@@ -1,0 +1,250 @@
+variables_dict = [
+    # Detunings and probe intensities
+    ["*RbDet", -8.64],
+    ["*RbHFBlast", -8.55],
+    ["*KDet", 0.375],
+    ["*RbProbeI", -4.4],
+    ["*KProbeI", -4.4],
+    ["*KRepumpI", -6],
+    ["*KHFBlast", 0.385],
+    ["*KMOT", 3.6],  # was 5.1
+    ["*RbMOT", 1.7],  # was 3.5
+    ["*RbHFOP", 5.2],
+    ["*KMOTDet", 7.0],
+    ["*RbMOTDet", 1.65],
+    ["*KCMOTDet", 7.21],
+    ["*RbCMOTDet", 1.96],
+    ["*D1MOTDet", 6.5],
+    ["*D1MOTPower", 1.2],
+    ["*D1MolassesPower", 1.2],
+    ["*D1MolassesDet", 8.14],
+    # QUAD shims
+    ["*NWhigh", 1.22],  # 07/05/2024
+    ["*NWlow", 1.4],  # 07/15/2024
+    ["*SWhigh", 1.615],  # 07/05/2024
+    ["*SWlow", 1.583],  # 07/15/2024
+    # Evaporation
+    ["*MagEvapTime", 12.9],
+    # Plug PZTs
+    ["*PLUGV", 0],
+    # Plug Power
+    ["*PLUGP", 1.9],
+    # B fields
+    ["*QuadV0", -1.15],
+    ["*QuadI0", 1.5], # for MOT
+    ["*QUADV", -3.9],  # was -3.6
+    ["*QTRAP", 7.5],
+    ["*QuadI2", 4.5],  # was 3.8, was 4.0, was 5
+    ["*QuadV2", -2.5],  # was -2.5 on 9/17/2020
+    ["*QuadI3", 0.0],
+    ["*QuadV3", -0.0],
+    ["*QuadVcmot", -1],
+    ["*QuadICMOT", 1.65],
+    # ["*BIASI", 0.047],  # 07/12/2024
+    ["*BIASI", 0.0487],  # 07/15/2024 
+    ["*BIASV", -0.415], #  07/15/2024
+    ["*BIASIHigh", 0.054],  # BiasI for the frist stage of MagEvap
+    ["*BIASVHigh", -0.375], # BiasV for the frist stage of MagEvap
+    ["*LowField", 0.458],  # changed 07/15/2024
+    ["*LowFieldV", -0.73],  # changed 07/15/2024
+    ["*HighField", 8.8], #changed 03/13/2025
+    ["*HighFieldV", -4.90],  # 12/09/24
+    ["*HighFieldInitial", 7.8],
+    ["*HighFieldInitialV", -4.75],
+    ["*HighFieldRecompress",9.0],
+    ["*HighFieldRecompressV",-5.1],
+    ["*BiasSub", -8.45],
+    ["*StableBias", -0.15],  #07/15/2024
+    ["*FeshBias", -5.206],   # 12/09/24
+    ["*ToeBias", -5.01],
+    ["*LowFieldGrad", 2.0],
+    # RF
+    ["*RFpulse", 0.001],
+    ["*RFpulse2", 0.001],
+    ["*RFpulse20", 0.001],
+    ["*RecoveryPulse", 0.001],
+    ["*RFlayer", 0.001],
+    ["*RFpi", 4.8],
+    ["*Echo10", 0.001],
+    ["*Echo1m1", 0.001],
+    ["*FlipTime", 0.001],
+    ["*RF1", 0.001],
+    ["*RF2", 0.001],
+    ["*RF3", 0.001],
+    ["*RF4", 0.001],
+    ["*RFspec", 0.001],
+    ["*RFfilter", 0.001],
+    # Lattice
+    ["*VOTLoad", 0],
+    ["*VOTBottom", 0],
+    ["*VOTFull", 0],
+    ["*VOTFinal", 0],
+    ["*VOTHold", 0],
+    ["*VLattPhase", 0],
+    ["*VLattPhase2", 0],
+    ["*VLattPhaseFinal", 0],
+    ["*VLattInitialPhase", 0],
+    # Optical traps
+    [
+        "*HOTLoad",
+        2.322,
+    ],  # was 3.6 (9/23/20); was 3.77 (11/27/19); was 5.2 before calibration changed
+    [
+        "*HOTMid",
+        0.9675,
+    ],  # was 0.8 (10/09/20); was 0.9 (11/27/19); was 1.6 (7/11/19); was 1.8 before calibration changed
+    ["*HOTFinal", 0.5],  # was 0.9 before calibration changed
+    ["*HOTFinal2", 0.5],
+    ["*HOTFinal3", 0.5],
+    ["*HOTFinal4", 0.5],
+    ["*HOTFinal5", 0.5],
+    ["*HOTBottom", 0.4],
+    ["*HOTBottom2", 0.4],
+    ["*HOTRecom", 0.42],
+    ["*HOTRecom1", 0.42],
+    ["*HOTLSLLoad", 0.42],
+    ["*HOTFilter", 0.4],
+    ["*HOTFilter1", 0.4],
+    ["*HOTFilter2", 0.4],
+    ["*HOTQuad", 0.5],
+    [
+        "*MARIALoad",
+        -8.37,
+    ],  # was 5 (10/09/20); was 4.5 (9/23/20); was 2.34 (11/27/19); was 2.6
+    ["*Latt1Load", -10],  # for HLatt alignment
+    ["*Latt2Load", -10],  # for HLatt alignment
+    ["*Latt1Final", -0.4],
+    ["*Latt2Final", -0.4],
+    ["*Latt1Spec", -0.4],
+    ["*Latt2Spec", -0.4],
+    ["*Latt1Mid", -0.4],
+    ["*Latt1Bottom", -0.4],
+    ["*Latt2Er", 0],
+    ["*VLattEr", 0],
+    [
+        "*MARIAMid",
+        -3.4875,
+    ],  # was 0.9 (10/21/20); was 0.7 (11/27/19);  was 1.0 (7/11/19); was 1
+    ["*MARIAFinal", -0.9765],  # was 0.5
+    ["*MARIAFinal2", -0.9765],
+    ["*MARIAFinal3", -0.9765],
+    ["*MARIAFinal4", -0.9765],
+    ["*MARIAFinal5", -0.9765],
+    ["*MARIABottom", 0.344],
+    ["*MARIABottom2", 0.344],
+    ["*MARIARecom", 0.4],
+    ["*MARIARecom1", 0.4],
+    ["*MARIALSLLoad", 0.4],
+    ["*MARIAFilter", 0.4],
+    ["*MARIAFilter1", 0.4],
+    ["*MARIAFilter2", 0.4],
+    ["*MARIAQuad", 0.7],
+    ["*MARIACDT", 0.7],
+    ["*UpLoad", 2.0],
+    ["*?UpOT", 0],
+    ["*LSLLoad", 0],
+    ["*LSLFilter", 0],
+    ["*LSLFilter1", 0],
+    ["*LSLFinal", 0.03],
+    ["*LSLFinal2", 0.03],
+    ["*LSLFinal3", 0.03],
+    ["*LSLFinal4", 0.03],
+    ["*LSLFinal5", 0.03],
+    ["*LSLLoadSpacing", 8],
+    ["*LSLFilterSpacing", 6],
+    ["*LSLFilterSpacing1", 4],
+    ["*LSLFilterSpacing2", 4],
+    ["*LSLFilterSpacing3", 4],
+    ["*LSLFilterSpacing4", 4],
+    ["*LSLDecompressSpacing", 4],
+    ["*LSLPowerRamp", 0.1],
+    ["*LSLPowerRampTau", 0.1],
+    ["*LSLSpacingRamp", 0.1],
+    ["*LSLSpacingRamp1", 0.1],
+    ["*LSLSpacingRamp2", 0.1],
+    ["*LSLUnloadTime", 0.1],
+    ["*LSLFinalSpacing", 0.1],
+    ["*LSLLoadPhase", 0],
+    ["*LSLFilterPhase", 0],
+    ["*LSLFilterPhase1", 0],
+    ["*LSLFilterPhase2", 0],
+    ["*LSLFilterPhase3", 0],
+    ["*LSLFilterPhase4", 0],
+    ["*LSLFinalPhase", 0],
+    ["*LSLDecompressPhase", 0],
+    ["*ColdPower", -2],
+    ["*ColdPower2", -2],
+    # Micellaneous
+    ["*time", 0.1],
+    ["*time2", 0.2],
+    ["*phase", 0],
+    ["*tip", 0],
+    ["*TAT", 0],
+    ["*basis", 3],
+    ["*X", 0.005],
+    ["*Tau", -3],
+    ["*FillTime", 5.0],
+    ["*LIADTime", 4.0],
+    ["*RbLIADTime", 4.0],
+    ["*KRbLIADTime", 4.0],
+    ["*BlastTime", 20e-6],
+    ["*end1", 1e-06],
+    ["*mid1", 1e-06],
+    ["*end2", 1e-06],
+    ["*mid2", 1e-06],
+    ["*tpi1", 1e-06],
+    ["*tpi2", 1e-06],
+    ["*TOF", 1e-03],
+    ["*RFShelve", 1e-06],
+    ["*SwapTime", 1e-06],
+    ["*NoRFTime", 1e-06],
+    ["*tx", 1e-6],
+    ["*ty", 1e-6],
+    ["*tz", 1e-6],
+    # Digital variables
+    ["*?HOT", 1],
+    ["*?MARIA", 1],
+    ["*?VLATT", 1],
+    ["*?VLATTImage",1],
+    ["*?LSL", 1],
+    ["*?LSLLoad", 1],
+    ["*?Latt1", 1],
+    ["*?Latt2", 1],
+    ["*?Blackman", 0],
+    ["*?RFpulse", 0],
+    ["*?stirap", 1],
+    ["*?layerBlast", 0],
+    ["*?Blast", 0],
+    ["*?Spectroscopy", 0],
+    ["*?Pulse1", 0],
+    ["*?Pulse2", 0],
+    ["*?Pulse3", 0],
+    ["*?layerPulse1", 0],
+    ["*?layerPulse2", 0],
+    ["*?layerPulse3", 0],
+    ["*?Sandwich", 0],
+    ["*?BigFlip", 0],
+    ["*?BigARP", 0],
+    ["*?Side", 0],
+    ["*?Axial", 0],
+    ["*?Image00", 1],
+    ["*?poo", 0],
+    ["*?!poo", 1],
+    ["*?20Pulse", 0],
+    ["*?!20Pulse", 1],
+    ["*?Shelve", 0],
+    ["*?ExtraTip", 0],
+    ["*?LowFieldGrad", 0],
+    ["*?D1MOT", 1],
+    # Utility variables
+    ["*poo", 0],
+    ["*howdy", 100],
+    ["*LowerPlateZero", 0],
+    ["*UpperPlateZero", 0],
+    ["*LWRodZero", 0],
+    ["*LERodZero", 0],
+    ["*UWRodZero", 0],
+    ["*UERodZero", 0],
+    #    ['*HRecompress', 0], # Evap recompression midpoint
+    #    ['*MRecompress', 0], # Evap recompression midpoint
+]

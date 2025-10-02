@@ -1,0 +1,99 @@
+{
+    "NOTE": "variables are in: conductor/clients/variables_config.py",
+    "data_directory": "/home/bialkali/data/{}/",
+    "time_format": "%Y%m%d",
+    "default_values_path": "./default_values.json",
+    "registry_directory": ["", "Servers", "conductor", "parameters"],
+    "default_parameters": {
+        "sequencer": {
+            "sequence": {
+                "sequence_directory": "/home/bialkali/data/{}/sequences/",
+                "default_sequence": "KRb_default"
+            }
+        },
+        "E8257D": {
+            "enable": {
+                "default_enable": 1,
+                "defaults": {
+                    "0": {"frequency": 6834.5, "amplitude": -4},
+	            "1": {"evap": 1},
+                    "2": {"frequency": 6889.25, "amplitude": 16, "dev": 1}
+                }
+            }
+        },
+        "kd1": {
+            "setting": {
+                "default":
+                {
+                    "frequency": [1285.79],
+                    "amplitude": [-9]
+                }
+            }
+        },
+        "arp33220A": {
+            "frequency": {
+                "default_frequency": 100
+            },
+            "amplitude": {
+                "default_amplitude": 1
+            }
+        },
+        "ad9910": {
+            "update": {
+                "device": "K",
+                "default": 0
+            }
+        },
+        "stirap": {
+            "up": {
+            },
+            "down": {
+            }
+        },
+        "highFieldRbARP": {
+            "duration": {
+                "default": 1
+            }
+        },    
+        "time": {
+            "timestamp": {}
+        },
+        "magevaptimer": {
+            "time": {}
+        },
+        "electrode" : {
+            "update": {
+                "default": {
+                }
+            }
+        },
+        "synthesizer": {
+            "waveform": {
+                "default_waveform": ""
+            }
+        },
+        "andor": {
+            "vertical": {
+                "temperature": -20
+            },
+            "side": {
+                "temperature": -20
+            }
+        },
+        "database": {
+            "update": {
+            }
+        },
+        "dg4000": {
+            "sin": {
+                "default_sin": {
+                    "freq2": 121.75e6,
+                    "amplitude2": 1.5,
+                    "phase2": 0.0,
+                    "offset2": 0.0,
+                    "output2": 1
+                }
+            }
+        }
+    }
+}

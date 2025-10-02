@@ -1,0 +1,36 @@
+{
+    "sequencer_servername": "sequencer",
+    "conductor_servername": "conductor",
+    "electrode_servername": "electrode",
+    "timing_channel": "Trigger@D15",
+    "sequence_directory": "/home/bialkali/data/{}/sequences/",
+    "time_format": "%Y%m%d",
+    "sequencer_update_id": 689223,
+    "conductor_update_id": 689222,
+    "electrode_update_id": 689221,
+    "conductor_parameter_changed_id": 689220,
+    "spacer_width": 65,
+    "spacer_height": 15,
+    "namecolumn_width": 250,
+    "namelabel_width": 250,
+    "durationrow_height": 20,
+    "analog_height": 50,
+    "max_columns": 100,
+    "digital_colors": [
+        "#ff0000",
+        "#ff7700",
+        "#ffff00",
+        "#00ff00",
+        "#0000ff",
+        "#8a2be2"
+    ],
+    "variable_colors": [
+        "#ff8887",
+        "#fed8b1",
+        "#fffcbb",
+        "#90ee90",
+        "#add8e6",
+        "#cbc8e3"
+    ],
+    "electrode_channel_map": ["LP", "UP", "LW", "LE", "UW", "UE"]
+}
