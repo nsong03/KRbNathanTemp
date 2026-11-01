@@ -18,7 +18,12 @@
    - *Measure noise* and *Measure loop*, and a loop model with the predicted phase margin.
    - Verilog latency simulation package (`fpga/`) and a component noise comparison against commercial RF and lock-in parts.
    - Findings: `docs/speed_latency_noise_study.md`, an export of the claude.ai doc <https://claude.ai/artifact/HjMYekzFVDwpCB3jPw6qkP>.
-7. **Next (hand-off to Claude Code)**: a Moku-style schematic UI in which every block is a box with live settings, with switches for scan, dither and lock. See `CLAUDE_CODE_PROMPT.md`.
+7. **App v4** (Claude Code, 2026-11-01): a Moku-style schematic UI. Every block is a box with its register readback and
+   settings, generated from one model (`app/schematic.py`) that also does the hardware writes. Switches for Scan, Dither,
+   Lock, Output (new `off` mode) and Auto-relock; 2 probe points feed the embedded scope; Lock Assist crosshairs at the
+   error zero crossings; new setting `setpoint_mv` (`pid0.setpoint`). No IIR band-pass (user decision).
+   Plan: `docs/schematic_plan.md`. The Moku manual PDFs could not be fetched from that session (network policy);
+   the design follows `moku_reference.md`.
 
 ## Notes on provenance
 - The latency numbers come from an earlier run of `run_sim.py`. A later sandbox refused to run downloaded Verilog, so it was not re-run. The 9- and 12-clock results match a hand count of the Verilog. Re-run it on Windows with Icarus to confirm.

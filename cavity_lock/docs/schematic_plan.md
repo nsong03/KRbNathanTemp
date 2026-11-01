@@ -1,6 +1,6 @@
 # Schematic (Moku-style) UI: plan
 
-Status: **draft for review**. Nothing below is built yet.
+Status: **approved** (2026-11-01): no IIR; Output switch and `off` mode in; layout as sketched.
 
 Note on sources: the Moku manual PDFs (download.liquidinstruments.com, photonics.laser2000.co.uk) are outside this
 session's allowed network domains, so this plan relies on the summary in `moku_reference.md`.
@@ -183,10 +183,6 @@ Interaction:
 - `app/ui.py`: Dash layout and callbacks (`build_app`), re-exported by `cavity_lock_app`.
 - No new dependencies (Dash + scipy only).
 
-## 8. Open question
-
-- **IIR band-pass / notch on IN1** (`in1 → iir → iq0.input`): the prompt allows it only if implemented for real.
-  PyRPL's `iir` API (`setup(zeros, poles, gain, loops, input, output_direct)`) and its latency are marked **verify**
-  in our notes and the fake has no IIR. Proposal: **leave it out of this version** and show the honest
-  "Band-pass (AC high-pass)". It can follow once checked on hardware. Say if you want it now instead (I would add it
-  default off, with a fake IIR and a latency label of `loops` clocks).
+## 8. Decisions
+- **IIR band-pass / notch on IN1:** not added (user decision). The block is labelled "Band-pass (AC high-pass)".
+- **Output switch and `off` mode:** included.

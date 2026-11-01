@@ -11,7 +11,7 @@ cb = [v for k, v in app.callback_map.items() if "frame.data" in k and "frame-seq
 fn = getattr(cb, "__wrapped__", None)
 print("have wrapped:", fn is not None)
 def one():
-    out = fn(1, ctl.version, -5, ctl.meas_seq)       # force a new frame
+    out = fn(1, ctl.version, -5, ctl.meas_seq, "")   # force a new frame (and diagram state)
     return json.dumps(out[0], cls=plotly.utils.PlotlyJSONEncoder)
 for _ in range(3): one()
 t0 = time.time(); n = 20

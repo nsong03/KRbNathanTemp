@@ -177,6 +177,10 @@ class Engine:
                        "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.value(ts),
                        "out1": drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)}
                 ready_at = now + duration          # an untriggered trace still takes its duration to record
+        p1 = self.rp.pid1                                # OUT2 monitor: pid1 pass-through (P only, clamped)
+        src = sig.get(p1.input, np.zeros(n)) if p1.output_direct == "out2" else np.zeros(n)
+        sig["out2"] = np.clip(p1.p * (src - p1.setpoint), p1.min_voltage, p1.max_voltage)
+        sig["in2"] = 0.0005 * self.rng.standard_normal(n)
         return [sig.get(nm, np.zeros(n)) for nm in names], ready_at
 
 

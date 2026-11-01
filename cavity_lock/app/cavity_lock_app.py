@@ -2,13 +2,18 @@
 """
 cavity_lock_app.py -- browser app for dither-locking a cavity PZT with a Red Pitaya (PyRPL).
 
-Two modes
-  Acquisition (on start-up)  OUT1 = slow ramp (asg0) + dither (iq0). iq0 demodulates the photodiode on IN1
-                             against its own dither oscillator -> error signal. Click a transmission peak to
-                             choose the lock target; "Auto-optimize phase" sets the demodulation phase.
-  Lock                       "LOCK!" stops the big ramp, switches to the lock dither, sweeps slowly across the
-                             chosen peak to find the exact zero crossing and slope (and re-fits the phase),
-                             parks OUT1 there and closes the loop with pid0: OUT1 = setpoint + lock dither.
+The UI is a Moku-style block diagram of the real FPGA signal chain (schematic.py = the model, ui.py = Dash):
+  IN1 -> band-pass (iq0 AC high-pass) -> mixer (LO = dither through the phase delay) -> low-pass -> integer gain
+      -> error (iq0) -> setpoint -> PID (pid0, P + I) -> limiter -> sum (+ ramp asg0, + dither) -> OUT1
+Every box shows what the registers really hold; every knob writes the register drawn on its box.
+Switches on the diagram:
+  Scan    asg0 ramp into OUT1 (acquisition). Off: OUT1 held at the ramp centre.
+  Dither  iq0's oscillator into OUT1.
+  Lock    stops the scan, sweeps slowly across the chosen peak with the lock dither, re-fits the phase, parks
+          OUT1 at the error zero crossing and closes pid0 with a gain ramp. Off: unlock and hold.
+  Output  OUT1 enable (off: ramp, dither and PID disconnected, OUT1 = 0 V).  Auto-relock: the watchdog.
+Probe points on the wires feed the embedded scope (2 channels). Click a transmission peak or an error zero
+crossing (Lock Assist crosshair) to choose the lock target.
 Diagnostics (while locked)
   "Measure noise"  spectra of the residual detuning (from the error signal) and of the transmitted intensity
   "Measure loop"   open-loop gain, phase margin and plant response with PyRPL's network analyzer
@@ -35,12 +40,16 @@ import threading
 import time
 import webbrowser
 
+import sys
+
 import numpy as np
 from scipy.signal import find_peaks, peak_widths, welch
 
+import schematic as SCH
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(HERE, "cavity_lock_settings.json")
-OUT_LIMIT = 0.95                      # never command OUT1 beyond +/- this [V]
+OUT_LIMIT = SCH.OUT_LIMIT             # never command OUT1 beyond +/- this [V]
 RP_LATENCY = 211e-9                   # analog-in to analog-out delay of the lock-in path (FPGA simulation)
 PANELS = ["transmission", "error", "drive", "setpoint history", "noise spectrum", "loop (Bode)"]
 
@@ -61,6 +70,7 @@ FIELDS = [
     ("ac_hz", "Photodiode high-pass [Hz]", 100.0, "Demodulation", "num", {"min": 0}),
     ("err_gain", "Error gain (integer, 1 = lowest)", 1, "Demodulation", "num", {"min": 1}),
     ("prominence", "Peak threshold [x tallest]", 0.1, "Demodulation", "num", {"min": 0.01, "max": 1}),
+    ("setpoint_mv", "Setpoint (error offset) [mV]", 0.0, "Demodulation", "num", {}),
     ("lock_same_dither", "Lock dither = acquisition dither", True, "Lock", "check", {}),
     ("lock_dither_hz", "Lock dither frequency [Hz]", 1000.0, "Lock", "num", {"min": 1}),
     ("lock_dither_mvpp", "Lock dither amplitude [mVpp]", 30.0, "Lock", "num", {"min": 0}),
@@ -88,11 +98,14 @@ FIELDS = [
     ("out2_signal", "OUT2 monitor", "error", "Display", "select",
      {"options": ["error", "setpoint", "ramp", "photodiode", "off"]}),
     ("out2_gain", "OUT2 gain", 1.0, "Display", "num", {}),
+    ("probe_a", "Probe A", "out1", "Display", "select", {"options": SCH.PROBE_SIGNALS + ["off"]}),
+    ("probe_b", "Probe B", "asg0", "Display", "select", {"options": SCH.PROBE_SIGNALS + ["off"]}),
 ]
 KEYS = [f[0] for f in FIELDS]
 DEFAULTS = {f[0]: f[2] for f in FIELDS}
 DEFAULTS["target_mv"] = None           # lock target (drive voltage of the chosen peak); None = tallest
-OUT2_SOURCE = {"error": "iq0", "setpoint": "pid0", "ramp": "asg0", "photodiode": "in1"}
+OUT2_SOURCE = SCH.OUT2_SOURCE
+SNAP_KEYS = ("lpf_hz", "lpf_order", "ac_hz", "err_gain")   # the FPGA rounds these: show requested -> used
 
 
 # ---------------------------------------------------------------------------------------------
@@ -163,6 +176,29 @@ def zero_crossing(vb, eb, v_target, half):
     return float(vz), slope
 
 
+def strong_crossings(vb, eb, frac=0.2):
+    """Error zero crossings (vb ascending) where the error swings past +/- frac x its maximum on both sides
+    (a hysteresis comparator, so noise around zero far from a resonance does not count).
+    Returns [(v, slope sign)]."""
+    if len(eb) < 4:
+        return []
+    th = frac * float(np.max(np.abs(eb)))
+    if th <= 0:
+        return []
+    out, state, last = [], 0, 0
+    for i in np.flatnonzero(np.abs(eb) > th):
+        st = 1 if eb[i] > 0 else -1
+        if state and st != state:
+            sc = np.flatnonzero(np.diff(np.sign(eb[last:i + 1])) != 0)
+            if len(sc):
+                k = last + int(sc[len(sc) // 2])
+                den = eb[k + 1] - eb[k]
+                vz = vb[k] - eb[k] * (vb[k + 1] - vb[k]) / den if den else vb[k]
+                out.append((float(vz), -1 if state > 0 else 1))
+        state, last = st, i
+    return out
+
+
 def analyze_sweep(tr, c):
     """Peaks, lock target, error zero crossing, slope and health checks from one sweep capture.
     c: prominence, target_mv, rate [V/s], lpf_hz, lpf_order, dither_hz, dither_mvpp, kappa, ramp_hz, ramp_mvpp."""
@@ -198,6 +234,17 @@ def analyze_sweep(tr, c):
                 k = ii[int(np.argmin(np.abs(v[ii] - p["v_by"][name])))]
                 p["t_ms"].append(float(t[k] * 1e3))
     res = dict(peaks=peaks, target=None, notes=[], err_max=float(np.max(np.abs(err))))
+    zc = []                                          # Lock Assist crosshairs: every strong error zero crossing
+    for name, sel in (("up", up), ("down", ~up)):
+        if name not in halves:
+            continue
+        ii = np.flatnonzero(sel)
+        for vz, sgn in strong_crossings(halves[name]["vb"], halves[name]["eb"]):
+            k = ii[int(np.argmin(np.abs(v[ii] - vz)))]
+            near = [p for p in peaks if abs(p["v_by"].get(name, p["v"]) - vz) < max(p["fwhm"], 1e-4)]
+            zc.append(dict(v=vz, t_ms=float(t[k] * 1e3), slope=sgn, on_peak=bool(near),
+                           peak_v=near[0]["v"] if near else None))
+    res["zc"] = zc
     if not peaks:
         res["notes"].append("no transmission peak above the threshold in the ramp window")
         return res
@@ -368,6 +415,11 @@ class Controller:
         self._bad_since = None
         self._good_ival = collections.deque(maxlen=50)
         self._tick = 0
+        self.dither_on = True                            # the Dither switch (iq0.output_direct)
+        self.hw = {}                                     # register readback shown on the diagram
+        self.req = {}                                    # requested values of keys the FPGA rounds
+        self.ival = None                                 # last pid0.ival read
+        self._probe_last = "b"                           # probe channel assigned last
         self.log(f"connecting to {host} ...")
         from pyrpl import Pyrpl
         self.p = Pyrpl(config=config, hostname=host, gui=False)
@@ -384,8 +436,8 @@ class Controller:
                 pass
         self.r.pid0.i = 0
         self.log("connected")
-        self.configure()
         self._start_acquire()
+        self._readback()
 
     # ---- small utilities ----
     def log(self, msg):
@@ -402,7 +454,18 @@ class Controller:
                         lock=dict(self.lock_info), history=list(self.history), logs=list(self.logs),
                         settings=dict(self.s), version=self.version, seq=self.seq, ramp=self.ramp,
                         kappa=self.kappa, dither=self._dither(), dither_meas=self.dither_meas, ctx=self.ctx,
-                        noise=self.noise, loop=self.loop, meas_seq=self.meas_seq, fps=self.fps)
+                        noise=self.noise, loop=self.loop, meas_seq=self.meas_seq, fps=self.fps,
+                        hw=dict(self.hw), req=dict(self.req), ival=self.ival, amp_cal=self.amp_cal,
+                        dither_on=self.dither_on)
+
+    def switches(self):
+        """Switch positions, derived from the register readback and the mode (never stored)."""
+        return SCH.switch_states(self.mode, self.hw, self.s)
+
+    def _readback(self):
+        hw = SCH.read_hw(self.r)
+        with self._pub_lock:
+            self.hw = hw
 
     def _publish(self, **kw):
         with self._pub_lock:
@@ -431,32 +494,9 @@ class Controller:
 
     # ---- hardware configuration ----
     def configure(self):
-        s, r = self.s, self.r
-        f_d, mvpp = self._dither()
-        if (f_d, mvpp) != self._last_dither:
-            self._last_dither = (f_d, mvpp)
-            self._cal_checks = 2                         # re-check the dither amplitude on OUT1
-        iq = r.iq0
-        iq.input = "in1"
-        iq.frequency = f_d
-        iq.amplitude = mvpp * 1e-3 / 2 / self.amp_cal
-        iq.phase = s["phase_deg"]
-        iq.bandwidth = [s["lpf_hz"]] * int(s["lpf_order"])
-        iq.acbandwidth = s["ac_hz"]
-        iq.gain = 0
-        iq.quadrature_factor = s["err_gain"]
-        iq.output_signal = "quadrature"
-        iq.output_direct = "out1" if mvpp > 0 else "off"
-        p1 = r.pid1                                      # OUT2 monitor
-        p1.i, p1.ival, p1.setpoint = 0, 0, 0
-        p1.p = s["out2_gain"]
-        p1.min_voltage, p1.max_voltage = -1.0, 1.0
-        if s["out2_signal"] == "off":
-            p1.output_direct = "off"
-        else:
-            p1.input = OUT2_SOURCE[s["out2_signal"]]
-            p1.output_direct = "out2"
-        for p in (r.pid0, r.pid1):
+        """Write every static block of the schematic (iq0: dither, phase, filters, gain; pid0 setpoint; pid1)."""
+        SCH.write_static(self)
+        for p in (self.r.pid0, self.r.pid1):
             try:
                 p.inputfilter = [0, 0, 0, 0]
             except Exception:
@@ -480,6 +520,8 @@ class Controller:
             snapped["err_gain"] = int(round(qf)) if abs(qf - round(qf)) < 1e-9 else qf
         if snapped:
             self.log("hardware values: " + ", ".join(f"{k} {s[k]} -> {v}" for k, v in snapped.items()))
+            for k in snapped:
+                self.req[k] = s[k]                       # what was asked for, shown as "asked -> used"
             s.update(snapped)
             self.version += 1
 
@@ -505,6 +547,7 @@ class Controller:
                           trigger_source="immediately", output_direct="out1")
         self.ramp = dict(lo=lo, hi=hi, hz=hz, shape=shape)
         self._ramp_cache = None
+        self._readback()
 
     def _ramp_off(self):
         a = self.r.asg0
@@ -514,10 +557,10 @@ class Controller:
         s = self.s
         self.r.pid0.i = 0
         self.ctx = "acq"
+        self.mode = "acquire"                            # before configure(): the writers look at the mode
         self.configure()
         lo, hi = self._ramp_limits(s["ramp_center_mv"] * 1e-3, s["ramp_mvpp"] * 1e-3)
         self._ramp_on(lo, hi, s["ramp_hz"], s["ramp_shape"])
-        self.mode = "acquire"
         if not quiet:
             f_d, mvpp = self._dither()
             self.log(f"acquiring: {s['ramp_shape']} ramp {lo*1e3:+.0f}..{hi*1e3:+.0f} mV at {s['ramp_hz']:g} Hz, "
@@ -579,7 +622,7 @@ class Controller:
         if want_drive or self._ramp_cache is None or self._ramp_cache[0] != key:
             td, out1, ramp = self.capture("out1", "asg0", dur, trigger="asg0")
             self._ramp_cache = (key, ramp)
-            drive = dict(t=td, out1=out1, ref=ramp, ref_name="ramp (asg0)")
+            drive = dict(t=td, out1=out1, ref=ramp, ref_name="ramp (asg0)", ref_sig="asg0")
             if np.ptp(ramp) < 0.2 * (rp["hi"] - rp["lo"]):
                 self.log("WARN the ramp does not show up on the scope: check asg0")
         ramp = self._ramp_cache[1]
@@ -608,8 +651,14 @@ class Controller:
                     lpf_order=s["lpf_order"], dither_hz=f_d, dither_mvpp=mvpp, kappa=self.kappa,
                     ramp_hz=rp["hz"], ramp_mvpp=pp * 1e3)
 
+    def _cal_live(self):
+        """A dither calibration capture is due (and meaningful: the dither is on OUT1)."""
+        return self._cal_checks > 0 and self.dither_on and self.mode != "off"
+
     def _check_drive(self, drive):
         """Measure the dither actually on OUT1 (OUT1 minus ramp or setpoint) and calibrate its amplitude."""
+        if not self.dither_on or self.mode == "off":
+            return                                       # no dither on OUT1: nothing to measure
         f_d, want = self._dither()
         pp = sine_pp(drive["t"], drive["out1"] - drive["ref"], f_d)
         if pp is None:
@@ -636,12 +685,16 @@ class Controller:
                         self.log(f"ERROR in {cmd}: {e!r}")
                         if self.mode in ("busy", "locking", "measuring"):
                             self.mode = "held"
+                    try:
+                        self._readback()                 # the diagram shows what the registers now hold
+                    except Exception as e:
+                        self.log(f"readback error: {e!r}")
             except queue.Empty:
                 pass
             try:
                 if self.mode == "acquire":
                     self._acquire_tick()
-                elif self.mode in ("locked", "held"):
+                elif self.mode in ("locked", "held", "off"):
                     self._live_tick()
                 else:
                     time.sleep(0.05)
@@ -658,18 +711,15 @@ class Controller:
             changed = {k for k, v in arg.items() if s.get(k) != v}
             if not changed:
                 return
+            for k in changed & set(SNAP_KEYS):
+                self.req[k] = arg[k]
             f_before = self._dither()[0]
             s.update(arg)
-            self.configure()
-            ramp_keys = {"ramp_shape", "ramp_hz", "ramp_mvpp", "ramp_center_mv", "acq_dither_mvpp"}
-            if self.mode == "acquire" and changed & ramp_keys:
-                self._start_acquire(quiet=True)
-            if self.mode == "locked" and changed & {"ugf_hz", "p_gain"} and self.lock_info.get("slope"):
-                self._set_gains(s["ugf_hz"])
-            if self.mode == "locked" and changed & {"clamp_mv", "clamp_auto"}:
-                lo, hi = self._clamp(self.lock_info["v0"], self.lock_info.get("spacing"))
-                self.r.pid0.min_voltage, self.r.pid0.max_voltage = lo, hi
-                self.lock_info["clamp"] = (lo, hi)
+            written = SCH.apply_changed(self, changed)      # the writers of the blocks that own these keys
+            if set(written) & {"lowpass", "bandpass", "amp"}:
+                self._snap_to_hardware()
+            if changed & {"probe_a", "probe_b"}:
+                self._show_panel("drive")
             if self.ctx == "lock" and self.mode in ("locked", "held") and self._dither()[0] != f_before:
                 self.log("note: a new dither frequency can shift the demodulation phase; press LOCK! to re-fit")
             if changed & {"ugf_hz", "p_gain", "lpf_hz", "lpf_order", "driver_bw_hz"}:
@@ -679,7 +729,13 @@ class Controller:
             if changed - {"panels", "ui_hz", "drive_every"}:
                 self.log("applied: " + ", ".join(f"{k}={s[k]}" for k in sorted(changed)))
         elif cmd == "acquire":
-            self._start_acquire()
+            self._switch("scan", True)
+        elif cmd == "switch":
+            self._switch(*arg)
+        elif cmd == "probe":
+            self._toggle_probe(arg)
+        elif cmd == "target_v":
+            self._target_at(float(arg))
         elif cmd == "autophase":
             self._auto_phase()
         elif cmd == "target":
@@ -690,10 +746,7 @@ class Controller:
         elif cmd == "lock":
             self._lock()
         elif cmd == "unlock":
-            self.r.pid0.i = 0
-            if self.mode in ("locked", "locking", "busy"):
-                self.mode = "held"
-            self.log(f"unlocked; setpoint held at {float(self.r.pid0.ival)*1e3:+.2f} mV")
+            self._switch("lock", False)
         elif cmd == "noise":
             self._measure_noise()
         elif cmd == "loop":
@@ -705,6 +758,7 @@ class Controller:
         elif cmd == "load":
             with open(SETTINGS_FILE) as f:
                 s.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+            self.req.clear()
             self.configure()
             self.version += 1
             if self.mode == "acquire":
@@ -712,23 +766,155 @@ class Controller:
             self.log("settings loaded")
 
     # ---- acquisition ----
+    def _probe_due(self):
+        return self._tick % max(int(self.s["drive_every"]), 1) == 0
+
+    def _probe_frame(self, main, dur, trigger, cal):
+        """Traces for the probe row (scope channels A and B). The main capture (in1 + iq0) is reused when both
+        probes are among those; a calibration capture (out1 + ramp/setpoint) when it matches; otherwise a
+        second capture of (A, B) every drive_every traces. Returns None when nothing new was captured."""
+        s = self.s
+        if "drive" not in s["panels"]:
+            return None
+        a, b = s["probe_a"], s["probe_b"]
+        pair = (a, b)
+        real = {x for x in pair if x != "off"}
+        if real <= {"in1", "iq0"}:
+            return dict(t=main["t"], a=main.get(a), b=main.get(b), a_name=a, b_name=b, pair=pair)
+        if cal is not None and real <= {"out1", cal["ref_sig"]}:
+            m = {"out1": cal["out1"], cal["ref_sig"]: cal["ref"]}
+            return dict(t=cal["t"], a=m.get(a), b=m.get(b), a_name=a, b_name=b, pair=pair)
+        if not self._probe_due() and self.drive is not None and self.drive.get("pair") == pair:
+            return None
+        t, ya, yb = self.capture(a if a != "off" else "in1", b if b != "off" else "in1", dur, trigger)
+
+        def sc(n, y):
+            return None if n == "off" else (y * s["in1_scale"] if n == "in1" else y)
+        return dict(t=t, a=sc(a, ya), b=sc(b, yb), a_name=a, b_name=b, pair=pair)
+
     def _acquire_tick(self):
         s = self.s
         self._tick += 1
-        want = ("drive" in s["panels"] and self._tick % max(int(s["drive_every"]), 1) == 0) or self._cal_checks > 0
+        real = {x for x in (s["probe_a"], s["probe_b"]) if x != "off"}
+        want = self._cal_live() or ("drive" in s["panels"] and self._probe_due() and bool(real)
+                                    and real <= {"out1", "asg0"})
         tr, drive = self.capture_sweep(s["averages"], want_drive=want)
         an = analyze_sweep(tr, self._ctx(s["target_mv"]))
         if s["target_mv"] is not None and an.get("target_v") is not None:
             s["target_mv"] = an["target_v"] * 1e3        # follow the chosen peak as it drifts
         if drive is not None:
             self._check_drive(drive)
+        probe = self._probe_frame(dict(t=tr["t"], in1=tr["pd"], iq0=tr["err"]), 1.02 / self.ramp["hz"], "asg0",
+                                  drive)
         self._publish(traces=dict(kind="sweep", **tr), analysis=an,
-                      **({"drive": drive} if drive is not None else {}))
+                      **({"drive": probe} if probe is not None else {}))
+
+    def _target_at(self, v):
+        """Lock Assist: the peak nearest drive voltage v (a clicked zero crossing) becomes the lock target."""
+        tr, an = self.traces, self.analysis or {}
+        if self.mode != "acquire" or tr is None or tr.get("kind") != "sweep" or not an.get("peaks"):
+            self.log("pick the lock target while scanning (Scan on)")
+            return
+        p = min(an["peaks"], key=lambda q: abs(q["v"] - v))
+        self.s["target_mv"] = p["v"] * 1e3
+        self.log(f"lock target (crosshair at {v*1e3:+.1f} mV): peak at {p['v']*1e3:+.1f} mV")
+        self._publish(analysis=analyze_sweep({k2: tr[k2] for k2 in ("t", "v", "pd", "err", "up")},
+                                             self._ctx(self.s["target_mv"])))
+
+    # ---- switches and probes ----
+    def _unlock(self, why):
+        self.r.pid0.i = 0
+        if self.mode in ("locked", "locking", "busy", "measuring"):
+            self.mode = "held"
+        self.log(f"{why}: unlocked; setpoint held at {float(self.r.pid0.ival)*1e3:+.2f} mV")
+
+    def _output_off(self):
+        r = self.r
+        r.pid0.i = 0
+        self._ramp_off()
+        r.iq0.output_direct = "off"
+        r.pid0.output_direct = "off"
+        self.mode = "off"
+        self.ctx = "acq"
+        self.log("Output OFF: OUT1 = 0 V (ramp, dither and PID disconnected from OUT1)")
+
+    def _switch(self, name, on):
+        """Diagram switches with interlocks. Their displayed state is derived from the registers (switches())."""
+        s, on = self.s, bool(on)
+        if self.mode in SCH.BUSY:
+            self.log(f"{name} switch ignored while {self.mode}")
+            return
+        if name == "relock":
+            s["auto_relock"] = on
+            self.version += 1
+            self.log(f"auto-relock {'on' if on else 'off'}")
+            return
+        if name == "output":
+            if on and self.mode == "off":
+                self.log("Output on: scanning")
+                self._start_acquire()
+            elif not on and self.mode != "off":
+                self._output_off()
+            return
+        if on and self.mode == "off":
+            self.log(f"{name}: Output is off; switch Output on first")
+            return
+        if name == "scan":
+            if on:
+                if self.mode == "locked":
+                    self._unlock("Scan on")
+                if self.mode != "acquire":
+                    self._start_acquire()
+            elif self.mode == "acquire":
+                c = (self.ramp["lo"] + self.ramp["hi"]) / 2
+                self._park(c)
+                self.log(f"Scan off: OUT1 held at the ramp center {c*1e3:+.1f} mV")
+        elif name == "dither":
+            if not on and self.mode == "locked":
+                self._unlock("Dither off (the error signal needs it)")
+            self.dither_on = on
+            SCH.WRITERS["dither"](self)
+            self.log(f"dither {'on' if on else 'off'} (iq0.output_direct = {self.r.iq0.output_direct})")
+        elif name == "lock":
+            if on:
+                if self.mode == "locked":
+                    return
+                if not self.dither_on:
+                    self.dither_on = True
+                    self.log("Lock: dither switched on first (the error signal needs it)")
+                self._lock()
+            elif self.mode == "locked":
+                self._unlock("Lock off")
+
+    def _toggle_probe(self, sig):
+        """Click on a probe point: place it on A (if free), else B, else replace the older one; click a placed
+        probe to remove it. The scope has 2 channels."""
+        if sig not in SCH.PROBE_SIGNALS:
+            self.log(f"'{sig}' is not a scope signal")
+            return
+        s = self.s
+        a, b = s["probe_a"], s["probe_b"]
+        if sig == a:
+            a = "off"
+        elif sig == b:
+            b = "off"
+        elif a == "off":
+            a, self._probe_last = sig, "a"
+        elif b == "off":
+            b, self._probe_last = sig, "b"
+        elif self._probe_last == "b":
+            a, self._probe_last = sig, "a"
+        else:
+            b, self._probe_last = sig, "b"
+        s["probe_a"], s["probe_b"] = a, b
+        self.version += 1
+        self._show_panel("drive")
+        self.log(f"probes: A = {a}, B = {b}")
 
     def _pick_target(self, t_ms):
         tr, an = self.traces, self.analysis or {}
         if self.mode != "acquire" or tr is None or tr.get("kind") != "sweep":
-            self.log("pick the lock target while acquiring (press Acquire)")
+            self.log("pick the lock target while scanning (Scan on)")
             return
         if not an.get("peaks"):
             self.log("no peaks in this sweep to pick from")
@@ -774,7 +960,10 @@ class Controller:
     def _auto_phase(self):
         s = self.s
         if self.mode != "acquire":
-            self.log("Auto-optimize phase works while acquiring (press Acquire first)")
+            self.log("Auto-optimize phase works while scanning (Scan on)")
+            return
+        if not self.dither_on:
+            self.log("Auto-optimize phase needs the dither: switch Dither on")
             return
         an = self.analysis or {}
         if an.get("target") is None:
@@ -835,12 +1024,12 @@ class Controller:
             center = an["v0"] if an.get("v0") is not None else tgt["v"]
             self.log(f"LOCK 1/3: going to the peak at {tgt['v']*1e3:+.1f} mV")
             ref = dict(fwhm=tgt["fwhm"], spacing=an.get("mode_spacing"), relocks=0)
-        elif self.mode in ("held", "locked") and self.lock_info:
+        elif self.mode in ("held", "locked") and self.lock_info.get("fwhm"):
             center = float(self.r.pid0.ival)
             self.log(f"LOCK 1/3: re-locking around the setpoint {center*1e3:+.2f} mV")
             ref = dict(fwhm=self.lock_info["fwhm"], spacing=self.lock_info.get("spacing"), relocks=0)
         else:
-            self.log("LOCK: start from Acquire")
+            self.log("LOCK: start from a scan (Scan on, pick a peak)")
             return False
         return self._zoom_and_lock(center, ref, refine=self.s["refine_phase"])
 
@@ -892,13 +1081,15 @@ class Controller:
         p0.ival = v
         p0.output_direct = "out1"
         self.mode = "held"
+        self._readback()
 
     def _engage(self, v0, S, ref):
         s = self.s
         lo, hi = self._clamp(v0, ref.get("spacing"))
         self._ramp_off()
         p0 = self.r.pid0
-        p0.i, p0.p, p0.setpoint = 0, 0, 0
+        p0.i, p0.p = 0, 0
+        SCH.WRITERS["setpoint"](self)
         p0.min_voltage, p0.max_voltage = lo, hi
         p0.input = "iq0"
         p0.ival = v0
@@ -923,6 +1114,7 @@ class Controller:
                 return False
         self.log(f"  loop bandwidth {self.lock_info['ugf_actual']:.2f} Hz; LOCKED")
         self.mode = "locked"
+        self._readback()
         self._bad_since = None
         self._good_ival.clear()
         return True
@@ -930,16 +1122,18 @@ class Controller:
     def _live_tick(self):
         """Time-domain traces while locked or held; watchdog when locked."""
         s = self.s
-        t, pd, err = self.capture("in1", "iq0", s["lock_window_ms"] * 1e-3)
+        dur = s["lock_window_ms"] * 1e-3
+        t, pd, err = self.capture("in1", "iq0", dur)
         pd = pd * s["in1_scale"]
         self._tick += 1
-        drive = None
-        if ("drive" in s["panels"] and (self._tick % max(int(s["drive_every"]), 1) == 0 or self.drive is None
-                                        or self.drive.get("ref_name") != "setpoint (pid0)")) or self._cal_checks > 0:
-            td, out1, sp = self.capture("out1", "pid0", s["lock_window_ms"] * 1e-3)
-            drive = dict(t=td, out1=out1, ref=sp, ref_name="setpoint (pid0)")
-            self._check_drive(drive)
+        cal = None
+        if self._cal_live():
+            td, out1, sp = self.capture("out1", "pid0", dur)
+            cal = dict(t=td, out1=out1, ref=sp, ref_name="setpoint (pid0)", ref_sig="pid0")
+            self._check_drive(cal)
+        drive = self._probe_frame(dict(t=t, in1=pd, iq0=err), dur, "immediately", cal)
         ival = float(self.r.pid0.ival)
+        self.ival = ival
         now = time.time()
         T, em, erms = float(np.mean(pd)), float(np.mean(err)), float(np.std(err))
         self.history.append((now, T, em, erms, ival, self.mode))
@@ -966,6 +1160,7 @@ class Controller:
         self.mode = "held"
         if s["auto_relock"]:
             self._relock()
+        self._readback()
 
     def _relock(self):
         li = self.lock_info
@@ -1137,400 +1332,11 @@ class Controller:
 
 
 # ---------------------------------------------------------------------------------------------
-# Browser UI (Dash). The server sends compact data; the browser builds the plots (Plotly.react, SVG: in tests WebGL refreshed about 2x slower).
+# Browser UI: the schematic and the embedded scope live in ui.py
 # ---------------------------------------------------------------------------------------------
-SCOPE_JS = """
-function(fr) {
-  if (!fr) { return [window.dash_clientside.no_update, window.dash_clientside.no_update]; }
-  var C = {pd: '#222222', err: '#1f5fa8', out1: '#8a8a8a', ref: '#d35400', tgt: '#1e8e3e'};
-  var rows = fr.rows, n = rows.length, data = [], shapes = [], ann = [], lay = {};
-  var gap = 0.06, h = (1 - gap * (n - 1)) / Math.max(n, 1);
-  var titles = {transmission: 'Transmission (photodiode, IN1) [V]', error: 'Error signal (iq0) [V]',
-                drive: 'Drive on OUT1 [mV]'};
-  rows.forEach(function(r, i) {
-    var ya = i === 0 ? 'y' : 'y' + (i + 1), key = i === 0 ? 'yaxis' : 'yaxis' + (i + 1);
-    var top = 1 - i * (h + gap);
-    lay[key] = {domain: [top - h, top], anchor: 'x', zeroline: false};
-    ann.push({text: titles[r], x: 0.5, xref: 'paper', y: top, yref: 'paper', yanchor: 'bottom', showarrow: false,
-              font: {size: 13}});
-    if (r === 'transmission' && fr.pd) {
-      data.push({type: 'scatter', mode: 'lines', x: fr.t, y: fr.pd, name: 'photodiode', yaxis: ya,
-                 line: {color: C.pd, width: 1}});
-      (fr.peaks || []).forEach(function(p) {
-        data.push({type: 'scatter', mode: 'markers+text', x: p.t, y: p.t.map(function() { return p.y; }),
-                   text: p.t.map(function() { return p.label; }), textposition: 'top center', yaxis: ya,
-                   marker: {symbol: p.tgt ? 'star' : 'triangle-down', size: p.tgt ? 13 : 9,
-                            color: p.tgt ? C.tgt : 'black'}, showlegend: false, hoverinfo: 'skip'});
-      });
-      if (fr.lock_height !== null && fr.lock_height !== undefined) {
-        shapes.push({type: 'line', xref: 'paper', x0: 0, x1: 1, yref: ya, y0: fr.lock_height, y1: fr.lock_height,
-                     line: {color: C.tgt, dash: 'dot', width: 1}});
-      }
-    }
-    if (r === 'error' && fr.err) {
-      data.push({type: 'scatter', mode: 'lines', x: fr.t, y: fr.err, name: 'error', yaxis: ya,
-                 line: {color: C.err, width: 1}});
-      shapes.push({type: 'line', xref: 'paper', x0: 0, x1: 1, yref: ya, y0: 0, y1: 0, line: {color: 'gray', width: 1}});
-    }
-    if (r === 'drive' && fr.dt) {
-      data.push({type: 'scatter', mode: 'lines', x: fr.dt, y: fr.dout, name: 'OUT1', yaxis: ya,
-                 line: {color: C.out1, width: 1}});
-      data.push({type: 'scatter', mode: 'lines', x: fr.dt, y: fr.dref, name: fr.dref_name, yaxis: ya,
-                 line: {color: C.ref, width: 1.5}});
-    }
-  });
-  (fr.v0_t || []).forEach(function(tv) {
-    shapes.push({type: 'line', xref: 'x', x0: tv, x1: tv, yref: 'paper', y0: 0, y1: 1,
-                 line: {color: C.tgt, dash: 'dash', width: 1}});
-  });
-  lay.xaxis = {title: {text: fr.xtitle}, anchor: n > 0 ? (n === 1 ? 'y' : 'y' + n) : 'y'};
-  lay.shapes = shapes; lay.annotations = ann;
-  lay.height = 200 * Math.max(n, 1) + 70; lay.margin = {l: 55, r: 15, t: 30, b: 45};
-  lay.template = 'plotly_white'; lay.hovermode = 'x'; lay.uirevision = fr.uirev;
-  lay.legend = {orientation: 'h', y: 1.04, x: 1, xanchor: 'right', yanchor: 'bottom'};
-  lay.plot_bgcolor = 'white'; lay.paper_bgcolor = 'white';
-  var scope = {data: data, layout: lay};
-  var hist = window.dash_clientside.no_update;
-  if (fr.hist) {
-    var H = fr.hist, hd = [
-      {type: 'scatter', mode: 'lines', x: H.t, y: H.sp, name: 'setpoint [mV]', line: {color: C.ref}},
-      {type: 'scatter', mode: 'lines', x: H.t, y: H.T, name: 'transmission [V]', yaxis: 'y2',
-       line: {color: C.pd, width: 1}}];
-    var hs = (H.unlocks || []).map(function(u) {
-      return {type: 'line', xref: 'x', x0: u, x1: u, yref: 'paper', y0: 0, y1: 1, line: {color: 'red', width: 1}}; });
-    hist = {data: hd, layout: {title: {text: 'Setpoint (OUT1 DC from pid0) over time', font: {size: 14}}, height: 260,
-            xaxis: {title: {text: 'time [s]'}}, yaxis: {title: {text: 'setpoint [mV]'}},
-            yaxis2: {title: {text: 'transmission [V]'}, overlaying: 'y', side: 'right'}, shapes: hs,
-            margin: {l: 55, r: 55, t: 35, b: 40}, template: 'plotly_white', uirevision: 'hist',
-            plot_bgcolor: 'white', paper_bgcolor: 'white',
-            legend: {orientation: 'h', y: 1.12, x: 1, xanchor: 'right'},
-            annotations: H.t.length ? [] : [{text: 'fills in once locked (or held)', showarrow: false,
-                                            xref: 'paper', yref: 'paper', x: 0.5, y: 0.5}]}};
-  }
-  return [scope, hist];
-}
-"""
-
-
 def build_app(ctl):
-    from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-
-    app = Dash(__name__, title="Cavity lock", update_title=None)
-    FIELD = {f[0]: f for f in FIELDS}
-    css_box = {"border": "1px solid #ccc", "borderRadius": "8px", "padding": "8px 10px", "marginBottom": "10px"}
-    btn = {"margin": "3px", "padding": "6px 10px", "fontSize": "14px", "cursor": "pointer"}
-
-    def to_ui(key, val):
-        kind = FIELD[key][4]
-        return (["on"] if val else []) if kind == "check" else val
-
-    def from_ui(key, val):
-        kind, default = FIELD[key][4], FIELD[key][2]
-        if kind == "check":
-            return bool(val)
-        if kind == "multi":
-            return [p for p in PANELS if p in (val or [])]
-        if kind == "select":
-            return val
-        if val is None:
-            return ctl.s.get(key, default)
-        return int(val) if isinstance(default, int) and not isinstance(default, bool) else float(val)
-
-    def control(key):
-        _, label, _, _, kind, opt = FIELD[key]
-        val = to_ui(key, ctl.s.get(key, FIELD[key][2]))
-        if kind == "num":
-            comp = dcc.Input(id=f"s-{key}", type="number", value=val, debounce=True, step="any",
-                             style={"width": "90px"}, **opt)
-        elif kind == "check":
-            comp = dcc.Checklist(id=f"s-{key}", options=[{"label": "", "value": "on"}], value=val,
-                                 style={"display": "inline-block"})
-        elif kind == "multi":
-            return html.Div([html.Span(label, style={"fontSize": "13px"}),
-                             dcc.Checklist(id=f"s-{key}", options=[{"label": " " + o, "value": o} for o in opt["options"]],
-                                           value=val, inline=True, inputStyle={"marginLeft": "8px"},
-                                           style={"fontSize": "13px"})], style={"margin": "3px 0"})
-        else:
-            comp = dcc.Dropdown(id=f"s-{key}", options=[{"label": o, "value": o} for o in opt["options"]],
-                                value=val, clearable=False, style={"width": "130px"})
-        return html.Div([html.Span(label, style={"flex": "1", "fontSize": "13px"}), comp],
-                        style={"display": "flex", "alignItems": "center", "gap": "6px", "margin": "3px 0"})
-
-    buttons = html.Div([
-        html.Button("Acquire", id="btn-acquire", style=btn),
-        html.Button("Auto-optimize phase", id="btn-phase", style=btn),
-        html.Button("LOCK!", id="btn-lock",
-                    style=dict(btn, background="#1e8e3e", color="white", fontWeight="bold", fontSize="16px")),
-        html.Button("Unlock (hold)", id="btn-unlock", style=btn),
-        html.Button("Measure noise", id="btn-noise", style=btn),
-        html.Button("Measure loop", id="btn-loop", style=btn),
-        html.Button("Save settings", id="btn-save", style=btn),
-        html.Button("Load settings", id="btn-load", style=btn),
-    ], style=css_box)
-    target_box = html.Div([
-        html.B("Lock target"),
-        html.Div(id="target-text", style={"fontSize": "13px", "margin": "4px 0"}),
-        html.Div("Click a transmission peak in the plot to choose it.", style={"fontSize": "12px", "color": "#666"}),
-        html.Button("Use tallest peak", id="btn-tallest", style=btn),
-    ], style=css_box)
-
-    def sidebar():                      # built on every page load, so it shows the controller's present values
-        groups = [html.Div([html.B(g)] + [control(f[0]) for f in FIELDS if f[3] == g], style=css_box)
-                  for g in dict.fromkeys(f[3] for f in FIELDS)]
-        return [buttons, target_box] + groups
-
-    def serve_layout():
-        return html.Div([
-            html.Div([
-                html.H3("Cavity PZT dither lock", style={"margin": "4px 0"}),
-                html.Div(id="status", style={"fontSize": "17px", "fontWeight": "bold"}),
-            ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
-            html.Div([
-                html.Div(sidebar(),
-                         style={"width": "390px", "flexShrink": "0", "overflowY": "auto", "height": "calc(100vh - 70px)"}),
-                html.Div([
-                    dcc.Graph(id="scope", config={"displaylogo": False}),
-                    dcc.Graph(id="history", config={"displaylogo": False}),
-                    dcc.Graph(id="noise", config={"displaylogo": False}, style={"display": "none"}),
-                    dcc.Graph(id="loopfig", config={"displaylogo": False}, style={"display": "none"}),
-                    html.Div([
-                        html.Div(id="analysis", style={"flex": "1", "fontSize": "13px", "whiteSpace": "pre-wrap"}),
-                        html.Pre(id="log", style={"flex": "1", "fontSize": "12px", "height": "22vh", "overflowY": "auto",
-                                                  "whiteSpace": "pre-wrap", "background": "#f6f6f6", "padding": "6px",
-                                                  "margin": 0}),
-                    ], style={"display": "flex", "gap": "10px"}),
-                ], style={"flex": "1", "minWidth": "0", "overflowY": "auto", "height": "calc(100vh - 70px)"}),
-            ], style={"display": "flex", "gap": "12px"}),
-            dcc.Interval(id="tick", interval=int(1000 / max(ctl.s.get("ui_hz", 10), 1))),
-            dcc.Store(id="synced", data=-1),                  # -1: the first tick pushes all present values
-            dcc.Store(id="frame"),
-            dcc.Store(id="frame-seq", data=-1),
-            dcc.Store(id="meas-seq", data=-1),
-            dcc.Store(id="ack"),
-        ], style={"fontFamily": "sans-serif", "padding": "6px 12px"})
-
-    app.layout = serve_layout
-
-    @app.callback(Output("ack", "data", allow_duplicate=True),
-                  [Input(f"s-{k}", "value") for k in KEYS], State("synced", "data"), prevent_initial_call=True)
-    def on_settings(*vals):
-        vals, synced = vals[:-1], vals[-1]
-        trig = (ctx.triggered_id or "").replace("s-", "")
-        if trig in FIELD and FIELD[trig][4] == "num" and vals[KEYS.index(trig)] is None:
-            lim = FIELD[trig][5]
-            ctl.log(f"'{FIELD[trig][1]}': not a number or outside "
-                    f"[{lim.get('min', '-inf')}, {lim.get('max', 'inf')}]; keeping {ctl.s[trig]}")
-        ctl.submit("apply", ({k: from_ui(k, v) for k, v in zip(KEYS, vals)}, synced))
-        return time.time()
-
-    btn_cmd = {"btn-acquire": "acquire", "btn-phase": "autophase", "btn-lock": "lock", "btn-unlock": "unlock",
-               "btn-save": "save", "btn-load": "load", "btn-tallest": "tallest", "btn-noise": "noise",
-               "btn-loop": "loop"}
-
-    @app.callback(Output("ack", "data", allow_duplicate=True), [Input(b, "n_clicks") for b in btn_cmd],
-                  prevent_initial_call=True)
-    def on_button(*_):
-        if ctx.triggered_id in btn_cmd:
-            ctl.submit(btn_cmd[ctx.triggered_id])
-        return time.time()
-
-    @app.callback(Output("ack", "data", allow_duplicate=True), Input("scope", "clickData"), prevent_initial_call=True)
-    def on_click(cd):
-        if cd and cd.get("points"):
-            ctl.submit("target", float(cd["points"][0]["x"]))
-        return time.time()
-
-    def r5(a, scale=1.0):
-        return np.round(np.asarray(a, dtype=float) * scale, 5).tolist()
-
-    def frame_data(snap):
-        s, tr, dr, an = snap["settings"], snap["traces"], snap["drive"], snap["analysis"] or {}
-        rows = [p for p in ("transmission", "error", "drive") if p in s["panels"]]
-        sweep = tr is not None and tr["kind"] == "sweep"
-        fr = dict(rows=rows, uirev=f"{'sweep' if sweep else 'live'}-{len(rows)}",
-                  xtitle="time [ms]" + ("  (one ramp period; click a peak to pick the lock target)" if sweep else "  (live)"))
-        if tr is not None:
-            t_ms = tr["t"] * 1e3
-            if "transmission" in rows:
-                x, y = envelope(t_ms, tr["pd"])
-                fr.update(t=r5(x), pd=r5(y))
-            if "error" in rows:
-                x, y = envelope(t_ms, tr["err"])
-                fr.update(t=r5(x), err=r5(y))
-        if dr is not None and "drive" in rows:
-            x, y = envelope(dr["t"] * 1e3, dr["out1"] * 1e3)
-            _, yr = envelope(dr["t"] * 1e3, dr["ref"] * 1e3)
-            fr.update(dt=r5(x), dout=r5(y), dref=r5(yr), dref_name=dr["ref_name"])
-        if sweep and an.get("peaks"):
-            fr["peaks"] = [dict(t=p["t_ms"], y=p["base"] + p["height"], label=f"{p['v']*1e3:+.0f} mV",
-                                tgt=i == an.get("target")) for i, p in enumerate(an["peaks"])]
-            fr["v0_t"] = an.get("v0_t_ms", [])
-        if not sweep and snap["lock"].get("height"):
-            fr["lock_height"] = snap["lock"]["height"]
-        if "setpoint history" in s["panels"]:
-            h = snap["history"][-6000:]
-            t, sp, T, un = [], [], [], []
-            if h:
-                t0 = h[0][0]
-                step = max(1, len(h) // 1500)
-                last = None
-                for j in range(0, len(h), step):
-                    x = h[j]
-                    tt = x[0] - t0
-                    if last is not None and tt - last > 1.5:          # gap (e.g. while acquiring): break the lines
-                        t.append(None); sp.append(None); T.append(None)
-                    t.append(round(tt, 3)); sp.append(round(x[4] * 1e3, 4)); T.append(round(x[1], 5))
-                    last = tt
-                un = [round(x[0] - t0, 3) for x in h if x[5] == "unlock"]
-            fr["hist"] = dict(t=t, sp=sp, T=T, unlocks=un)
-        return fr
-
-    app.clientside_callback(SCOPE_JS, [Output("scope", "figure"), Output("history", "figure")], Input("frame", "data"))
-
-    def noise_fig(nz):
-        f = go.Figure()
-        if nz:
-            x = nz["f"]
-            if nz["det_lw"] is not None:
-                f.add_scatter(x=x, y=[v * nz["kappa_mhz"] * 1e6 for v in nz["det_lw"]], mode="lines",
-                              name="residual detuning [Hz/rtHz]", line=dict(color="#1f5fa8", width=1))
-            f.add_scatter(x=x, y=nz["rin"], mode="lines", name="relative intensity noise [1/rtHz]", yaxis="y2",
-                          line=dict(color="#222222", width=1))
-            for k in (1, 2, 3, 4):
-                f.add_vline(x=k * nz["f_d"], line=dict(color="#d35400", width=0.8, dash="dot"))
-        f.update_layout(title=dict(text="Noise while locked (dotted: dither harmonics)", font=dict(size=14)),
-                        height=330, template="plotly_white", margin=dict(l=60, r=60, t=35, b=40),
-                        xaxis=dict(type="log", title="frequency [Hz]"),
-                        yaxis=dict(type="log", title="detuning [Hz/√Hz]", exponentformat="power"),
-                        yaxis2=dict(type="log", title="RIN [1/√Hz]", overlaying="y", side="right",
-                                    exponentformat="power"),
-                        legend=dict(orientation="h", y=1.12, x=1, xanchor="right"))
-        return f
-
-    def loop_fig(lp):
-        f = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08)
-        if lp:
-            x = lp["f"]
-            f.add_scatter(x=x, y=lp["G_mag"], mode="lines+markers", name="|G| measured", row=1, col=1,
-                          line=dict(color="#1f5fa8"))
-            f.add_scatter(x=x, y=lp["M_mag"], mode="lines", name="|G| model", row=1, col=1,
-                          line=dict(color="#1f5fa8", dash="dot"))
-            if lp["P_mag"] is not None:
-                pm = np.asarray(lp["P_mag"])
-                f.add_scatter(x=x, y=(pm / pm[0]).tolist(), mode="lines", name="plant (normalized)", row=1, col=1,
-                              line=dict(color="#d35400"))
-            f.add_scatter(x=x, y=lp["G_ph"], mode="lines+markers", name="phase G", row=2, col=1,
-                          line=dict(color="#1f5fa8"), showlegend=False)
-            f.add_scatter(x=x, y=lp["M_ph"], mode="lines", name="phase model", row=2, col=1,
-                          line=dict(color="#1f5fa8", dash="dot"), showlegend=False)
-            if lp["P_ph"] is not None:
-                f.add_scatter(x=x, y=lp["P_ph"], mode="lines", name="phase plant", row=2, col=1,
-                              line=dict(color="#d35400"), showlegend=False)
-            f.add_hline(y=1, line=dict(color="gray", width=1), row=1, col=1)
-            f.add_hline(y=-180, line=dict(color="red", width=1, dash="dot"), row=2, col=1)
-            if lp["ugf"]:
-                f.add_vline(x=lp["ugf"], line=dict(color="#1e8e3e", dash="dash"))
-        ttl = "Open-loop gain G" + (f": unity gain {lp['ugf']:.1f} Hz, phase margin {lp['pm']:.0f} deg"
-                                     if lp and lp["ugf"] else "")
-        f.update_layout(title=dict(text=ttl, font=dict(size=14)), height=420, template="plotly_white",
-                        margin=dict(l=60, r=20, t=35, b=40), legend=dict(orientation="h", y=1.08, x=1, xanchor="right"))
-        f.update_xaxes(type="log")
-        f.update_xaxes(title_text="frequency [Hz]", row=2, col=1)
-        f.update_yaxes(type="log", title_text="magnitude", row=1, col=1)
-        f.update_yaxes(title_text="phase [deg]", row=2, col=1)
-        return f
-
-    @app.callback(
-        [Output("frame", "data"), Output("frame-seq", "data"), Output("status", "children"),
-         Output("target-text", "children"), Output("analysis", "children"), Output("log", "children"),
-         Output("noise", "style"), Output("loopfig", "style"),
-         Output("history", "style"), Output("meas-seq", "data"), Output("tick", "interval")]
-        + [Output(f"s-{k}", "value") for k in KEYS] + [Output("synced", "data")],
-        Input("tick", "n_intervals"), State("synced", "data"), State("frame-seq", "data"), State("meas-seq", "data"))
-    def on_tick(_, synced, frame_seq, meas_seq):
-        snap = ctl.snapshot()
-        s, mode, an, li = snap["settings"], snap["mode"], snap["analysis"] or {}, snap["lock"]
-        new_frame = snap["seq"] != frame_seq or snap["version"] != synced
-        frame = frame_data(snap) if new_frame else no_update
-        f_d, d_mvpp = snap["dither"]
-        dm = f" (measured {snap['dither_meas']:.1f})" if snap["dither_meas"] else ""
-        color = {"locked": "#1e8e3e", "acquire": "#2471a3", "held": "#b9770e", "busy": "#7d3c98",
-                 "locking": "#7d3c98", "measuring": "#7d3c98"}.get(mode, "#555")
-        if mode in ("locked", "measuring") and li.get("setpoint") is not None:
-            extra = (f"   setpoint {li['setpoint']*1e3:+.3f} mV   transmission {li['frac']*100:.0f}% of peak   "
-                     f"bandwidth {li.get('ugf_actual', 0):.1f} Hz   dither {d_mvpp:g} mVpp{dm} @ {f_d:g} Hz")
-        elif mode == "acquire" and snap["ramp"]:
-            rp = snap["ramp"]
-            extra = (f"   {rp['shape']} ramp {(rp['hi']-rp['lo'])*1e3:.0f} mVpp @ {rp['hz']:g} Hz   "
-                     f"dither {d_mvpp:g} mVpp{dm} @ {f_d:g} Hz")
-        elif mode == "held":
-            extra = f"   setpoint held at {snap['history'][-1][4]*1e3:+.3f} mV" if snap["history"] else ""
-        else:
-            extra = ""
-        extra += f"   {snap['fps']:.1f} traces/s" if snap["fps"] else ""
-        status = html.Span([html.Span(mode.upper(), style={"color": color}), html.Span(extra, style={"fontSize": "13px"})])
-        if an.get("target") is not None and mode in ("acquire", "busy"):
-            p = an["peaks"][an["target"]]
-            ttxt = (f"{'Chosen' if s.get('target_mv') is not None else 'Tallest'} peak at {p['v']*1e3:+.1f} mV, "
-                    f"height {p['height']:.3f} V" + (f", lock point {an['v0']*1e3:+.2f} mV" if an.get("v0") is not None else ""))
-        elif li.get("v0") is not None:
-            ttxt = f"Locked peak: lock point {li['v0']*1e3:+.2f} mV, height {li['height']:.3f} V"
-        else:
-            ttxt = "no target yet"
-        lines = []
-        if mode in ("acquire", "busy", "locking") and an.get("peaks"):
-            for i, p in enumerate(an["peaks"]):
-                lines.append(f"{p['v']*1e3:+8.1f} mV   height {p['height']:.3f} V   FWHM {p['fwhm']*1e3:.2f} mV"
-                             + ("   <- target" if i == an.get("target") else ""))
-            if an.get("v0") is not None:
-                lines.append(f"lock point {an['v0']*1e3:+.3f} mV, slope {an['slope']:+.1f} /V"
-                             + (f", nearest other peak {an['mode_spacing']*1e3:.1f} mV away" if an.get("mode_spacing") else ""))
-            lines += an.get("notes", [])
-        elif li.get("v0") is not None:
-            lines.append(f"lock point {li['v0']*1e3:+.3f} mV, slope {li['slope']:+.1f} /V, clamp "
-                         f"{li['clamp'][0]*1e3:+.1f}..{li['clamp'][1]*1e3:+.1f} mV, relocks {li.get('relocks', 0)}")
-            if li.get("err_rms") is not None:
-                lines.append(f"error rms {li['err_rms']*1e3:.2f} mV  ->  about {abs(li['err_rms']/li['slope'])*1e6:.1f} uV "
-                             f"of drive ({abs(li['err_rms']/li['slope'])/li['fwhm']*100:.2f}% of the swept FWHM)")
-        lp_list = [s["lpf_hz"]] * int(s["lpf_order"])
-        fu, pm = predicted_margin(s, lp_list)
-        if fu:
-            lines.append(f"model: unity gain {fu:.0f} Hz, phase margin {pm:.0f} deg (integrator + error low-pass "
-                         f"{' + '.join(f'{x:.0f} Hz' for x in lp_list)} + driver {s['driver_bw_hz']:g} Hz + 0.2 us)")
-            if pm < 45:
-                lines.append("WARN phase margin under 45 deg: lower the loop bandwidth or raise the low-pass/dither frequency")
-        nz = snap["noise"]
-        if nz:
-            lines.append("noise (linewidths rms | intensity rms) by band: " + ", ".join(
-                f"{r['band']}: {r['det']*100 if r['det'] is not None else float('nan'):.2f}% | {r['rin']*100:.2f}%"
-                for r in nz["rows"]))
-        meas_new = snap["meas_seq"] != meas_seq
-        show_noise = "noise spectrum" in s["panels"]
-        show_loop = "loop (Bode)" in s["panels"]
-        hist_style = {} if "setpoint history" in s["panels"] else {"display": "none"}
-        if snap["version"] != synced:
-            vals = [to_ui(k, s[k]) for k in KEYS] + [snap["version"]]
-            interval = int(1000 / max(float(s["ui_hz"]), 1))
-        else:
-            vals = [no_update] * len(KEYS) + [no_update]
-            interval = no_update
-        return [frame, snap["seq"], status, ttxt, "\n".join(lines), "\n".join(reversed(snap["logs"][-80:])),
-                {} if show_noise else {"display": "none"}, {} if show_loop else {"display": "none"},
-                hist_style, snap["meas_seq"] if meas_new else no_update, interval] + vals
-
-    # The measurement plots get their own callbacks: sending both figures inside the 10 Hz tick response made
-    # the browser drop the whole update (seen with Dash 4.5), freezing the page.
-    @app.callback(Output("noise", "figure"), Input("meas-seq", "data"))
-    def on_noise(_):
-        return noise_fig(ctl.noise)
-
-    @app.callback(Output("loopfig", "figure"), Input("meas-seq", "data"))
-    def on_loop(_):
-        return loop_fig(ctl.loop)
-
-    return app
+    import ui
+    return ui.build_app(ctl, sys.modules[__name__])
 
 
 def main():
