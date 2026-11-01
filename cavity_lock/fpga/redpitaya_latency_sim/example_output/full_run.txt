@@ -1,0 +1,44 @@
+app settings: dither 1000 Hz, high-pass 75 Hz, low-pass 303.6 Hz x2, phase 0 deg, quadrature factor 1
+
+[1] IN1 -> PID0 (P=1) -> OUT1 inside red_pitaya_dsp: 9 cycles = 72 ns  (0.1 s)
+[2] IN1 -> IQ0 (filters off) -> PID0 -> OUT1: 12 cycles = 96 ns  (0.1 s)
+
+    delays outside red_pitaya_dsp:
+      ADC pipeline (LTC2145-14, full-rate CMOS)      6.0 cycles  (LTC2145-14 datasheet: pipeline latency 6 cycles)
+      FPGA ADC input register                        1.0 cycles  (red_pitaya_top.v: adc_dat_a <= adc_dat_a_i (one register))
+      FPGA DAC output register                       1.0 cycles  (red_pitaya_top.v: dac_dat_a <= ... (one register))
+      ODDR output stage (A/B interleave)             1.0 cycles  (red_pitaya_top.v: ODDR oddr_dac_dat, one dac_clk_1x cycle)
+      DAC latches (AD9767 input + DAC latch)         1.0 cycles  (AD9767 datasheet: double-buffered latches, ~1 cycle)
+      analog filters + DAC settling                  4.4 cycles  (AD9767 settling 35 ns; 50 MHz input/output filters)
+    => analog in to analog out: PID path ~187 ns, lock-in path ~211 ns
+       (published measurements of Red Pitaya PID loops: ~200 ns)
+
+[3] lock-in as configured by the app (simulated 7.9 ms in 86 s)
+[4] lock-in with a 20 kHz dither and two low-pass stages at f/8 (simulated 0.98 ms in 12 s)
+
+    lockin_app: dither 1000 Hz, high-pass 75.9 Hz, low-pass 303.6 Hz + 303.6 Hz
+      error signal reaches 10/50/90 %:    255.1 /    811.1 /   1909.1 us   (ideal low-pass cascade: 278.9 / 880.0 / 2039.4 us)
+      residual ripple at 2f: 24.0 counts rms on a 1001-count step
+    lockin_fast: dither 20000 Hz, high-pass 1214.3 Hz, low-pass 2428.7 Hz + 2428.7 Hz
+      error signal reaches 10/50/90 %:     40.2 /    112.8 /    254.4 us   (ideal low-pass cascade: 34.9 / 110.0 / 254.9 us)
+      residual ripple at 2f: 3.9 counts rms on a 1004-count step
+
+phase lag at candidate loop bandwidths (integrator 90 deg + FPGA/converters + error low-pass + PZT driver at 1000 Hz); keep the total under ~135 deg for a stable lock:
+     UGF [Hz]    delay  low-pass   driver    total
+  error low-pass of the app configuration: 304 Hz + 304 Hz
+           10    0.001       3.8      0.6     94.3
+           30    0.002      11.3      1.7    103.0
+          100    0.008      36.5      5.7    132.2
+          300    0.023      89.3     16.7    196.0   <- too much
+         1000    0.076     146.2     45.0    281.3   <- too much
+         3000    0.228     168.4     71.6    330.2   <- too much
+  error low-pass of the fast (20 kHz dither) configuration: 2429 Hz + 2429 Hz
+           10    0.001       0.5      0.6     91.0
+           30    0.002       1.4      1.7     93.1
+          100    0.008       4.7      5.7    100.4
+          300    0.023      14.1     16.7    120.8
+         1000    0.076      44.8     45.0    179.8   <- too much
+         3000    0.228     102.0     71.6    263.8   <- too much
+
+plot: lockin_step_response.png
+results: sim_results.json
