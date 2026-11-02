@@ -67,11 +67,12 @@ class ASG:
             return np.zeros_like(np.asarray(t, dtype=float))
         return self.raw(t)
 
-    def raw(self, t):
-        """The ASG's internal signal (what the scope sees as 'asg0' / 'asg1'), routed or not."""
+    def raw(self, t, rel=None):
+        """The ASG's internal signal (what the scope sees as 'asg0' / 'asg1'), routed or not.
+        rel: times relative to self.t0 instead of epoch times t (epoch float64 resolves only 0.24 us)."""
         if self.amplitude == 0:
-            return np.zeros_like(np.asarray(t, dtype=float)) + self.offset
-        ph = ((np.asarray(t) - self.t0) * self.frequency) % 1.0
+            return np.zeros_like(np.asarray(t if rel is None else rel, dtype=float)) + self.offset
+        ph = ((np.asarray(t) - self.t0 if rel is None else np.asarray(rel)) * self.frequency) % 1.0
         if self.waveform in ("sin", "cos"):
             return self.offset + self.amplitude * np.sin(2 * np.pi * ph + (np.pi / 2 if self.waveform == "cos" else 0))
         if self.waveform == "halframp":
@@ -148,17 +149,23 @@ class Engine:
         if len(self.hist) > 40000:
             del self.hist[:20000]
 
-    def copies(self, ts):
-        """The spare iq1 -> pid2 chain driven by an ASG (circuit-only Bode). iq1 with its oscillator at 0 Hz is
-        input x cos(phase) through its low-pass stages and integer gain; pid2 is P + I of its input."""
+    def copies(self, rel):
+        """The spare iq1 and pid2 copies driven by asg1 (circuit-only Bode), on asg1-relative times rel.
+        iq1 with its oscillator at 0 Hz is input x cos(phase) through its low-pass stages and integer gain; pid2 is
+        P + I of its input. FPGA pipeline delays as counted in the Verilog: IQ 3 clocks + 2 per low-pass stage,
+        PID 4 clocks."""
         rp = self.rp
         iq, p2 = rp.iq1, rp.pid2
-        n, dt = len(ts), float(ts[-1] - ts[0]) / (len(ts) - 1)   # not ts[1]-ts[0]: epoch times lose precision
+        n, dt = len(rel), float(rel[-1] - rel[0]) / (len(rel) - 1)
         bws = [b for b in np.atleast_1d(iq.bandwidth) if b > 0]
-        npre = int(min(8 / (2 * math.pi * min(bws)) if bws else 0.0, 0.5) / dt) + 1
-        tf = np.concatenate([ts[0] - np.arange(npre, 0, -1) * dt, ts])
-        src = {"asg0": rp.asg0.raw(tf), "asg1": rp.asg1.raw(tf)}
-        x = src.get(iq.input, np.zeros(len(tf)))
+        npre = int(min(min(8 / (2 * math.pi * min(bws)) if bws else 0.0, 0.5) / dt, 2_000_000)) + 1
+        tf = np.concatenate([rel[0] - np.arange(npre, 0, -1) * dt, rel])
+        a1 = rp.asg1
+        tau_iq = (3 + 2 * len(bws)) * 8e-9
+
+        def src_at(name, delay):
+            return a1.raw(None, rel=tf - delay) if name == "asg1" else np.zeros(len(tf))
+        x = src_at(iq.input, tau_iq)
         if iq.acbandwidth > 0:
             a = math.exp(-2 * math.pi * iq.acbandwidth * dt)
             x = lfilter([a, -a], [1, -a], x)
@@ -167,7 +174,7 @@ class Engine:
             a = 1 - math.exp(-2 * math.pi * b * dt)
             y = lfilter([a], [1, -(1 - a)], y)
         y = y * iq.quadrature_factor
-        u = y if p2.input == "iq1" else src.get(p2.input, np.zeros(len(tf)))
+        u = y if p2.input == "iq1" else src_at(p2.input, 4 * 8e-9)
         u = u - p2.setpoint
         out = np.clip(p2.p * u + p2.ival + 2 * math.pi * p2.i * np.cumsum(u) * dt, p2.min_voltage, p2.max_voltage)
         return y[npre:], out[npre:]
@@ -213,8 +220,9 @@ class Engine:
                        "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.value(ts),
                        "out1": drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)}
                 ready_at = now + duration          # an untriggered trace still takes its duration to record
-        sig["asg1"] = self.rp.asg1.raw(ts)
-        sig["iq1"], sig["pid2"] = self.copies(ts)
+        rel1 = (ts[0] - self.rp.asg1.t0) + np.arange(n) * (duration / n)   # precise relative time axis
+        sig["asg1"] = self.rp.asg1.raw(None, rel=rel1)
+        sig["iq1"], sig["pid2"] = self.copies(rel1)
         p1 = self.rp.pid1                                # OUT2 monitor: pid1 pass-through (P only, clamped)
         src = sig.get(p1.input, np.zeros(n)) if p1.output_direct == "out2" else np.zeros(n)
         sig["out2"] = np.clip(p1.p * (src - p1.setpoint), p1.min_voltage, p1.max_voltage)

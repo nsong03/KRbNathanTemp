@@ -222,22 +222,27 @@ check("closed-loop Bode refused while not locked", ctl.mode == "acquire" and ctl
 outs = []
 _setup = ctl.r.asg1.setup
 ctl.r.asg1.setup = lambda **kw: (outs.append(kw.get("output_direct")), _setup(**kw))[1]
-apply(bode_mode="circuit only")
+apply(bode_mode="circuit only", bode_stop_hz=3e5, bode_points=12)
 ctl.submit("bode"); time.sleep(0.5); wait_idle(120)
 B = ctl.bode
-check("circuit only: every point measured, mode restored", B and B["done"] and B["n"] == 8 and ctl.mode == "acquire",
+check("circuit only: every point measured, mode restored", B and B["done"] and B["n"] == 12 and ctl.mode == "acquire",
       f"n={B and B['n']}")
+check("circuit only: no dither cap, sweeps to 300 kHz", abs(B["curves"][0]["f"][-1] - 3e5) < 1)
+lowf = [f for f, lo in zip(B["curves"][2]["f"], B["curves"][2]["low"]) if lo]
+check("circuit only: only points beyond 100 kHz are under the scope resolution (auto-ranged)",
+      all(f > 1e5 for f in lowf), f"unresolved at {lowf}")
 check("circuit only: asg1 never routed to an output (OUT1 untouched)", outs and set(outs) == {"off"}, str(set(outs)))
 for cv in B["curves"]:
-    r_ = np.abs(np.array(cv["c"]) / np.array(cv["model"][:len(cv["c"])]))
-    ph = np.degrees(np.angle(np.array(cv["c"]) / np.array(cv["model"][:len(cv["c"])])))
-    check(f"circuit only: '{cv['name'][:28]}' matches its model (|ratio-1| < 5 %, < 5 deg)",
-          np.all(np.abs(r_ - 1) < 0.05) and np.all(np.abs(ph) < 5), f"{np.round(r_, 3)}")
+    ok_ = ~np.array(cv["low"])
+    q_ = np.array(cv["c"])[ok_] / np.array(cv["model"][:len(cv["c"])])[ok_]
+    r_, ph = np.abs(q_), np.degrees(np.angle(q_))
+    check(f"circuit only: '{cv['name'][:28]}' matches its model (|ratio-1| < 3 %, < 2 deg, resolved points)",
+          np.all(np.abs(r_ - 1) < 0.03) and np.all(np.abs(ph) < 2), f"{np.round(r_, 3)} {np.round(ph, 1)}")
 check("circuit only: electronics UGF = loop bandwidth setting", B["ugf"] and abs(B["ugf"] - ctl.s["ugf_hz"]) < 0.1 *
       ctl.s["ugf_hz"], f"{B['ugf']}")
 ctl.r.asg1.setup = _setup
 ctl.submit("lock"); time.sleep(0.5); ok = wait_mode("locked", 60)
-apply(bode_mode="closed loop", na_amp_frac=0.1)   # low frequencies: G comes from 1 + c/x, so excite enough
+apply(bode_mode="closed loop", na_amp_frac=0.1, bode_stop_hz=300.0, bode_points=8)   # low frequencies: G comes from 1 + c/x, so excite enough
 ctl.submit("bode"); time.sleep(0.5); wait_idle(180)
 B = ctl.bode
 f_ = np.array(B["curves"][0]["f"]); G_ = np.array(B["curves"][0]["c"]); S_ = np.array(B["curves"][1]["c"])

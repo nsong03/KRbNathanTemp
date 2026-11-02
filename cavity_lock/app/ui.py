@@ -242,10 +242,13 @@ function(B) {
       data.push({type: 'scatter', mode: 'lines', x: B.fp, y: c.mph, legendgroup: c.name, showlegend: false,
                  line: {color: c.color, dash: 'dot', width: 1.5}, xaxis: 'x2', yaxis: 'y2', hoverinfo: 'skip'});
     }
+    var sym = (c.low || []).map(function(l) { return l ? 'circle-open' : 'circle'; });
+    var mk = {size: 6, symbol: sym.length ? sym : 'circle'};
+    var txt = (c.low || []).map(function(l) { return l ? 'under 5 scope steps: not resolved' : ''; });
     data.push({type: 'scatter', mode: 'lines+markers', x: c.f, y: c.db || [], name: c.name, legendgroup: c.name,
-               line: {color: c.color, width: 2}, marker: {size: 5}, xaxis: 'x', yaxis: 'y'});
+               line: {color: c.color, width: 2}, marker: mk, xaxis: 'x', yaxis: 'y', text: txt});
     data.push({type: 'scatter', mode: 'lines+markers', x: c.f, y: c.ph || [], legendgroup: c.name, showlegend: false,
-               line: {color: c.color, width: 2}, marker: {size: 5}, xaxis: 'x2', yaxis: 'y2'});
+               line: {color: c.color, width: 2}, marker: mk, xaxis: 'x2', yaxis: 'y2', text: txt});
   });
   var prog = B.done ? (B.n < B.n_total ? ' (stopped at ' + B.n + '/' + B.n_total + ')' : '')
                     : '  measuring ' + B.n + '/' + B.n_total + ' ...';
@@ -253,6 +256,10 @@ function(B) {
   var shapes = [{type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: 0, y1: 0, line: {color: 'gray', width: 1}},
                 {type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y2', y0: -180, y1: -180,
                  line: {color: 'red', width: 1, dash: 'dot'}}];
+  if (B.f_dither && B.fp.length && B.fp[B.fp.length - 1] > B.f_dither / 2) {
+    shapes.push({type: 'rect', xref: 'x', x0: Math.max(B.f_dither / 2, B.fp[0]), x1: B.fp[B.fp.length - 1],
+                 yref: 'paper', y0: 0, y1: 1, fillcolor: 'rgba(0,0,0,0.06)', line: {width: 0}, layer: 'below'});
+  }
   if (B.ugf) {
     shapes.push({type: 'line', xref: 'x', x0: B.ugf, x1: B.ugf, yref: 'paper', y0: 0, y1: 1,
                  line: {color: '#1e8e3e', width: 1, dash: 'dash'}});

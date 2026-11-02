@@ -94,7 +94,8 @@ FIELDS = [
     ("bode_mode", "Bode: what to measure", "closed loop", "Diagnostics", "select",
      {"options": ["closed loop", "circuit only"]}),
     ("bode_start_hz", "Bode: start frequency [Hz]", 3.0, "Diagnostics", "num", {"min": 0.5}),
-    ("bode_stop_hz", "Bode: stop frequency [Hz] (max 0.45 x dither)", 500.0, "Diagnostics", "num", {"min": 1}),
+    ("bode_stop_hz", "Bode: stop frequency [Hz] (closed loop: max 0.45 x dither)", 500.0, "Diagnostics", "num",
+     {"min": 1}),
     ("bode_points", "Bode: points", 30, "Diagnostics", "num", {"min": 3, "max": 200}),
     ("bode_cycles", "Bode: sine cycles per point", 6, "Diagnostics", "num", {"min": 2, "max": 50}),
     ("bode_amp_mv", "Bode circuit only: max test amplitude [mV]", 400.0, "Diagnostics", "num",
@@ -1352,7 +1353,8 @@ class Controller:
         self._stop_meas.set()
 
     def _bode_publish(self, B):
-        B = dict(B, curves=[dict(cv, f=list(cv["f"]), c=list(cv["c"])) for cv in B["curves"]])  # a snapshot
+        B = dict(B, curves=[dict(cv, f=list(cv["f"]), c=list(cv["c"]),
+                                 **({"low": list(cv["low"])} if "low" in cv else {})) for cv in B["curves"]])
         with self._pub_lock:
             self.bode = B
             self.bode_seq += 1
@@ -1374,10 +1376,13 @@ class Controller:
             self.log("Bode (closed loop) works while locked; use 'circuit only' to measure the electronics alone")
             return
         f_d = self._dither()[0]
-        f_stop = min(s["bode_stop_hz"], 0.45 * f_d)
+        # closed loop: the lock-in cannot pass more than ~dither/2. Circuit only: the copies run at baseband, so any
+        # frequency can be measured (up to the 62.5 MHz Nyquist limit); above dither/2 the plot is shaded.
+        f_stop = min(s["bode_stop_hz"], 0.45 * f_d if closed else 30e6)
         f_start = min(s["bode_start_hz"], f_stop / 2)
         if f_stop < s["bode_stop_hz"]:
-            self.log(f"Bode: stop frequency limited to {f_stop:.0f} Hz (0.45 x dither: the lock-in cannot pass more)")
+            self.log(f"Bode: stop frequency limited to {f_stop:.0f} Hz (closed loop: 0.45 x dither, the lock-in "
+                     f"cannot pass more)")
         fs = np.geomspace(f_start, f_stop, int(s["bode_points"]))
         prev = self.mode
         self.mode = "measuring"
@@ -1406,7 +1411,7 @@ class Controller:
 
     def _bode_capture(self, sig, f, cycles):
         """Two-channel capture (asg1, sig) long enough for `cycles` periods; complex amplitudes at f."""
-        dur = float(np.clip(cycles / f, 2e-3, 2.1))      # 2.1 s: the scope then picks 2.15 s, not 4.3 s
+        dur = float(np.clip(cycles / f, 1.3e-4, 2.1))    # 2.1 s: the scope then picks 2.15 s, not 4.3 s
         t, x, y = self.capture("asg1", sig, dur)
         return fit_sine(t, x, f), fit_sine(t, y, f)
 
@@ -1454,7 +1459,7 @@ class Controller:
             Tc, Ex = C / X, E / X2                       # c/x and e/x
             G, S = -Tc / (1 + Tc), 1 + Tc
             P = Ex / S
-            p0 = p0 or P                                 # normalize to the first point (magnitude and sign)
+            p0 = p0 or dc_norm(P)                        # normalize to the first point: magnitude and sign only
             for cv, val in zip(B["curves"], (G, S, -Tc, P / p0)):
                 cv["f"].append(float(f))
                 cv["c"].append(val)
@@ -1467,10 +1472,16 @@ class Controller:
                                          "no unity-gain crossing in the measured range"))
 
     def _bode_circuit(self, fs, prev):
+        """Each block measured on its own spare copy, driven straight from asg1 (the response of the chain is the
+        product: the blocks are linear). Per point, the test amplitude and the copy's gain (integer gain x K for the
+        lock-in, i and p x K for the PID) are chosen so the copy's output is ~0.3 V: the response then stays far
+        above the scope's 14-bit step even where the block attenuates by 100 dB. The gain actually used is read back
+        and divided out. Points whose response is still under 5 steps are flagged (hollow markers)."""
         s, r = self.s, self.r
         S = self.lock_info.get("slope")
         Sn = abs(S) if S else 1.0
         iq, p2 = r.iq1, r.pid2
+        qf0 = int(round(s["err_gain"]))
         # copy of the lock-in chain at baseband (oscillator at 0 Hz: the mixer multiplies by cos(0) = 1)
         iq.output_direct = "off"
         iq.amplitude = 0
@@ -1480,71 +1491,108 @@ class Controller:
         iq.acbandwidth = 0
         iq.gain = 0
         iq.bandwidth = [s["lpf_hz"]] * int(s["lpf_order"])
-        iq.quadrature_factor = s["err_gain"]
+        iq.quadrature_factor = qf0
         iq.output_signal = "quadrature"
-        # copy of the PID with the loop gains per unit slope: i = UGF, p = P gain (the lock divides by |S|)
+        # copy of the PID with the loop gains per unit slope (i = UGF, p = P gain; the lock divides them by |S|)
         p2.output_direct = "off"
-        p2.input = "iq1"
+        p2.input = "asg1"
         p2.setpoint = 0
-        p2.p, p2.i = s["p_gain"], s["ugf_hz"]
         p2.min_voltage, p2.max_voltage = -1.0, 1.0
         try:
             p2.inputfilter = [0, 0, 0, 0]
         except Exception:
             pass
+        p2.p, p2.i = s["p_gain"], s["ugf_hz"]
         p_reg, i_reg = float(p2.p), float(p2.i)
         bw = [float(b) for b in np.atleast_1d(iq.bandwidth) if b > 0]
-        L_m = np.ones(len(fs), dtype=complex)
+        tau_L = (3 + 2 * len(bw)) * 8e-9                 # FPGA pipeline (Verilog count, docs): IQ 3 + 2 per stage
+        tau_C = 4 * 8e-9                                 # PID: 4 clocks
+        L_m = np.exp(-2j * np.pi * fs * tau_L)
         for b in bw:
             L_m = L_m / (1 + 1j * fs / b)
-        C_m = i_reg / (1j * fs) + p_reg
+        C_m = (i_reg / (1j * fs) + p_reg) * np.exp(-2j * np.pi * fs * tau_C)
+        f_d = self._dither()[0]
         hp = float(r.iq0.acbandwidth)
-        hp_fd = abs(1 / (1 + hp / (1j * self._dither()[0]))) if hp > 0 else 1.0
+        hp_fd = abs(1 / (1 + hp / (1j * f_d))) if hp > 0 else 1.0
         B = bode_init("circuit only", fs, [
-            ("lock-in chain (normalized)", "#1f5fa8", L_m), (f"PID x slope (i = {i_reg:.3g} Hz, p = {p_reg:.3g})",
-                                                             "#7d3c98", C_m),
+            ("lock-in chain (normalized)", "#1f5fa8", L_m),
+            (f"PID x slope (i = {i_reg:.3g} Hz, p = {p_reg:.3g})", "#7d3c98", C_m),
             ("electronics open loop", "#1e8e3e", L_m * C_m)],
-            title="Circuit-only Bode (spare copies iq1 + pid2 driven by asg1; OUT1 untouched)",
-            note=(f"lock-in at baseband: low-pass {' + '.join(f'{b:.1f}' for b in bw)} Hz, gain x{s['err_gain']:g}; "
-                  f"input high-pass at the dither: x{hp_fd:.3f} (not in the copy). PID with i = UGF, p = P gain: "
-                  f"the lock uses i/|S|" + (f" (|S| = {Sn:.1f}/V)" if S else " (slope not measured yet)") +
-                  ". Driver and cavity are not included."))
+            title="Circuit-only Bode (spare copies iq1, pid2 driven by asg1; OUT1 untouched)",
+            note=(f"lock-in at baseband: low-pass {' + '.join(f'{b:.1f}' for b in bw)} Hz, gain x{qf0}; input "
+                  f"high-pass at the dither: x{hp_fd:.3f} (not in the copy). PID with i = UGF, p = P gain: the lock "
+                  f"uses i/|S|" + (f" (|S| = {Sn:.1f}/V)" if S else " (slope not measured yet)") +
+                  ". Driver and cavity not included. Each block auto-ranged; hollow = under 5 scope steps. "
+                  "Shaded: above dither/2, where the real lock-in folds the sidebands."))
+        B["f_dither"] = f_d
+        for cv in B["curves"]:
+            cv["low"] = []
         self._bode_publish(B)
-        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.3g} Hz on iq1 + pid2 (OUT1 untouched)")
+        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.4g} Hz on iq1 and pid2 (OUT1 untouched)")
+        A_max = s["bode_amp_mv"] * 1e-3
+        TARGET, KMAX, FLOOR = 0.3, 1024, 5 * SCOPE_LSB
         L0 = None
         for k, f in enumerate(fs):
             if self._stop_meas.is_set():
                 self.log(f"Bode stopped after {k} points")
                 break
-            self.meas_progress = f"Bode {k+1}/{len(fs)} at {f:.3g} Hz"
-            # keep the copies' outputs well inside +/-1 V and well above the 14-bit step: linear, so the ratio holds
-            amp = float(np.clip(min(0.25 / max(abs(L_m[k] * C_m[k]), 1e-9), 0.6 / max(abs(L_m[k]), 1e-9)),
-                                1e-3, s["bode_amp_mv"] * 1e-3))
-            self._bode_point_live(f, amp, "off")
-            time.sleep(min(max(3 / f, self._filter_settle()), 1.5))
-            p2.ival = 0
+            self.meas_progress = f"Bode {k+1}/{len(fs)} at {f:.4g} Hz"
+            settle = min(max(3 / f, self._filter_settle()), 1.5)
+            # lock-in copy: amplitude first (output <= 0.3 V where the chain passes), then gain x K where it attenuates
+            gL = abs(L_m[k]) * qf0
+            A = float(np.clip(TARGET / max(gL, 1e-12), 1e-3, A_max))
+            K = int(np.clip(round(TARGET / max(A * gL, 1e-12)), 1, KMAX))
+            iq.quadrature_factor = qf0 * K
+            K_L = float(iq.quadrature_factor) / qf0       # what the FPGA really uses
+            self._bode_point_live(f, A, "off")
+            time.sleep(settle)
             X, Y = self._bode_capture("iq1", f, s["bode_cycles"])
+            L, low_L = Y / X / K_L, abs(Y) < FLOOR
+            # PID copy, the same way (i and p scaled together)
+            gC = abs(C_m[k])
+            A = float(np.clip(TARGET / max(gC, 1e-12), 1e-3, A_max))
+            K = float(np.clip(TARGET / max(A * gC, 1e-12), 1, KMAX))
+            p2.p, p2.i = p_reg * K, i_reg * K
+            K_C = float(p2.i) / i_reg if i_reg else (float(p2.p) / p_reg if p_reg else 1.0)
+            self._bode_point_live(f, A, "off")
+            time.sleep(min(3 / f, 0.5))
+            p2.ival = 0
             X2, Z = self._bode_capture("pid2", f, s["bode_cycles"])
-            L, T = Y / X, Z / X2
-            L0 = L0 or L
-            for cv, val in zip(B["curves"], (L / L0, T / L, T / L0)):
+            C, low_C = Z / X2 / K_C, abs(Z) < FLOOR
+            L0 = L0 or dc_norm(L)                        # magnitude and sign only: keep the real phase lag
+            for cv, val, low in zip(B["curves"], (L / L0, C, C * L / L0), (low_L, low_C, low_L or low_C)):
                 cv["f"].append(float(f))
                 cv["c"].append(val)
-            fu, pm = margins(np.array(B["curves"][2]["f"]), np.array(B["curves"][2]["c"])) \
-                if len(B["curves"][2]["f"]) > 1 else (None, None)
+                cv["low"].append(bool(low))
+            ok = ~np.array(B["curves"][2]["low"])
+            f_ok = np.array(B["curves"][2]["f"])[ok]
+            fu, pm = margins(f_ok, np.array(B["curves"][2]["c"])[ok]) if len(f_ok) > 1 else (None, None)
             B.update(ugf=fu, pm=pm, n=k + 1, dc_gain=abs(L0))
             self._bode_publish(dict(B))
+        iq.quadrature_factor = qf0
+        n_low = sum(B["curves"][2]["low"])
         self.log(f"Bode circuit only: lock-in DC gain {abs(L0 or 0):.3f} V/V" +
                  (f"; electronics alone: unity gain {B['ugf']:.1f} Hz, phase margin {B['pm']:.0f} deg"
-                  if B.get("ugf") else ""))
+                  if B.get("ugf") else "") +
+                 (f"; {n_low} points under the scope resolution even auto-ranged (hollow)" if n_low else ""))
+
+SCOPE_LSB = 2.0 / 2 ** 14                  # one step of the 14-bit scope signal on +/-1 V
+
+
+def dc_norm(z):
+    """A real normalization constant from a low-frequency point: |z| with the sign of Re z. Dividing by the complex
+    z would also remove the real phase lag at that frequency."""
+    return abs(z) * (1.0 if z.real >= 0 else -1.0)
 
 
 def fit_sine(t, y, f):
     """Complex amplitude Z of the component of y at f (y ~ Re(Z exp(2 pi i f t)) + offset + drift),
-    by least squares; the offset and linear drift terms absorb integrator offsets and slow drifts."""
+    by least squares; the offset and linear drift terms absorb integrator offsets and slow drifts.
+    The fit uses <= 4096 samples, but never fewer than 16 per period of f."""
     t = np.asarray(t, dtype=float)
     y = np.asarray(y, dtype=float)
-    k = max(1, len(t) // 4096)
+    per_cycle = 1.0 / (f * (t[1] - t[0])) if len(t) > 1 else 1.0
+    k = int(max(1, min(len(t) // 4096, per_cycle // 16)))
     t, y = t[::k], y[::k]
     w = 2 * np.pi * f * t
     M = np.column_stack([np.cos(w), np.sin(w), np.ones_like(t), t - t.mean()])
@@ -1564,9 +1612,10 @@ def bode_json(B):
     if not B:
         return None
     out = dict(mode=B["mode"], title=B["title"], note=B["note"], n=B["n"], n_total=B["n_total"], done=B["done"],
+               f_dither=B.get("f_dither"),
                ugf=B.get("ugf"), pm=B.get("pm"), fp=[round(x, 5) for x in B["f_plan"]], curves=[])
     for cv in B["curves"]:
-        d = dict(name=cv["name"], color=cv["color"], f=[round(x, 5) for x in cv["f"]])
+        d = dict(name=cv["name"], color=cv["color"], f=[round(x, 5) for x in cv["f"]], low=cv.get("low"))
         if cv["c"]:
             c = np.asarray(cv["c"], dtype=complex)
             d["db"] = np.round(20 * np.log10(np.maximum(np.abs(c), 1e-12)), 3).tolist()
