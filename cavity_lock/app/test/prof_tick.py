@@ -10,9 +10,16 @@ time.sleep(4)
 cb = [v for k, v in app.callback_map.items() if "frame.data" in k and "frame-seq" in k][0]["callback"]
 fn = getattr(cb, "__wrapped__", None)
 print("have wrapped:", fn is not None)
+VIEW = sys.argv[1] if len(sys.argv) > 1 else "cavity"
+if VIEW == "intensity":                                   # intensity locked: power scan, then Lock
+    ctl.submit("int_switch", ("output", True)); ctl.submit("int_switch", ("scan", True)); time.sleep(2)
+    ctl.submit("int_switch", ("lock", True)); time.sleep(1)
+
+
 def one():
-    out = fn(1, ctl.version, -5, ctl.meas_seq, "", -1)   # force a new frame (and diagram state)
-    return json.dumps(out[0], cls=plotly.utils.PlotlyJSONEncoder)
+    # force a new frame (and diagram state) for the chosen view
+    out = fn(1, ctl.version, -5, ctl.meas_seq, "", -1, VIEW, -5, "", -1, -1, "", "", None)
+    return json.dumps(out, cls=plotly.utils.PlotlyJSONEncoder)
 for _ in range(3): one()
 t0 = time.time(); n = 20
 for _ in range(n): s = one()

@@ -3,6 +3,7 @@ Edits every block parameter, flips every switch, places probes, targets a peak w
 locks with the Lock switch, runs Measure noise and Measure loop, measures redraws per second, saves screenshots."""
 import asyncio
 import json
+import os
 import sys
 
 sys.path.insert(0, "..")
@@ -11,10 +12,13 @@ import schematic as SCH            # noqa: E402
 from playwright.async_api import async_playwright   # noqa: E402
 
 PORT = 8070
+# the container's Chromium (Playwright's own download is not needed); unset CHROME to use Playwright's browser
+LAUNCH = dict(executable_path=os.environ.get("CHROME", "/opt/pw-browsers/chromium"), args=["--no-sandbox"]) \
+    if os.path.exists(os.environ.get("CHROME", "/opt/pw-browsers/chromium")) else {}
 FIELD = {f[0]: f for f in A.FIELDS}
 NEW = dict(ramp_hz="13", ramp_mvpp="300", ramp_shape="sawtooth", ramp_center_mv="30", acq_dither_hz="1700",
            acq_dither_mvpp="20", phase_deg="80", ac_hz="300", lpf_hz="600", lpf_order=1, err_gain="3",
-           setpoint_mv="2", out2_signal="photodiode", out2_gain="2", ugf_hz="15", p_gain="0.3", clamp_auto=None,
+           setpoint_mv="2", ugf_hz="15", p_gain="0.3", clamp_auto=None,
            clamp_mv="30", lock_same_dither=None, lock_dither_hz="2500", lock_dither_mvpp="6", in1_scale="2",
            kappa_mhz="35", driver_bw_hz="800")
 FAILS = []
@@ -43,7 +47,7 @@ JS_PIX = """([t, y, ax]) => { const gd = document.querySelector('#scope .js-plot
 
 async def main():
     async with async_playwright() as p:
-        b = await p.chromium.launch()
+        b = await p.chromium.launch(**LAUNCH)
         pg = await b.new_page(viewport={"width": 1500, "height": 1000})
         errors = []
         pg.on("pageerror", lambda e: errors.append(str(e)))
@@ -136,7 +140,8 @@ async def main():
                     new = "sawtooth" if old != "sawtooth" else "triangle"
                 await set_value(k, new)
                 lg = await log_text()
-                ok = f"{k}=" in "\n".join(lg.splitlines()[:6])
+                head = "\n".join(lg.splitlines()[:6])
+                ok = f"{k}=" in head or (k == "ramp_center_mv" and f"ramp setpoint {float(new):+g} mV" in head)
                 rb = await pg.locator(f"#rb-{blk['id']}").inner_text()
                 check(f"{blk['id']}: {k} {old} -> {new if new is not None else 'toggled'}", ok,
                       rb.replace("\n", " | ")[:80])
@@ -190,12 +195,12 @@ async def main():
         await pg.wait_for_timeout(500)
         check("grey probe point (raw mixer) has a tooltip and does nothing", "not probe-able" in tip and
               (await pg.locator("#pb-mix").inner_text()) == "", tip[:60])
-        await pg.locator(pid(type="probe", p="out2")).click()
+        await pg.locator(pid(type="probe", p="in1")).click()
         await pg.wait_for_timeout(1500)
         names = [d["name"] for d in await pg.evaluate(JS_TRACES)]
-        check("a third probe replaces the older one (A)", "A: out2" in names and "B: pid0" in names, str(names))
+        check("a third probe replaces the older one (A)", "A: in1" in names and "B: pid0" in names, str(names))
         await pg.screenshot(path="v4_4_probes.png")
-        for sig in ("out2", "pid0", "out1", "asg0"):            # back to A = out1, B = asg0
+        for sig in ("in1", "pid0", "out1", "asg0"):             # back to A = out1, B = asg0
             await pg.locator(pid(type="probe", p=sig)).click()
             await pg.wait_for_timeout(500)
         check("probes restored", (await pg.locator("#pb-out1").inner_text()) == "A"
@@ -211,6 +216,10 @@ async def main():
             i = max(range(len(cross["x"])), key=lambda j: min(abs(cross["x"][j] - s) for s in stars))
             ax = "yaxis2"                                            # error row (transmission is row 1)
             px = await pg.evaluate(JS_PIX, [cross["x"][i], 0, ax])
+            if px[1] > 900 or px[1] < 50:                      # bring the point into the viewport first
+                await pg.evaluate(f"window.scrollBy(0, {px[1] - 500})")
+                await pg.wait_for_timeout(300)
+                px = await pg.evaluate(JS_PIX, [cross["x"][i], 0, ax])
             await pg.mouse.click(*px)
             await pg.wait_for_timeout(1500)
             txt = await pg.locator("#target-text").inner_text()
@@ -306,7 +315,7 @@ async def main():
         check("closed-loop Bode fills in point by point", len([n for n in seen if 0 < n < 10]) >= 3,
               f"point counts seen: {seen}")
         check("status shows the sweep progress", "Bode" in stat and "MEASURING" in stat, stat[:70])
-        await pg.locator("#rb-testgen").scroll_into_view_if_needed()
+        await pg.locator("#rb-ramp").scroll_into_view_if_needed()
         await pg.screenshot(path="v4_8_bode_running.png", clip={"x": 0, "y": 0, "width": 1500, "height": 560})
         st = await bode_wait_done()
         check("closed-loop Bode completes with UGF and phase margin", st["n"] == 10 and "unity gain" in st["title"],

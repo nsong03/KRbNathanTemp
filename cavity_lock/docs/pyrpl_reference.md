@@ -16,7 +16,11 @@ Every statement here was read from that source or from PyRPL's Python modules, o
           ─▶ clamp [min_voltage, max_voltage] ─▶ output_direct = out1
  asg0 (ramp / halframp) ─▶ output_direct = out1
  Σ (red_pitaya_dsp.v, 5-clock adder tree of every module with output_direct out1) ─▶ saturate ±1 V ─▶ DAC (AD9767) ─▶ OUT1
- pid1: input = iq0 / pid0 / asg0 / in1, P = out2_gain, I = 0 ─▶ out2   (OUT2 monitor)
+ IN2 ─ ADC ─▶ pid2 (intensity servo): error = in2 − setpoint ─▶ [inputfilter, ≤4 stages] ─▶ P·e + ∫ I·e
+          ─▶ clamp [min_voltage, max_voltage] ─▶ output_direct = out2
+ asg1 (power-scan triangle / Bode test sine) ─▶ output_direct = out2
+ Σ (out2: pid2 + asg1) ─▶ saturate ±1 V ─▶ DAC ─▶ OUT2 ─▶ bias driver ─▶ mixer IF ─▶ RF amp ─▶ AOM
+ pid1: off (kept free; the only differential-mode partner of pid0). The v4 OUT2 monitor is removed.
 ```
 Latency, from the Verilog simulation and datasheets:
 - IN1 → `iq0` (filters off) → `pid0` → OUT1 takes 12 FPGA clocks = 96 ns.
@@ -44,21 +48,33 @@ Latency, from the Verilog simulation and datasheets:
 | | `min_voltage`, `max_voltage` | output clamp. The app sets ±0.4·(mode spacing) around the lock point |
 | | `inputfilter` | `[0,0,0,0]` (off) |
 | | `output_direct` | `"out1"` / `"off"` |
-| pid1 | as above | OUT2 monitor: `p = out2_gain`, `i = 0` |
+| pid1 | as above | off; borrowed (output off) as the PID copy of the cavity circuit-only Bode |
+| pid2 | as above | intensity servo: `input = "in2"`, `output_direct = "out2"`, gains from the measured plant gain K (i·K < 0) |
+| asg1 | `setup(...)` | intensity power scan (`"ramp"` = triangle on out2, scope trigger `asg1`) and Bode test sine (`"sin"`) |
 | asg0 | `setup(waveform, frequency, amplitude, offset, trigger_source, output_direct)` | `"ramp"` = **triangle**, `"halframp"` = sawtooth. The ramp is the scope trigger (`trigger_source="asg0"` on the scope) |
 | scope | `input1`, `input2`, `duration`, `average`, `rolling_mode`, `trigger_source`, `trigger_delay`, `durations` | 2 channels, 16384 points per trace. Sources are any DSP signal name: `in1`, `in2`, `out1`, `out2`, `iq0`–`iq2`, `iq2_2`, `pid0`–`pid2`, `asg0`, `asg1`, `iir`, `trig` **(verify with `r.scope.inputs`)** |
 | scope (0.9.9.1) | `_start_trace_acquisition()`, `curve_ready()`, `_get_trace()` | 0.9.3 uses `_start_acquisition()` / `_get_curve()`. `single()` is the slow fallback |
 | networkanalyzer | `p.networkanalyzer.setup(start_freq, stop_freq, points, rbw, average_per_point, amplitude, input, output_direct, acbandwidth, logscale, auto_bandwidth, q_factor_min, auto_amplitude)`, `single()`, `frequencies` | uses a free IQ module. Reserve yours with `.owner` first |
 | iir | not used | available for a true band-pass or notch on IN1: route in1 → iir → iq0.input. It adds latency **(verify)** |
 
-Unused modules (`asg1`, `pid2`, `iq1`, `iq2`) get `output_direct = "off"` at start-up so that nothing else writes to OUT1.
+Spare modules (`iq1`, `iq2`) get `output_direct = "off"` at start-up, and `pid1` is switched off. `pid2` and `asg1`
+belong to the intensity servo (`intensity.py`): the cavity code never writes them, and they are never reset at
+start-up while pid2 runs with non-zero gains.
 
-"Measure Bode plot" uses `asg1`, `iq1` and `pid2` (reserved with `.owner`). Assumptions to check on hardware **(verify)**:
-- `asg1.setup(waveform="sin", ...)` with `output_direct="off"` still produces the internal signal `asg1` for the scope
+The cavity "Measure Bode plot" uses `asg0` (idle while locked), `iq1` and `pid1` (reserved with `.owner`; outputs off).
+The intensity Bode uses `asg1` on out2. Assumptions to check on hardware **(verify)**:
+- `asg0.setup(waveform="sin", ...)` with `output_direct="off"` still produces the internal signal `asg0` for the scope
   and for `iq1.input`.
 - `iq1.frequency = 0` makes the mixer multiply by cos(phase), so `iq1` is the input through the low-pass stages and
   `quadrature_factor` (the app reports the measured DC gain of this copy; the plot normalizes it).
-- The scope accepts `asg1`, `iq1` and `pid2` as inputs (they are DSP signals like `iq0` and `pid0`).
+- The scope accepts `asg0`, `asg1`, `iq1`, `pid1`, `pid2`, `in2`, `out2` as inputs (DSP signals like `iq0`, `pid0`).
+- `r.sampler.in1`, `.in2` return the present sample (one register read each): used for the hidden loop's background
+  watchdog. Present in the 0.9.9.1 Python source; check it on the board (read-only connection check).
+
+Checked in the 0.9.9.1 Python source (2026-11-02): scope trigger sources include `asg0` and `asg1`; pid `p` is a
+24-bit register with norm 2^12 (max ≈ 2048), `i` 24-bit with norm 2^32·2π·8 ns (step ≈ 0.0046 Hz, max ≈ 38.9 kHz);
+`inputfilter` = up to 4 stages, positive = low-pass, negative = high-pass, power-of-2 ladder; the D gain is commented
+out; `differential_mode_enabled` exists only for pid0/pid1.
 
 ## Signals that can and cannot be probed
 The scope sees only DSP signal names. With the app's routing:
@@ -69,7 +85,7 @@ Can probe:
 - `asg0`: the ramp.
 - `pid0`: the PID output (= setpoint while locked).
 - `out1`: the total drive = ramp + dither + PID.
-- `out2`, and `in2`.
+- `in2` (intensity photodiode), `pid2` (servo output), `asg1`, `out2` (pid2 + asg1).
 
 Cannot probe without re-routing, which disturbs the lock:
 - the signal between the high-pass and the mixer;

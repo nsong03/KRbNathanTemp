@@ -15,7 +15,7 @@ import math
 
 OUT_LIMIT = 0.95                      # never command OUT1 beyond +/- this [V] (the DAC saturates at +/- 1 V)
 I_STEP = 1.0 / (2 ** 32 * 2 * math.pi * 8e-9)   # pid.i register resolution [Hz] (~0.0046 Hz)
-CANVAS_W, CANVAS_H = 1340, 515
+CANVAS_W, CANVAS_H = 1340, 500
 
 
 def P(key, attr, live="always", inline=True, widget=None):
@@ -97,23 +97,17 @@ BLOCKS = [
               "summed into OUT1 (iq0.output_direct). Two contexts: ACQ (scan) and LOCK; the lock dither "
               "equals the acquisition dither unless unticked. Amplitude is pp on OUT1, calibrated by "
               "measuring it on OUT1."),
-    dict(id="ramp", label="Ramp / scan", kind="dsp", x=320, y=345, w=230, h=110,
+    dict(id="ramp", label="Ramp / scan", kind="dsp", x=320, y=345, w=230, h=142,
          params=[P("ramp_hz", "asg0.frequency", live="acquire"), P("ramp_mvpp", "asg0.amplitude", live="acquire"),
-                 P("ramp_shape", "asg0.waveform", live="acquire", inline=False),
-                 P("ramp_center_mv", "asg0.offset", live="acquire", inline=False)],
+                 P("ramp_center_mv", "asg0.offset", live="acquire"),
+                 P("ramp_shape", "asg0.waveform", live="acquire", inline=False)],
          opts=[],
          note="asg0: triangle ('ramp') or sawtooth ('halframp'), summed into OUT1 through the Scan switch. "
-              "It triggers the scope. Clipped so ramp + dither stay inside +/-0.95 V."),
-    dict(id="out2", label="OUT2 monitor (pid1)", kind="dsp", x=900, y=420, w=200, h=88,
-         params=[P("out2_signal", "pid1.input", widget="select"), P("out2_gain", "pid1.p", inline=False)], opts=[],
-         note="pid1 as a pass-through (i = 0, P = gain) from error (iq0), setpoint (pid0), ramp (asg0) or "
-              "photodiode (in1) to OUT2, for an external scope."),
-    dict(id="testgen", label="Test sine (asg1)", kind="dsp", x=880, y=86, w=230, h=34, params=[], opts=[],
-         note="asg1, the swept-sine generator of 'Measure Bode plot'. Closed loop: a small sine summed into OUT1 "
-              "(amplitude = Loop excitation x linewidth). Circuit only: it drives spare copies of the blocks "
-              "(iq1, pid2) and is not routed to any output. Off otherwise."),
-    dict(id="out2term", label="OUT2", kind="node", x=1222, y=445, w=106, h=40, params=[], opts=[],
-         note="OUT2 -> external scope."),
+              "It triggers the scope. Clipped so ramp + dither stay inside +/-0.95 V. Setpoint = the ramp centre "
+              "(asg0.offset): moves the scan live; after Scan off OUT1 is parked there (pid0.ival), and the "
+              "setpoint then moves the parked level (not while locked or held after an unlock). Also the swept-sine "
+              "generator of 'Measure Bode plot': closed loop = a small sine into OUT1 while locked (the ramp is "
+              "off then); circuit only = it drives spare copies iq1 -> pid1 with their outputs off."),
 ]
 BLOCK = {b["id"]: b for b in BLOCKS}
 
@@ -173,8 +167,6 @@ WIRES = [
     dict(id="lo_mix", kind="lo", pts=[(216, 250), (216, 193)]),
     dict(id="dith_sum", kind="drv", pts=[(270, 362), (290, 362), (290, 333), (1132, 333), (1132, 193)]),
     dict(id="ramp_sum", kind="drv", pts=[(550, 410), (1148, 410), (1148, 193)]),
-    dict(id="out2", kind="mon", pts=[(1100, 465), (1222, 465)]),
-    dict(id="test_sum", kind="drv", pts=[(1110, 103), (1140, 103), (1140, 153)]),
 ]
 
 SWITCHES = [
@@ -201,8 +193,6 @@ PROBES = [
          why="the bare dither oscillator is not a scope signal; it shows on out1 when the ramp and PID are off"),
     dict(id="asg0", signal="asg0", x=610, y=410, label="asg0: ramp"),
     dict(id="out1", signal="out1", x=1275, y=100, label="out1: total drive (ramp + dither + PID)"),
-    dict(id="out2", signal="out2", x=1160, y=465, label="out2: OUT2 monitor"),
-    dict(id="asg1", signal="asg1", x=1140, y=128, label="asg1: Bode test sine"),
 ]
 PROBE_SIGNALS = [p["signal"] for p in PROBES if p["signal"]]
 
@@ -256,23 +246,16 @@ def w_setpoint(ctl):
     ctl.r.pid0.setpoint = ctl.s["setpoint_mv"] * 1e-3
 
 
-def w_out2(ctl):
-    s, p1 = ctl.s, ctl.r.pid1
-    p1.i, p1.ival, p1.setpoint = 0, 0, 0
-    p1.p = s["out2_gain"]
-    p1.min_voltage, p1.max_voltage = -1.0, 1.0
-    if s["out2_signal"] == "off":
-        p1.output_direct = "off"
-    else:
-        p1.input = OUT2_SOURCE[s["out2_signal"]]
-        p1.output_direct = "out2"
-
-
 def w_ramp(ctl):
     """asg0 is live only while scanning (mode acquire); the lock sequence drives it itself otherwise."""
+    s = ctl.s
+    if ctl.mode == "held" and getattr(ctl, "_parked_at_ramp", False):
+        v = max(min(s["ramp_center_mv"] * 1e-3, OUT_LIMIT), -OUT_LIMIT)   # Scan off: the park follows the setpoint
+        ctl.r.pid0.ival = v
+        ctl.log(f"ramp setpoint: OUT1 held at {v*1e3:+.1f} mV")
+        return
     if ctl.mode != "acquire":
         return
-    s = ctl.s
     lo, hi = ctl._ramp_limits(s["ramp_center_mv"] * 1e-3, s["ramp_mvpp"] * 1e-3)
     ctl._ramp_on(lo, hi, s["ramp_hz"], s["ramp_shape"])
 
@@ -290,10 +273,9 @@ def w_limiter(ctl):
         li["clamp"] = (lo, hi)
 
 
-OUT2_SOURCE = {"error": "iq0", "setpoint": "pid0", "ramp": "asg0", "photodiode": "in1"}
 WRITERS = dict(mixer=w_mixer, bandpass=w_bandpass, lowpass=w_lowpass, amp=w_amp, phase=w_phase, dither=w_dither,
-               setpoint=w_setpoint, out2=w_out2, ramp=w_ramp, pid=w_pid, limiter=w_limiter)
-STATIC = ["mixer", "dither", "phase", "bandpass", "lowpass", "amp", "setpoint", "out2"]   # configure() order
+               setpoint=w_setpoint, ramp=w_ramp, pid=w_pid, limiter=w_limiter)
+STATIC = ["mixer", "dither", "phase", "bandpass", "lowpass", "amp", "setpoint"]   # configure() order
 LIVE = ["ramp", "pid", "limiter"]
 
 
@@ -323,19 +305,17 @@ READBACK = {
             "input"],
     "pid0": ["i", "p", "setpoint", "min_voltage", "max_voltage", "output_direct", "input"],
     "asg0": ["waveform", "frequency", "amplitude", "offset", "output_direct"],
-    "pid1": ["input", "p", "output_direct"],
-    "asg1": ["waveform", "frequency", "amplitude", "output_direct"],
 }
 
 
-def read_hw(r):
+def read_hw(r, readback=None):
     hw = {}
-    for mod, attrs in READBACK.items():
+    for mod, attrs in (readback or READBACK).items():
         m = getattr(r, mod)
         for a in attrs:
             try:
                 v = getattr(m, a)
-                if a == "bandwidth":
+                if a in ("bandwidth", "inputfilter"):
                     v = [float(x) for x in (v if hasattr(v, "__len__") else [v])]
                 elif isinstance(v, (int, float)) and not isinstance(v, bool):
                     v = float(v)
@@ -355,7 +335,8 @@ BUSY = ("locking", "busy", "measuring", "connecting")
 
 def switch_states(mode, hw, s):
     """True/False for every switch, from the register readback and the mode."""
-    return dict(scan=hw.get("asg0.output_direct") == "out1" and (hw.get("asg0.amplitude") or 0) > 0,
+    return dict(scan=hw.get("asg0.output_direct") == "out1" and (hw.get("asg0.amplitude") or 0) > 0
+                and hw.get("asg0.waveform") != "sin",
                 dither=hw.get("iq0.output_direct") == "out1",
                 lock=mode in ("locking", "locked", "measuring"),
                 output=mode != "off",
@@ -437,8 +418,9 @@ def diagram_state(snap, pm=None):
         if iv is not None:
             lim.append((f"out {iv*1e3:+.2f} mV", "dim"))
     B["limiter"] = lim
-    parts = [n for n, on in (("ramp", hw.get("asg0.output_direct") == "out1"),
-                             ("test sine", hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0),
+    sine = hw.get("asg0.waveform") == "sin" and (hw.get("asg0.amplitude") or 0) > 0
+    parts = [n for n, on in (("ramp", sw["scan"]),
+                             ("test sine", sine and hw.get("asg0.output_direct") == "out1"),
                              ("dither", hw.get("iq0.output_direct") == "out1"),
                              ("PID", hw.get("pid0.output_direct") == "out1")) if on]
     B["sum"] = []
@@ -464,26 +446,22 @@ def diagram_state(snap, pm=None):
         tag = "lock sweep: " if mode in ("locking", "busy") and snap.get("ctx") == "lock" else ""
         B["ramp"] = [(f"{tag}{wf} {_f(hw.get('asg0.frequency'), '{:.3g}')} Hz", ""),
                      (f"{(o-a)*1e3:+.0f}..{(o+a)*1e3:+.0f} mV", "dim")]
+    elif sine:
+        a0 = hw["asg0.amplitude"]
+        B["ramp"] = [(f"Bode test sine {_f(hw.get('asg0.frequency'), '{:.3g}')} Hz", ""),
+                     (f"{a0*1e3:.3g} mV → " + ("OUT1" if hw.get("asg0.output_direct") == "out1"
+                                               else "iq1/pid1 copies (outputs off)"), "dim")]
+    elif snap.get("parked_at_ramp") and mode == "held":
+        B["ramp"] = [("off: OUT1 held at the setpoint", "")]
     else:
         B["ramp"] = [("off", "dim")]
-    if hw.get("pid1.output_direct") == "out2":
-        B["out2"] = [(f"{s['out2_signal']} ({hw.get('pid1.input')}) ×{_f(hw.get('pid1.p'), '{:g}')}", "")]
-    else:
-        B["out2"] = [("off", "dim")]
-    B["out2term"] = []
-    if (hw.get("asg1.amplitude") or 0) > 0 and mode == "measuring":
-        a1 = hw["asg1.amplitude"]
-        B["testgen"] = [(f"sine {_f(hw.get('asg1.frequency'), '{:.3g}')} Hz, {a1*1e3:.3g} mV → "
-                         + ("OUT1" if hw.get("asg1.output_direct") == "out1" else "iq1/pid2 copies"), "")]
-    else:
-        B["testgen"] = [("off", "dim")]
+    B["ramp"].append((f"setpoint {s['ramp_center_mv']:+g} mV (centre)", "dim"))
     wires = dict(
         pd_in1=True, bp_mix=True, mix_lpf=True, lpf_amp=True, amp_sp=True, nco_phase=True, lo_mix=True,
         sp_pid=hw.get("pid0.input") == "iq0" and bool(hw.get("pid0.i")),
         pid_lim=hw.get("pid0.output_direct") == "out1", lim_sum=hw.get("pid0.output_direct") == "out1",
         sum_out=mode != "off", out_plant=mode != "off", drv_cav=True, cav_pd=True,
-        dith_sum=sw["dither"], ramp_sum=sw["scan"], out2=hw.get("pid1.output_direct") == "out2",
-        test_sum=hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0)
+        dith_sum=sw["dither"], ramp_sum=sw["scan"] or (sine and hw.get("asg0.output_direct") == "out1"))
     busy = mode in BUSY
     swd = {}
     for k, on in sw.items():
