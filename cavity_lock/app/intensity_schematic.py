@@ -69,44 +69,38 @@ BLOCKS = [
               "negative = high-pass, 0 = off. Any filter adds phase lag inside a 100 kHz loop: usually off."),
     dict(id="i_setpoint", label="Setpoint adjuster", kind="dsp", x=230, y=200, w=250, h=134,
          params=[P("int_setpoint_mv", "pid2.setpoint")], opts=[],
-         note="pid2.setpoint in photodiode volts. The error is IN2 - setpoint. Slider (0 .. the most light the "
-              "power scan allows), +/- steps or type a value; written live, also while locked (the gains are "
-              "re-derived from the scan's K at the new setpoint)."),
+         note="pid2.setpoint in photodiode volts. The error is IN2 - setpoint. Slider, +/- steps or type a value; "
+              "written live, also while locked. K was measured at one operating point: after a large setpoint "
+              "change, re-measure it with a (locked) Bode plot."),
     dict(id="i_pid", label="PI (pid2)", kind="dsp", x=530, y=200, w=245, h=188,
          params=[P("int_gain_mode", "pid2.i", live="locked", widget="select"),
                  P("int_ugf_khz", "pid2.i", live="locked"),
                  P("int_p", "pid2.p", live="locked", widget="select"),
                  P("int_i_hz", "pid2.i", live="locked", widget="select"),
                  P("int_corner_khz", "pid2.p", live="locked", inline=False)],
-         opts=["int_gain_ramp"],
+         opts=["int_gain_ramp", "int_plant_sign"],
          note="pid2: output = p e + 2 pi i ∫ e dt. Negative feedback needs i K < 0, |i K| = loop bandwidth. "
-              "Bandwidth mode: i = -f_u/K, p = i/f_corner. Manual: P and I magnitudes from the dropdowns, sign "
-              "-sign(K). i is limited to 38.9 kHz (24 bit), so the integrator bandwidth is at most 38.9 kHz x |K|; "
+              "Bandwidth mode (needs K from a Bode plot): i = -f_u/K, p = i/f_corner. Manual: P and I magnitudes from "
+              "the dropdowns, sign -sign(K), or from the plant-sign setting while K is not measured. i is limited to 38.9 kHz (24 bit), so the integrator bandwidth is at most 38.9 kHz x |K|; "
               "p to 2048. The D term is not in this FPGA build (0.9.9.1). Written only while locked."),
-    dict(id="i_limiter", label="Limiter", kind="dsp", x=820, y=200, w=150, h=112,
-         params=[P("int_clamp_auto", "pid2.min_voltage", live="locked"),
-                 P("int_clamp_margin", "pid2.max_voltage", live="locked", inline=False),
-                 P("int_clamp_lo_mv", "pid2.min_voltage", live="locked", inline=False),
-                 P("int_clamp_hi_mv", "pid2.max_voltage", live="locked", inline=False),
+    dict(id="i_limiter", label="Limiter", kind="dsp", x=820, y=200, w=150, h=132,
+         params=[P("int_clamp_lo_mv", "pid2.min_voltage", live="locked"),
+                 P("int_clamp_hi_mv", "pid2.max_voltage", live="locked"),
                  P("int_out2_limit_mv", None, inline=False)],
          opts=["int_auto_reengage", "int_rail_s", "int_light_frac"],
-         note="pid2.min_voltage / max_voltage. Auto: the bright side stops where the light is (1 - margin) x the "
-              "efficiency peak (from the power scan), the dark side at the scan limit. Watchdog: output at a "
-              "clamp longer than 'railed after' -> railed fault (hold); light below the threshold -> hold, and "
-              "re-engage when it is back (Re-engage switch). The OUT2 limit bounds every scan and clamp."),
+         note="pid2.min_voltage / max_voltage in OUT2 volts. More OUT2 = less light, so the low clamp is the "
+              "bright side: keep it short of the AOM's diffraction-efficiency peak (past the peak the plant gain "
+              "changes sign and the servo would latch at full drive). Watchdog: output at a clamp longer than "
+              "'railed after' -> railed fault (hold); light below the threshold -> hold, and re-engage when it is "
+              "back (Re-engage switch). The OUT2 limit bounds the clamps and the Bode test sine."),
     dict(id="i_sum", label="Σ", kind="node", x=1090, y=233, w=40, h=40, params=[], opts=[],
          note="Every module with output_direct = out2 is summed digitally onto OUT2: pid2 and asg1."),
     dict(id="i_out2", label="OUT2", kind="node", x=1210, y=220, w=110, h=66, params=[], opts=[],
          note="OUT2 -> 50 ohm tee -> bias driver. Useful range only about +/-0.1-0.2 V (x10 driver gain)."),
-    dict(id="i_scan", label="Power scan (asg1)", kind="dsp", x=230, y=372, w=280, h=88,
-         params=[P("int_scan_lo_mv", "asg1.offset", live="scanning"), P("int_scan_hi_mv", "asg1.amplitude",
-                                                                         live="scanning"),
-                 P("int_scan_hz", "asg1.frequency", live="scanning", inline=False),
-                 P("int_scan_avg", None, inline=False)],
-         opts=[],
-         note="asg1 triangle on OUT2 with the loop open (pid2 p = i = 0, ival = 0); the scope triggers on asg1 and "
-              "plots the photodiode against OUT2. Finds the efficiency peak, the auto clamp, K = dV_IN2/dV_OUT2 at "
-              "the setpoint and the most light available. Also the Bode test-sine generator while locked."),
+    dict(id="i_asg1", label="Bode test sine (asg1)", kind="dsp", x=230, y=380, w=280, h=60, params=[], opts=[],
+         note="asg1: the swept sine of 'Measure Bode plot', summed onto OUT2. Locked: closed-loop G, S, T and the "
+              "plant. Not locked (Output off or held): the open-loop plant dV_IN2/dV_OUT2 around the present drive; "
+              "its low-frequency value is K. Off otherwise."),
 ]
 BLOCK = {b["id"]: b for b in BLOCKS}
 
@@ -114,7 +108,7 @@ HOMES = {
     "i_scope": ["int_window_us"],
     "i_scope_bar": ["int_panels", "int_probe_a", "int_probe_b"],
     "i_measure": ["int_bode_start_hz", "int_bode_stop_hz", "int_bode_points", "int_bode_cycles",
-                  "int_bode_amp_frac"],
+                  "int_bode_amp_frac", "int_bode_amp_mv"],
 }
 
 OWNER = {}
@@ -158,18 +152,17 @@ WIRES = [
     dict(id="mix_amp", kind="plant", pts=[(800, 43), (725, 43)]),
     dict(id="amp_aom", kind="plant", pts=[(545, 43), (470, 43)]),
     dict(id="aom_pd", kind="plant", pts=[(290, 43), (200, 43)]),
-    dict(id="scan_sum", kind="drv", pts=[(510, 416), (1110, 416), (1110, 273)]),
+    dict(id="asg_sum", kind="drv", pts=[(510, 410), (1110, 410), (1110, 273)]),
 ]
 
 SWITCHES = [
     dict(id="lock", label="Lock", x=505, y=250),
     dict(id="output", label="Output", x=1035, y=253),
-    dict(id="scan", label="Scan", x=900, y=416),
-    dict(id="reengage", label="Re-engage", x=895, y=350),
+    dict(id="reengage", label="Re-engage", x=895, y=372),
 ]
 SWITCH_TITLES = {
-    "scan": "Scan: asg1 power scan on OUT2 with the loop open (on while locked asks to unlock first)",
-    "lock": "Lock: asg1 off, set the clamp, park at the scan's OUT2 for the setpoint, ramp the gains up; "
+    "lock": "Lock: set the clamp, start from the present drive, ramp the gains up (the integrator brings the light "
+            "to the setpoint); "
             "off = hold the present drive",
     "output": "Output: pid2.output_direct (out2 / off). Off: OUT2 = 0 V = the bias level",
     "reengage": "Re-engage: after a 'no light' hold, lock again when the light is back",
@@ -180,7 +173,7 @@ PROBES = [
     dict(id="err", signal=None, x=212, y=250, why="after the input filter / error: inside pid2, not a scope "
                                                   "signal; probe in2 and subtract the setpoint"),
     dict(id="pid2", signal="pid2", x=990, y=253, label="pid2: servo output (after the limiter)"),
-    dict(id="asg1", signal="asg1", x=560, y=416, label="asg1: power scan / Bode test sine"),
+    dict(id="asg1", signal="asg1", x=560, y=410, label="asg1: Bode test sine"),
     dict(id="out2", signal="out2", x=1170, y=253, label="out2: total OUT2 (pid2 + asg1)"),
 ]
 PROBE_SIGNALS = [p["signal"] for p in PROBES if p["signal"]]
@@ -215,14 +208,9 @@ def w_limiter(it):
         it.apply_clamp()
 
 
-def w_scan(it):
-    if it.mode == "scanning":
-        it.scan_on(quiet=True)
-
-
-WRITERS = dict(i_filter=w_filter, i_setpoint=w_setpoint, i_pid=w_pid, i_limiter=w_limiter, i_scan=w_scan)
+WRITERS = dict(i_filter=w_filter, i_setpoint=w_setpoint, i_pid=w_pid, i_limiter=w_limiter)
 STATIC = ["i_filter", "i_setpoint"]
-LIVE = ["i_scan", "i_limiter", "i_pid"]
+LIVE = ["i_limiter", "i_pid"]
 
 
 def write_static(it):
@@ -233,7 +221,7 @@ def write_static(it):
 def apply_changed(it, changed):
     owners = {OWNER.get(k) for k in changed}
     if "int_out2_limit_mv" in changed:
-        owners |= {"i_scan"}
+        owners |= {"i_limiter"}
     done = []
     for b in STATIC + LIVE:
         if b in owners:
@@ -258,13 +246,8 @@ def read_hw(r):
 BUSY = ("locking", "measuring", "busy")
 
 
-def scan_live(hw):
-    return hw.get("asg1.output_direct") in ("out2", "both") and (hw.get("asg1.amplitude") or 0) > 0 \
-        and hw.get("asg1.waveform") != "sin"
-
-
 def switch_states(mode, hw, s):
-    return dict(scan=scan_live(hw), lock=mode in ("locking", "locked", "measuring"),
+    return dict(lock=mode in ("locking", "locked", "measuring"),
                 output=hw.get("pid2.output_direct") in ("out2", "both"), reengage=bool(s.get("int_auto_reengage")))
 
 
@@ -283,7 +266,7 @@ def _mw(s, v):
 
 
 def diagram_state(snap):
-    s, hw, mode, li, sc = snap["settings"], snap["hw"], snap["mode"], snap["lock"], snap.get("scan") or {}
+    s, hw, mode, li, pl = snap["settings"], snap["hw"], snap["mode"], snap["lock"], snap.get("plant") or {}
     sw = switch_states(mode, hw, s)
     W = "warn"
     B = {}
@@ -314,12 +297,9 @@ def diagram_state(snap):
         B["i_filter"] = [("off (pass-through)", ""), ("4 stages max, factor-2 ladder", "dim")]
     sp = hw.get("pid2.setpoint")
     spl = [(("? mV" if sp is None else f"{sp*1e3:.1f} mV") + _mw(s, sp), "")]
-    if sc.get("max_lock") is not None and sp is not None and sp > sc["max_lock"]:
-        spl.append((f"above max lockable {sc['max_lock']*1e3:.0f} mV!", W))
-    elif sc.get("max_lock") is not None:
-        spl.append((f"max lockable {sc['max_lock']*1e3:.0f} mV (scan)", "dim"))
     B["i_setpoint"] = spl
-    p_hw, i_hw, K = hw.get("pid2.p"), hw.get("pid2.i"), li.get("K") or sc.get("K")
+    p_hw, i_hw = hw.get("pid2.p"), hw.get("pid2.i")
+    K = (li.get("K") if li.get("K_measured") else None) or pl.get("K")
     pidl = [(f"p {'?' if p_hw is None else f'{p_hw:+.4g}'}   i {'?' if i_hw is None else f'{i_hw:+.4g}'} Hz", "")]
     if K:
         pidl.append((f"K {K:+.2f} V/V · |i·K| {abs((i_hw or 0) * K)/1e3:.1f} kHz", ""))
@@ -330,7 +310,8 @@ def diagram_state(snap):
         else:
             pidl.append((f"integrator cap {cap/1e3:.0f} kHz", "dim"))
     else:
-        pidl.append(("K unknown: run a power scan", "dim"))
+        sign = "−" if s["int_plant_sign"].startswith("negative") else "+"
+        pidl.append((f"K not measured (Bode plot); sign {sign}", "dim"))
     if mode in ("locked", "measuring") and i_hw == 0 and (p_hw or 0) == 0:
         pidl.append(("gains round to 0!", W))
     pm = snap.get("pm")
@@ -344,10 +325,7 @@ def diagram_state(snap):
         lim = [(f"{'?' if lo is None else f'{lo*1e3:+.1f}'}..{'?' if hi is None else f'{hi*1e3:+.1f}'} mV", "")]
     if drive is not None and hw.get("pid2.output_direct") == "out2":
         lim.append((f"out {drive*1e3:+.2f} mV", "dim"))
-    if sc.get("u_peak") is not None:
-        lim.append((f"peak at {sc['u_peak']*1e3:+.0f} mV", "dim"))
-    elif sc:
-        lim.append(("no peak in the scan range", "dim"))
+    lim.append(("low = bright side", "dim"))
     B["i_limiter"] = lim
     B["i_sum"] = []
     parts = [n for n, on in (("pid2", sw["output"]),
@@ -356,19 +334,17 @@ def diagram_state(snap):
     B["i_out2"] = [(f"limit ±{s['int_out2_limit_mv']:g} mV", ""),
                    ("= " + " + ".join(parts) if parts else "0 V = bias level", "dim")]
     a1 = hw.get("asg1.amplitude") or 0
-    if sw["scan"]:
-        o = hw.get("asg1.offset") or 0
-        B["i_scan"] = [(f"triangle {hw.get('asg1.frequency') or 0:.3g} Hz on OUT2", ""),
-                       (f"{(o-a1)*1e3:+.0f}..{(o+a1)*1e3:+.0f} mV", "dim")]
-    elif a1 > 0 and hw.get("asg1.waveform") == "sin" and hw.get("asg1.output_direct") == "out2":
-        B["i_scan"] = [(f"Bode test sine {hw.get('asg1.frequency') or 0:.4g} Hz, {a1*1e3:.3g} mV", "")]
+    if a1 > 0 and hw.get("asg1.output_direct") == "out2":
+        B["i_asg1"] = [(f"sine {hw.get('asg1.frequency') or 0:.4g} Hz, {a1*1e3:.3g} mV on OUT2", "")]
     else:
-        B["i_scan"] = [("off", "dim")]
+        B["i_asg1"] = [("off", "dim")]
+    if pl.get("K"):
+        B["i_asg1"].append((f"last K {pl['K']:+.2f} V/V at {pl.get('u0', 0)*1e3:+.1f} mV", "dim"))
     asg_on = hw.get("asg1.output_direct") in ("out2", "both") and a1 > 0
     closed = hw.get("pid2.input") == "in2" and bool(hw.get("pid2.i") or hw.get("pid2.p"))
     wires = dict(pd_in2=True, f_sp=True, sp_pid=closed, pid_lim=sw["output"], lim_sum=sw["output"],
                  sum_out=sw["output"] or asg_on, out_drv=True, drv_mix=True, src_mix=True, mix_amp=True,
-                 amp_aom=True, aom_pd=True, scan_sum=asg_on)
+                 amp_aom=True, aom_pd=True, asg_sum=asg_on)
     busy = mode in BUSY
     swd = {}
     for k, on in sw.items():

@@ -18,11 +18,11 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 OUT2 is no longer a scope monitor. The intensity hardware is described in `docs/intensity_hardware.md` (not built yet).
 
 ## Status
-- **v5 — AOM intensity stabilization** (2026-11-02): a second feature on IN2/OUT2 (`pid2` servo, `asg1` power scan).
+- **v5 — AOM intensity stabilization** (2026-11-02): a second feature on IN2/OUT2 (`pid2` servo, `asg1` Bode test sine).
   Two icons at the top left switch between the *Cavity lock* and *Intensity* views; each icon has a status dot, both
-  loops always run in hardware and share the scope (scheduled). Intensity: power scan (efficiency peak, clamp below
-  it, measured plant gain K), PI lock from a target bandwidth or P/I dropdowns, setpoint adjuster, watchdog (railed,
-  no light + re-engage), swept-sine Bode plot. Plan: `docs/intensity_plan.md`. Tested on the fake only.
+  loops always run in hardware and share the scope (scheduled). Intensity: swept-sine Bode plot (open loop: the plant and
+  its gain K; locked: G, disturbance suppression, closed loop), PI lock from a target bandwidth or P/I dropdowns,
+  setpoint adjuster, watchdog (railed, no light + re-engage). No scan. Plan: `docs/intensity_plan.md`. Tested on the fake only.
 - **v4** (2026-11-01): the settings sidebar is now a Moku-style schematic of the real FPGA chain, with switches
   (Scan, Dither, Lock, Output, Auto-relock), probe points (2 scope channels) and Lock Assist crosshairs.
   Plan and register map: `docs/schematic_plan.md`; screenshots: `docs/screenshots/`. Tested on the fake only.
@@ -43,7 +43,7 @@ OUT2 is no longer a scope monitor. The intensity hardware is described in `docs/
 | `app/cavity_lock_app.py` | The app (analysis + Controller). Run: `python app\cavity_lock_app.py --host rp-f0fa92.local` |
 | `app/schematic.py` | The block diagram as data: blocks, parameter → register map, writers, wires, switches, probes |
 | `app/ui.py` | Dash UI: the two views (schematic canvases, popovers, embedded scopes), view icons |
-| `app/intensity.py` | AOM intensity servo: settings, power-scan analysis, controller (pid2 / asg1) |
+| `app/intensity.py` | AOM intensity servo: settings, Bode measurement, controller (pid2 / asg1) |
 | `app/intensity_schematic.py` | The intensity block diagram as data (blocks, registers, writers, wires, switches, probes) |
 | `docs/intensity_plan.md` | Intensity plan: module allocation, settings, modes, watchdog, scope schedule, layout |
 | `docs/intensity_hardware.md` | Intensity hardware: photodiode, bias driver, mixer, RF chain, what it means for the software |

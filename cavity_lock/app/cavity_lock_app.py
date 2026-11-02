@@ -26,7 +26,7 @@ Wiring
   IN1  <- cavity transmission photodiode   (LV jumper for signals under 1 V, else HV + set "IN1 scale" to 20)
   OUT1 -> PZT driver MOD IN                (ramp + dither, or setpoint + dither)
   IN2  <- AOM pickoff photodiode           (1st-order beam, LV jumper, ~0.5-0.8 V at the operating point)
-  OUT2 -> 50 ohm tee -> AOM bias driver    (intensity servo pid2 + power scan asg1; 0 V = bias level)
+  OUT2 -> 50 ohm tee -> AOM bias driver    (intensity servo pid2 + Bode test sine asg1; 0 V = bias)
 
 FPGA modules: cavity = iq0, asg0, pid0 (+ iq1, pid1 with outputs off during a circuit-only Bode);
 intensity = pid2, asg1; pid1 otherwise off; iq2 free for the network analyzer.
@@ -925,7 +925,6 @@ class Controller:
             self._owner = "int"
             try:
                 self.ints.req.clear()
-                self.ints._setpoint_changed()
                 INT.ISCH.apply_changed(self.ints, set(INT.I_KEYS))   # static + the writers live in this mode
                 self.ints._snap()
             finally:

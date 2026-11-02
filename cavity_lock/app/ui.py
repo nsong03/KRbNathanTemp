@@ -29,8 +29,8 @@ SHORT = {"ac_hz": "Hz", "lpf_hz": "Hz", "lpf_order": "order", "err_gain": "gain 
          "acq_dither_mvpp": "mVpp", "ramp_hz": "Hz", "ramp_mvpp": "mVpp", "in1_scale": "×",
          "kappa_mhz": "κ MHz", "driver_bw_hz": "Hz",
          "ramp_center_mv": "setpoint mV", "int_filter_hz": "Hz", "int_filter_stages": "stages", "int_setpoint_mv": "mV", "int_gain_mode": "",
-         "int_ugf_khz": "kHz", "int_p": "P", "int_i_hz": "I Hz", "int_clamp_auto": "auto (scan)",
-         "int_scan_lo_mv": "from mV", "int_scan_hi_mv": "to mV", "int_mw_per_v": "mW/V", "int_pd_bw_mhz": "MHz",
+         "int_ugf_khz": "kHz", "int_p": "P", "int_i_hz": "I Hz", "int_clamp_lo_mv": "low mV",
+         "int_clamp_hi_mv": "high mV", "int_mw_per_v": "mW/V", "int_pd_bw_mhz": "MHz",
          "int_aom_max_dbm": "max dBm", "int_aom_delay_us": "µs", "int_amp_gain_db": "dB", "int_if_full_ma": "mA",
          "int_rf_src_dbm": "dBm", "int_bias_v": "|V_bias| V"}
 COLORS = {"A": "#e67e22", "B": "#8e44ad"}
@@ -302,7 +302,7 @@ function(B) {
 }
 """
 
-# Intensity embedded scope: live traces (probes A/B; setpoint line on in2) or the power scan (light vs OUT2), and the
+# Intensity embedded scope: live traces (probes A/B; setpoint line on in2), and the
 # history of the mean photodiode level and the drive.
 ISCOPE_JS = """
 function(fr) {
@@ -310,29 +310,7 @@ function(fr) {
   if (!fr) { return [nu, nu]; }
   var C = {A: '#e67e22', B: '#8e44ad', pd: '#222222', sp: '#1e8e3e', cl: '#c0392b', pk: '#d35400'};
   var data = [], shapes = [], ann = [], lay = {};
-  if (fr.kind === 'scan') {
-    data.push({type: 'scatter', mode: 'lines', x: fr.u, y: fr.pd, name: 'photodiode (in2)', line: {color: C.pd, width: 1.3}});
-    (fr.clamp || []).forEach(function(c, i) {
-      shapes.push({type: 'line', xref: 'x', x0: c, x1: c, yref: 'paper', y0: 0, y1: 1,
-                   line: {color: C.cl, dash: 'dash', width: 1.2}});
-    });
-    if (fr.sp !== null && fr.sp !== undefined) {
-      shapes.push({type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: fr.sp, y1: fr.sp,
-                   line: {color: C.sp, dash: 'dot', width: 1.2}});
-    }
-    if (fr.upk !== null && fr.upk !== undefined) {
-      data.push({type: 'scatter', mode: 'markers+text', x: [fr.upk], y: [fr.peak], text: ['efficiency peak'],
-                 textposition: 'top center', marker: {symbol: 'star', size: 13, color: C.pk}, showlegend: false});
-    }
-    if (fr.usp !== null && fr.usp !== undefined) {
-      data.push({type: 'scatter', mode: 'markers', x: [fr.usp], y: [fr.sp], name: 'setpoint (K ' + fr.K + ' V/V)',
-                 marker: {symbol: 'cross-thin', size: 18, line: {color: C.sp, width: 2.5}}});
-    }
-    lay = {xaxis: {title: {text: 'OUT2 [mV]  (red dashed: clamp, green dotted: setpoint)'}},
-           yaxis: {title: {text: 'photodiode in2 [V]'}}, height: 330};
-    ann.push({text: fr.title, x: 0.5, xref: 'paper', y: 1, yref: 'paper', yanchor: 'bottom', showarrow: false,
-              font: {size: 13}});
-  } else if (fr.kind === 'time') {
+  if (fr.kind === 'time') {
     var rows = [['a', fr.a_name, C.A], ['b', fr.b_name, C.B]].filter(function(r) { return fr[r[0]]; });
     var n = rows.length, gap = 0.1, h = (1 - gap * (n - 1)) / Math.max(n, 1);
     rows.forEach(function(r, i) {
@@ -678,7 +656,6 @@ def build_app(ctl, A):
             ], className="bar", style={"marginBottom": "4px"}),
             dcc.Graph(id="iscope", config={"displaylogo": False}),
             dcc.Graph(id="ihistory", config={"displaylogo": False}),
-            dcc.Graph(id="iscan", config={"displaylogo": False}, style={"display": "none"}),
             dcc.Graph(id="ibodefig", config={"displaylogo": False}, style={"display": "none"}),
             html.Div(id="ianalysis", style={"fontSize": "13px", "whiteSpace": "pre-wrap"}),
         ], id="view-intensity", style={"display": "none"})
@@ -697,8 +674,6 @@ def build_app(ctl, A):
                                       "margin": "6px 0 0"}),
             dcc.ConfirmDialog(id="confirm-scan", message="The cavity is locked. Turning Scan on unlocks it "
                                                          "(the setpoint is dropped and the ramp starts). Continue?"),
-            dcc.ConfirmDialog(id="confirm-iscan", message="The intensity servo is locked. Turning the power scan on "
-                                                          "opens the loop (the scan sweeps the AOM power). Continue?"),
             dcc.Interval(id="tick", interval=int(1000 / max(ctl.s.get("ui_hz", 10), 1))),
             dcc.Store(id="view", storage_type="local", data="cavity"),
             dcc.Store(id="view-ack"),
@@ -723,7 +698,6 @@ def build_app(ctl, A):
             dcc.Store(id="igeom", data=ISCH.geometry()),
             dcc.Store(id="ibode"),
             dcc.Store(id="ibode-seq", data=-1),
-            dcc.Store(id="iscan-seq", data=-1),
             dcc.Store(id="ack"),
         ], style={"fontFamily": "sans-serif", "padding": "6px 12px"})
 
@@ -778,24 +752,15 @@ def build_app(ctl, A):
             ctl.submit("switch", ("scan", True))
         return time.time()
 
-    @app.callback(Output("ack", "data", allow_duplicate=True), Output("confirm-iscan", "displayed"),
+    @app.callback(Output("ack", "data", allow_duplicate=True),
                   Input({"type": "isw", "s": ALL}, "n_clicks"), prevent_initial_call=True)
     def on_iswitch(_):
         t = ctx.triggered_id
         if not t or not ctx.triggered or not ctx.triggered[0].get("value"):
-            return no_update, no_update
+            return no_update
         name = t["s"]
         on = not ISCH.switch_states(it.mode, it.hw, ctl.s)[name]
-        if name == "scan" and on and it.mode in ("locked", "measuring"):
-            return no_update, True
         ctl.submit("int_switch", (name, on))
-        return time.time(), False
-
-    @app.callback(Output("ack", "data", allow_duplicate=True), Input("confirm-iscan", "submit_n_clicks"),
-                  prevent_initial_call=True)
-    def on_confirm_iscan(n):
-        if n:
-            ctl.submit("int_switch", ("scan", True))
         return time.time()
 
     @app.callback(Output("ack", "data", allow_duplicate=True), Input({"type": "probe", "p": ALL}, "n_clicks"),
@@ -934,25 +899,11 @@ def build_app(ctl, A):
         return fr
 
     def iframe_data(snap):
-        s, tr, pr, sc = snap["settings"], snap["traces"], snap["probe"], snap["scan"] or {}
+        s, tr, pr = snap["settings"], snap["traces"], snap["probe"]
         sp = s["int_setpoint_mv"] * 1e-3
         fr = dict(kind=None, sp=sp)
         if "traces" in s["int_panels"] and tr is not None:
-            if tr["kind"] == "scan":
-                fr.update(kind="scan", uirev="scan")
-                if sc.get("ok"):
-                    fr.update(u=r5(sc["u"], 1e3), pd=r5(sc["pd"]), clamp=[round(c * 1e3, 3) for c in sc["clamp"]],
-                              upk=None if sc.get("u_peak") is None else round(sc["u_peak"] * 1e3, 3),
-                              peak=round(sc["peak"], 5),
-                              usp=None if sc.get("u_sp") is None else round(sc["u_sp"] * 1e3, 3),
-                              K=f"{sc['K']:+.2f}" if sc.get("K") else "?")
-                    fr["title"] = (f"Power scan (loop open): peak {sc['peak']*1e3:.0f} mV, max lockable "
-                                   f"{sc['max_lock']*1e3:.0f} mV" + (f", K {sc['K']:+.2f} V/V at the setpoint"
-                                                                     if sc.get("K") else ""))
-                else:
-                    x, y = A.envelope(tr["u"] * 1e3, tr["pd"])
-                    fr.update(u=r5(x), pd=r5(y), title="Power scan: " + "; ".join(sc.get("notes", [])))
-            elif pr is not None:
+            if pr is not None:
                 fr.update(kind="time", uirev=f"live-{pr['a_name']}-{pr['b_name']}", a_name=pr["a_name"],
                           b_name=pr["b_name"])
                 t_us = pr["t"] * 1e6
@@ -1025,28 +976,21 @@ def build_app(ctl, A):
                           html.Span(extra, style={"fontSize": "13px"})])
 
     def int_lines(snap):
-        s, li, sc, done = snap["settings"], snap["lock"], snap["scan"] or {}, snap["scan_done"] or {}
+        s, li, pl = snap["settings"], snap["lock"], snap["plant"] or {}
         L = []
-        src = sc if sc.get("ok") else done
-        if src.get("ok"):
-            L.append(f"power scan: peak {src['peak']*1e3:.0f} mV" + (f" at OUT2 {src['u_peak']*1e3:+.1f} mV" if
-                     src.get("u_peak") is not None else " (no peak inside the scan range)") +
-                     f"; clamp {src['clamp'][0]*1e3:+.1f}..{src['clamp'][1]*1e3:+.1f} mV; max lockable "
-                     f"{src['max_lock']*1e3:.0f} mV; bright direction {'+' if src['bright_dir'] > 0 else '−'}OUT2")
-            if src.get("K"):
-                L.append(f"at the setpoint {s['int_setpoint_mv']:g} mV: OUT2 {src['u_sp']*1e3:+.2f} mV, "
-                         f"K = dV_IN2/dV_OUT2 = {src['K']:+.3f} V/V; integrator cap 38.9 kHz × |K| = "
-                         f"{ISCH.I_MAX*abs(src['K'])/1e3:.0f} kHz")
-            elif src.get("sp_note"):
-                L.append("WARN " + src["sp_note"])
-            L += src.get("notes", [])
+        if pl.get("K"):
+            L.append(f"plant gain K = dV_IN2/dV_OUT2 = {pl['K']:+.3f} V/V, measured "
+                     f"{time.strftime('%H:%M:%S', time.localtime(pl['t']))} by a {'closed' if pl.get('closed') else 'open'}"
+                     f"-loop Bode plot at OUT2 {pl.get('u0', 0)*1e3:+.1f} mV (photodiode {(pl.get('pd0') or 0)*1e3:.0f} mV);"
+                     f" integrator cap 38.9 kHz × |K| = {ISCH.I_MAX*abs(pl['K'])/1e3:.0f} kHz")
         else:
-            L.append("no power scan yet: switch Output on, Scan on (loop open), then Scan off or Lock")
+            L.append("K not measured yet: with Output on and the loop open, press Measure Bode plot (open-loop plant); "
+                     "manual P / I gains also lock with the plant-sign setting")
         if li.get("K") and snap["mode"] in ("locked", "measuring", "railed", "nolight", "held"):
             if li.get("i_hw") is not None:
                 L.append(f"gains ({s['int_gain_mode']}): asked p {li.get('p_req', 0):+.4g}, i {li.get('i_req', 0):+.4g} "
-                         f"Hz -> hardware p {li['p_hw']:+.4g}, i {li['i_hw']:+.4g} Hz; |i·K| "
-                         f"{abs(li['i_hw']*li['K'])/1e3:.2f} kHz")
+                         f"Hz -> hardware p {li['p_hw']:+.4g}, i {li['i_hw']:+.4g} Hz"
+                         + (f"; |i·K| {abs(li['i_hw']*li['K'])/1e3:.2f} kHz" if li.get("K_measured") else ""))
             if li.get("adopted"):
                 L.append("this servo was running at start-up and was adopted as is")
         if snap["pm"] and snap["pm"][0]:
@@ -1064,8 +1008,8 @@ def build_app(ctl, A):
                      Output("bode-seq", "data"), Output("bodefig", "style"),
                      Output("iframe", "data"), Output("iframe-seq", "data"), Output("idiag", "data"),
                      Output("idiag-key", "data"), Output("ibode", "data"), Output("ibode-seq", "data"),
-                     Output("iscan-seq", "data"), Output("ianalysis", "children"),
-                     Output("iscope", "style"), Output("ihistory", "style"), Output("iscan", "style"),
+                     Output("ianalysis", "children"),
+                     Output("iscope", "style"), Output("ihistory", "style"),
                      Output("ibodefig", "style"), Output("dot-cav", "className"), Output("dot-int", "className"),
                      Output("push-version", "data")])
     N_CAV = 16
@@ -1073,10 +1017,10 @@ def build_app(ctl, A):
     @app.callback(tick_outputs, Input("tick", "n_intervals"), State("synced", "data"), State("frame-seq", "data"),
                   State("meas-seq", "data"), State("diag-key", "data"), State("bode-seq", "data"),
                   State("view", "data"), State("iframe-seq", "data"), State("idiag-key", "data"),
-                  State("ibode-seq", "data"), State("iscan-seq", "data"), State("dot-cav", "className"),
+                  State("ibode-seq", "data"), State("dot-cav", "className"),
                   State("dot-int", "className"), State("push-version", "data"))
     def on_tick(_, synced, frame_seq, meas_seq, diag_key, bode_seq, view, iframe_seq, idiag_key, ibode_seq,
-                iscan_seq, dot_cav, dot_int, pushed):
+                dot_cav, dot_int, pushed):
         view = "intensity" if view == "intensity" else "cavity"
         if ctl.view != view:
             ctl.view = view                       # scope-schedule hint only: no hardware access
@@ -1087,7 +1031,7 @@ def build_app(ctl, A):
         dots = ["vdot " + CAV_DOT.get(snap["mode"], "off"), "vdot " + it.status()[2]]
         dots = [d if d != old else no_update for d, old in zip(dots, (dot_cav, dot_int))]   # only on change
         cav = [no_update] * N_CAV
-        ints = [no_update] * 12
+        ints = [no_update] * 10
         if view == "cavity":
             mode, an, li = snap["mode"], snap["analysis"] or {}, snap["lock"]
             new_frame = snap["seq"] != frame_seq or version_new
@@ -1154,11 +1098,9 @@ def build_app(ctl, A):
                     idiag if key != idiag_key else no_update, key if key != idiag_key else no_update,
                     A.bode_json(isnap["bode"]) if isnap["bode_seq"] != ibode_seq else no_update,
                     isnap["bode_seq"] if isnap["bode_seq"] != ibode_seq else no_update,
-                    isnap["scan_seq"] if isnap["scan_seq"] != iscan_seq else no_update,
                     int_lines(isnap),
                     {} if "traces" in ip else {"display": "none"},
                     {} if "history" in ip else {"display": "none"},
-                    {} if "power scan" in ip else {"display": "none"},
                     {} if "Bode (swept)" in ip else {"display": "none"}]
             cav[2] = int_status(isnap)
             cav[5] = logs
@@ -1173,8 +1115,7 @@ def build_app(ctl, A):
                   Input("push-version", "data"), prevent_initial_call=True)
     def on_push(v):
         s = dict(ctl.s)
-        sc = it.scan or {}
-        smax = math.ceil(max(sc.get("peak", 1.0) * 1e3, s["int_setpoint_mv"], 10.0) / 10) * 10
+        smax = math.ceil(max(1000.0, s["int_setpoint_mv"]) / 10) * 10
         return [s["int_setpoint_mv"], smax] + [to_ui(k, s[k]) for k in KEYS] + [v]
 
     # The measurement plots get their own callbacks: sending both figures inside the 10 Hz tick response made
@@ -1187,33 +1128,7 @@ def build_app(ctl, A):
     def on_loop(_):
         return loop_fig(ctl.loop)
 
-    @app.callback(Output("iscan", "figure"), Input("iscan-seq", "data"))
-    def on_iscan(_):
-        return scan_fig(it.scan, ctl.s)
-
     return app
-
-
-def scan_fig(sc, s):
-    import plotly.graph_objects as go
-    f = go.Figure()
-    ttl = "Last power scan: none yet"
-    if sc and sc.get("ok"):
-        u = [x * 1e3 for x in sc["u"]]
-        f.add_scatter(x=u, y=sc["pd"], mode="lines", name="photodiode vs OUT2", line=dict(color="#222222"))
-        for c in sc["clamp"]:
-            f.add_vline(x=c * 1e3, line=dict(color="#c0392b", dash="dash"))
-        f.add_hline(y=s["int_setpoint_mv"] * 1e-3, line=dict(color="#1e8e3e", dash="dot"))
-        if sc.get("u_peak") is not None:
-            f.add_scatter(x=[sc["u_peak"] * 1e3], y=[sc["peak"]], mode="markers", name="efficiency peak",
-                          marker=dict(symbol="star", size=13, color="#d35400"))
-        ttl = (f"Last power scan ({time.strftime('%H:%M:%S', time.localtime(sc.get('t', time.time())))}): peak "
-               f"{sc['peak']*1e3:.0f} mV, clamp {sc['clamp'][0]*1e3:+.0f}..{sc['clamp'][1]*1e3:+.0f} mV, max lockable "
-               f"{sc['max_lock']*1e3:.0f} mV" + (f", K {sc['K']:+.2f} V/V" if sc.get("K") else ""))
-    f.update_layout(title=dict(text=ttl, font=dict(size=14)), height=300, template="plotly_white",
-                    margin=dict(l=60, r=20, t=35, b=40), xaxis_title="OUT2 [mV]", yaxis_title="photodiode in2 [V]",
-                    legend=dict(orientation="h", y=1.1, x=1, xanchor="right"))
-    return f
 
 
 def noise_fig(nz):

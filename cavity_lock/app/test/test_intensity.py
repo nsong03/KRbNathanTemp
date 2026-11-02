@@ -34,6 +34,10 @@ check("plant parameters write no register",
 check("ladders stay inside the register ranges", max(ISCH.P_LADDER) <= ISCH.P_MAX and max(ISCH.I_LADDER) <= ISCH.I_MAX
       and abs(ISCH.I_MAX - 38.9e3) < 100 and abs(ISCH.P_MAX - 2048) < 1)
 
+check("no scan functionality: no Scan switch, no scan settings", not any(s["id"] == "scan" for s in ISCH.SWITCHES)
+      and not any(k.startswith("int_scan") for k in INT.I_KEYS) and not hasattr(INT, "analyze_scan"))
+if os.path.exists(INT.PLANT_FILE):
+    os.remove(INT.PLANT_FILE)
 ctl = A.Controller("fake", "t", dict(A.DEFAULTS))
 eng, it, r = ctl.r.eng, ctl.ints, ctl.r
 aom = eng.aom
@@ -84,29 +88,37 @@ check("start-up mode off, pid2 output off, asg1 off", it.mode == "off" and r.pid
 w = window()
 check("OUT2 = 0 V at start-up", abs(np.mean(w["out2"])) < 1e-9, f"{np.mean(w['out2']):.2e}")
 
-print("--- power scan")
-apply(int_setpoint_mv=500.0)
-ctl.submit("int_switch", ("output", True)); ctl.submit("int_switch", ("scan", True)); wait_idle()
-check("Scan on: asg1 triangle on out2, loop open", it.mode == "scanning" and r.asg1.output_direct == "out2"
-      and r.asg1.waveform == "ramp" and r.pid2.i == 0 and r.pid2.p == 0)
-time.sleep(2.5)
-ctl.submit("int_switch", ("scan", False)); wait_idle()
-sc = it.scan or {}
-true_pk = float(aom.ug[np.argmax(aom.eg * (np.abs(aom.ug) <= 0.2))])
-check("scan finds the efficiency peak (fake: OUT2 -63 mV)", sc.get("u_peak") is not None
-      and abs(sc["u_peak"] - true_pk) < 0.01, f"{sc.get('u_peak')} vs {true_pk:.4f}")
-lo, hi = sc.get("clamp", (0, 0))
-bright = lo if sc.get("bright_dir", 0) < 0 else hi
-check("the clamp lands below the peak (on the near side)", sc.get("bright_dir") == -1 and bright > sc["u_peak"],
-      f"bright clamp {bright*1e3:+.1f} mV, peak {sc['u_peak']*1e3:+.1f} mV")
-pd_at = float(aom.pd(bright))
-check("light at the clamp = (1 - margin) x peak", abs(pd_at / sc["peak"] - (1 - ctl.s["int_clamp_margin"])) < 0.03,
-      f"{pd_at/sc['peak']:.3f}")
-K_true = aom.slope(sc["u_sp"])
-check("K measured with the right sign (negative: inverting driver)", sc.get("K", 0) < 0, f"K {sc.get('K')}")
-check("K matches the fake's true slope at the setpoint (10 %)", abs(sc["K"] / K_true - 1) < 0.1,
-      f"{sc['K']:.2f} vs {K_true:.2f}")
-check("the scan is saved for a restart", os.path.exists(INT.SCAN_FILE))
+print("--- K is measured by the Bode plot (no scan)")
+apply(int_setpoint_mv=500.0, int_gain_mode="bandwidth")
+ctl.submit("int_switch", ("lock", True)); wait_idle()
+check("bandwidth-mode lock refused while K is not measured", it.mode == "off"
+      and any("need the plant gain K" in l for l in list(ctl.logs)[-3:]))
+apply(int_gain_mode="manual", int_p=0.002, int_i_hz=2000.0)
+ctl.submit("int_switch", ("lock", True)); wait_idle(); time.sleep(0.4)
+check("manual gains lock without K, sign from the setting (negative -> p, i > 0)", it.mode == "locked"
+      and r.pid2.i > 0 and r.pid2.p > 0 and abs(it.pd / 0.5 - 1) < 0.01 and not it.lock_info["K_measured"],
+      f"{it.mode}, pd {it.pd}")
+ctl.submit("int_switch", ("output", False)); wait_idle()
+apply(int_gain_mode="bandwidth")
+ctl.submit("int_switch", ("output", True)); wait_idle()
+check("Output on: held at 0 V (bias level), loop open", it.mode == "held" and r.pid2.output_direct == "out2"
+      and r.pid2.ival == 0 and r.pid2.i == 0)
+apply(int_bode_points=10, int_bode_start_hz=2e3, int_bode_stop_hz=400e3, int_bode_cycles=20, int_bode_amp_mv=2.0)
+ctl.submit("int_bode"); time.sleep(0.5); wait_idle(120)
+B = it.bode
+check("open-loop Bode: every point, back to held, asg1 off", B and B["done"] and B["n"] == 10 and B["mode"] == "open loop"
+      and it.mode == "held" and r.asg1.output_direct == "off" and r.asg1.amplitude == 0, f"n={B and B['n']}")
+K_true0 = aom.slope(0.0)
+Kp = (it.plant or {}).get("K")
+check("K measured with the right sign (negative: inverting driver)", Kp is not None and Kp < 0, f"K {Kp}")
+check("K matches the fake's true slope at the drive (5 %)", Kp and abs(Kp / K_true0 - 1) < 0.05,
+      f"{Kp:.3f} vs {K_true0:.3f}")
+f_ = np.array(B["curves"][0]["f"]); P_ = np.array(B["curves"][0]["c"])
+Pt = K_true0 * np.exp(-2j * np.pi * f_ * aom.delay) / (1 + 1j * f_ / aom.PD_BW)
+check("measured plant = the fake's true plant incl. the delay (5 %, 5 deg)", np.all(np.abs(np.abs(P_ / Pt) - 1) < 0.05)
+      and np.all(np.abs(np.degrees(np.angle(P_ / Pt))) < 5), f"{np.round(np.abs(P_ / Pt), 3)}")
+check("the plant gain is saved for a restart", os.path.exists(INT.PLANT_FILE))
+check("diagram shows the measured K", "K " in ISCH.diagram_state(it.snapshot())["boxes"]["i_pid"][1][0])
 
 print("--- lock")
 apply(int_gain_mode="bandwidth", int_ugf_khz=30.0, int_corner_khz=1000.0)
@@ -115,6 +127,8 @@ time.sleep(0.5)
 check("locked", it.mode == "locked", it.mode)
 check("asg1 off and pid2 gains positive (i K < 0 with K < 0)", r.asg1.output_direct == "off" and r.pid2.i > 0
       and r.pid2.p > 0, f"p {r.pid2.p}, i {r.pid2.i}")
+check("the lock starts from the present drive and uses the Bode K", abs(it.lock_info["u_sp"]) < 1e-9
+      and abs(it.lock_info["K"] - Kp) < 1e-9)
 check("|i K| = the requested bandwidth", abs(abs(r.pid2.i * it.lock_info["K"]) - 30e3) < 0.02 * 30e3,
       f"{abs(r.pid2.i*it.lock_info['K']):.0f} Hz")
 check("p = i / f_corner (quantized)", abs(r.pid2.p - r.pid2.i / 1e6) <= F.P_STEP, f"{r.pid2.p} vs {r.pid2.i/1e6}")
@@ -178,7 +192,7 @@ apply(int_auto_reengage=True)
 wait_for(lambda: it.mode == "locked", 4)
 
 print("--- setpoint above the achievable light -> railed")
-ctl.submit("int_setpoint", (sc["max_lock"] + 0.04) * 1e3); wait_idle()
+ctl.submit("int_setpoint", 950.0); wait_idle()           # above the AOM's peak light (0.9 V)
 ok = wait_for(lambda: it.mode == "railed", 3)
 check("railed fault", ok, it.mode)
 check("railed: held at the last good drive, gains 0", r.pid2.i == 0 and lo + 0.002 < r.pid2.ival < hi - 0.002,
@@ -193,8 +207,6 @@ check("nudge +10 mV writes pid2.setpoint live", abs(ctl.s["int_setpoint_mv"] - 5
       and abs(r.pid2.setpoint - 0.51) < 1e-9)
 time.sleep(0.4)
 check("still locked at the new setpoint", it.mode == "locked" and abs(it.pd / 0.51 - 1) < 0.01, f"{it.pd}")
-check("gains follow K at the new setpoint (same bandwidth)",
-      abs(abs(r.pid2.i * it.lock_info["K"]) - 30e3) < 0.03 * 30e3)
 ctl.submit("int_setpoint", 500.0); wait_idle()
 p_now, i_now = r.pid2.p, r.pid2.i
 apply(int_gain_mode="manual")
@@ -210,9 +222,8 @@ apply(int_ugf_khz=30.0)
 
 print("--- every intensity block parameter changes its register")
 NEW = dict(int_filter_hz=200e3, int_filter_stages=2, int_setpoint_mv=480.0, int_gain_mode="manual",
-           int_ugf_khz=20.0, int_p=0.01, int_i_hz=1000.0, int_corner_khz=500.0, int_clamp_auto=False,
-           int_clamp_margin=0.1, int_clamp_lo_mv=-30.0, int_clamp_hi_mv=120.0,
-           int_scan_lo_mv=-150.0, int_scan_hi_mv=150.0, int_scan_hz=80.0)
+           int_ugf_khz=20.0, int_p=0.01, int_i_hz=1000.0, int_corner_khz=500.0,
+           int_clamp_lo_mv=-30.0, int_clamp_hi_mv=120.0)
 params = [(b["id"], p) for b in ISCH.BLOCKS for p in b["params"] if p["attr"]]
 check("the register test covers every intensity block parameter", all(p["key"] in NEW for _, p in params),
       str([p["key"] for _, p in params if p["key"] not in NEW]))
@@ -225,8 +236,7 @@ def reg(attr):
 
 PRE = {"int_p": {"int_gain_mode": "manual"}, "int_i_hz": {"int_gain_mode": "manual"},
        "int_ugf_khz": {"int_gain_mode": "bandwidth"}, "int_corner_khz": {"int_gain_mode": "bandwidth"},
-       "int_clamp_lo_mv": {"int_clamp_auto": False}, "int_clamp_hi_mv": {"int_clamp_auto": False},
-       "int_clamp_margin": {"int_clamp_auto": True}, "int_filter_stages": {"int_filter_hz": 200e3}}
+       "int_filter_stages": {"int_filter_hz": 200e3}}
 
 
 def try_param(bid, p):
@@ -236,21 +246,13 @@ def try_param(bid, p):
     if pre:
         apply(**pre)
     old, before = ctl.s[k], reg(p["attr"])
-    if k == "int_clamp_margin":                  # the margin acts through the next scan
-        apply(int_clamp_margin=NEW[k])
-        ctl.submit("int_switch", ("scan", True)); wait_idle(); time.sleep(1.5)
-        ctl.submit("int_switch", ("lock", True)); wait_idle()
-    else:
-        apply(**{k: NEW[k]})
+    apply(**{k: NEW[k]})
     after = reg(p["attr"])
     changed = before != after if not isinstance(after, float) else abs(after - before) > 1e-12
     hwv = it.hw.get(p["attr"])
     hw_ok = hwv == after or (isinstance(after, float) and hwv is not None and abs(hwv - after) < 1e-9)
     check(f"{bid}: {k} {old} -> {NEW[k]} changes {p['attr']}", changed and hw_ok, f"{before} -> {after}")
     apply(**{k: old})
-    if k == "int_clamp_margin":
-        ctl.submit("int_switch", ("scan", True)); wait_idle(); time.sleep(1.5)
-        ctl.submit("int_switch", ("lock", True)); wait_idle()
     if pre:
         apply(**saved)
 
@@ -263,13 +265,6 @@ for bid, p in params:
         if it.mode != "locked":
             ctl.submit("int_switch", ("lock", True)); wait_idle()
         try_param(bid, p)
-ctl.submit("int_switch", ("scan", True)); wait_idle()
-for bid, p in params:
-    if p["live"] == "scanning":
-        try_param(bid, p)
-time.sleep(1.0)
-ctl.submit("int_switch", ("lock", True)); wait_idle()
-check("filter snaps to the ladder and shows used vs asked", True)
 
 print("--- probes and switches")
 ctl.submit("int_probe", "asg1"); wait_idle()
@@ -304,29 +299,37 @@ low = f_ < 1e5
 check("measured G = the fake's true loop gain below 100 kHz (10 %, 10 deg)",
       np.all(np.abs(np.abs(G_[low] / Gt[low]) - 1) < 0.1)
       and np.all(np.abs(np.degrees(np.angle(G_[low] / Gt[low]))) < 10), f"{np.round(np.abs(G_ / Gt), 3)}")
-check("UGF near the bandwidth setting (15 %)", B["ugf"] and abs(B["ugf"] / 30e3 - 1) < 0.15, f"{B['ugf']}")
+ugf_true = abs(r.pid2.i * K)
+check("measured UGF = |i x true K| at the lock point (10 %)", B["ugf"] and abs(B["ugf"] / ugf_true - 1) < 0.1,
+      f"{B['ugf']:.0f} vs {ugf_true:.0f} Hz")
+check("the closed-loop Bode updates K at the lock point (5 %) and the shown |i·K|",
+      abs(it.lock_info["K"] / K - 1) < 0.05 and abs(it.lock_info["ugf_actual"] / ugf_true - 1) < 0.05,
+      f"K {it.lock_info['K']:.3f} vs {K:.3f}")
 apply(int_bode_points=40)
 ctl.submit("int_bode"); time.sleep(1.0)
 ctl.stop_measurement(); wait_idle(60)
 check("Stop ends the sweep early, still locked", it.bode["done"] and it.bode["n"] < 40 and it.mode == "locked"
       and r.asg1.output_direct == "off", f"n={it.bode['n']}")
 ctl.submit("int_switch", ("lock", False)); wait_idle()
-ctl.submit("int_bode"); wait_idle()
-check("Bode refused while not locked", any("works while locked" in l for l in list(ctl.logs)[-3:]))
+apply(int_bode_points=6)
+ctl.submit("int_bode"); time.sleep(0.5); wait_idle(60)
+check("not locked: the Bode plot measures the open-loop plant", it.bode["mode"] == "open loop" and it.bode["done"]
+      and it.mode == "held" and r.asg1.output_direct == "off")
 ctl.submit("int_switch", ("lock", True)); wait_idle()
 
 print("--- settings compatibility")
 tmp = os.path.join(tempfile.mkdtemp(), "old.json")
 old = {k: v for k, v in A.DEFAULTS.items() if k in A.CAV_KEYS}
-old.update(out2_signal="photodiode", out2_gain=2.0)
+old.update(out2_signal="photodiode", out2_gain=2.0, int_scan_lo_mv=-200.0, int_scan_hz=50.0, int_clamp_auto=True)
 json.dump(old, open(tmp, "w"))
 A.SETTINGS_FILE = tmp
 n_err = sum("ERROR" in l for l in ctl.logs)
 ctl.submit("load"); wait_idle(); time.sleep(0.5)
-check("an old settings file (out2_signal, out2_gain) loads without errors", sum("ERROR" in l for l in ctl.logs) == n_err
-      and "out2_signal" not in ctl.s and "out2_gain" not in ctl.s)
+check("an old settings file (out2_*, removed int_scan_* / clamp_auto) loads without errors",
+      sum("ERROR" in l for l in ctl.logs) == n_err and "out2_signal" not in ctl.s and "int_scan_lo_mv" not in ctl.s
+      and "int_clamp_auto" not in ctl.s)
 check("missing intensity keys keep their defaults", all(ctl.s[k] == A.DEFAULTS[k] for k in
-                                                         ("int_out2_limit_mv", "int_scan_lo_mv", "int_light_frac")))
+                                                         ("int_out2_limit_mv", "int_clamp_lo_mv", "int_light_frac")))
 check("the loaded file did not unlock the intensity servo", it.mode == "locked")
 
 print("--- restart: adopt a running servo, reset otherwise")

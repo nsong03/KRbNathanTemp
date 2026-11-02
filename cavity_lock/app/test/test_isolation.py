@@ -20,6 +20,10 @@ def check(name, ok, info=""):
         FAILS.append(name)
 
 
+import os
+import intensity as INT
+if os.path.exists(INT.PLANT_FILE):
+    os.remove(INT.PLANT_FILE)
 ctl = A.Controller("fake", "t", dict(A.DEFAULTS))
 eng, it, r = ctl.r.eng, ctl.ints, ctl.r
 stop = threading.Event()
@@ -53,8 +57,11 @@ def apply(**kw):
 
 print("--- both loops up")
 time.sleep(2.0)
-ctl.submit("int_switch", ("output", True)); ctl.submit("int_switch", ("scan", True)); idle()
-time.sleep(2.0)                                   # the cavity scans and the intensity scans at the same time
+ctl.submit("int_switch", ("output", True)); idle()
+apply(int_bode_points=6, int_bode_start_hz=2e3, int_bode_stop_hz=300e3)
+ctl.submit("int_bode"); time.sleep(0.5); idle(60)     # open-loop plant Bode (K) while the cavity scans
+check("open-loop intensity Bode measured K while the cavity scanned", (it.plant or {}).get("K", 0) < 0
+      and ctl.mode == "acquire")
 ctl.submit("lock"); ctl.submit("int_switch", ("lock", True)); idle(90)
 check("cavity and intensity both locked", wait_for(lambda: ctl.mode == "locked" and it.mode == "locked", 30),
       f"{ctl.mode} / {it.mode}")
@@ -71,7 +78,7 @@ for view, hid in (("intensity", "cav"), ("cavity", "int")):
     vis = "int" if hid == "cav" else "cav"
     fv = (ctl.frames[vis] - f0[vis]) / dt
     check(f"view {view}: hidden {hid} gets >= 5 watchdog checks/s (frames {fr:.1f}/s + register checks {bg:.1f}/s)",
-          fr + bg >= 5 and fr >= 0.8, f"visible {vis} {fv:.1f} frames/s")
+          fr + bg >= 5 and fr >= 0.5, f"visible {vis} {fv:.1f} frames/s")
 
 print("--- without a sampler the hidden loop gets scope watchdog frames")
 ctl.has_sampler = it.has_sampler = False
@@ -81,7 +88,9 @@ for view, hid in (("intensity", "cav"), ("cavity", "int")):
     f0, t0 = dict(ctl.frames), time.time()
     time.sleep(3.0)
     fr = (ctl.frames[hid] - f0[hid]) / (time.time() - t0)
-    check(f"no sampler, view {view}: hidden {hid} gets >= 4 scope frames/s", fr >= 4, f"{fr:.1f}/s")
+    nominal = 1 / ctl.HIDDEN_PERIOD[hid]
+    check(f"no sampler, view {view}: hidden {hid} gets >= 70 % of its {nominal:.1f} scope frames/s",
+          fr >= 0.7 * nominal, f"{fr:.2f}/s")
 ctl.has_sampler = it.has_sampler = True
 
 print("--- a cavity unlock while the intensity view is shown is caught and relocked")

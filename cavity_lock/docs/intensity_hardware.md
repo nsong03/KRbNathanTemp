@@ -34,16 +34,17 @@ as a current-controlled attenuator. OUT2 is no longer the cavity lock's monitor 
 
 ## What this means for the software
 1. **More OUT2 gives less light** (the driver inverts). The plant gain K = dV_IN2/dV_OUT2 is negative; the app
-   measures it with the power scan instead of assuming it. The PID rule is the cavity's: negative feedback needs
+   measures it with an open-loop Bode plot (small sine on OUT2, loop open) instead of assuming it. The PID rule is the cavity's: negative feedback needs
    i·K < 0, so with K < 0 the gains p and i come out positive.
 2. **OUT2 = 0 V leaves the AOM at the bias level** (set by the pot). That is the safe default: at start-up the app
    resets OUT2 to 0 V (pid2 off, asg1 off) unless a servo is already running with non-zero gains (then it is
    adopted untouched).
-3. Because of the ×10 driver gain, the useful OUT2 range is only about ±0.1–0.2 V. The app limits every scan and
-   clamp to `int_out2_limit_mv` (default ±300 mV).
+3. Because of the ×10 driver gain, the useful OUT2 range is only about ±0.1–0.2 V. The app limits the clamps and
+   the Bode test sine to `int_out2_limit_mv` (default ±300 mV).
 4. **Diffraction efficiency rises with RF power, peaks, then falls.** Past the peak K changes sign and the servo
-   latches at full drive. The power scan finds the peak and puts the bright-side clamp where the light is
-   (1 − margin) × peak (default margin 5 %) on the near side of the peak.
+   latches at full drive. There is no scan in the app (user decision), so set the bright-side clamp
+   (`int_clamp_lo_mv`, low = bright because the driver inverts) short of the peak from your own measurement of the
+   AOM; if the loop does pass the peak, the "railed" watchdog holds it.
 5. Expected loop bandwidth 100–200 kHz, limited by delays: Red Pitaya 0.21 µs, AOM acoustic transit about
    0.24 µs per mm (TeO2) of beam-to-transducer distance, plus the photodiode. A pure integrator with a total delay
    τ has 45° phase margin at f_u ≈ 1/(8τ): τ = 0.5 µs → about 250 kHz.
@@ -55,7 +56,7 @@ as a current-controlled attenuator. OUT2 is no longer the cavity lock's monitor 
 2. OUT2 = 0 V (app start-up, Output off). Set the bias pot for a moderate light level; check the AOM RF power at
    the amplifier output with a power meter/attenuator against the AOM rating.
 3. Photodiode on IN2 with the LV jumper; about 0.5–0.8 V at the intended operating point.
-4. In the app's Intensity view: Output on, Scan on (loop open). Check the scan shows the efficiency peak or at
-   least a monotonic rise, the clamp sits short of the peak, and K is negative.
-5. Choose the setpoint below "max lockable", start with a modest bandwidth (e.g. 10 kHz), Lock, then raise the
+4. In the app's Intensity view: Output on (loop open, OUT2 = 0 V = bias level), then Measure Bode plot: the
+   open-loop plant. Check K is negative and the phase follows the expected delay.
+5. Set the clamps short of the efficiency peak, choose a setpoint the bias level can reach, start with a modest bandwidth (e.g. 10 kHz), Lock, then raise the
    bandwidth while watching the model phase margin and the Bode plot.
