@@ -68,7 +68,7 @@ FIELDS = [
     ("ramp_shape", "Ramp shape", "triangle", "Acquisition", "select", {"options": ["triangle", "sawtooth"]}),
     ("ramp_hz", "Ramp frequency [Hz]", 20.0, "Acquisition", "num", {"min": 0.2}),
     ("ramp_mvpp", "Ramp amplitude [mVpp]", 500.0, "Acquisition", "num", {"min": 0}),
-    ("ramp_center_mv", "Ramp center [mV]", 0.0, "Acquisition", "num", {}),
+    ("ramp_center_mv", "Ramp setpoint (centre) [mV]", 0.0, "Acquisition", "num", {}),
     ("acq_dither_hz", "Dither frequency [Hz]", 1000.0, "Acquisition", "num", {"min": 1}),
     ("acq_dither_mvpp", "Dither amplitude [mVpp]", 30.0, "Acquisition", "num", {"min": 0}),
     ("averages", "Traces averaged", 1, "Acquisition", "num", {"min": 1, "max": 50}),
@@ -448,6 +448,7 @@ class Controller:
         self.bg_count = {"cav": 0, "int": 0}            # background watchdog checks done (diagnostics, tests)
         self.frames = {"cav": 0, "int": 0}              # scope frames given to each loop by the scheduler
         self._relock_pending = False
+        self._parked_at_ramp = False                     # Scan off parked OUT1 at the ramp setpoint
         self.has_sampler = False
         self.log(f"connecting to {host} ...")
         from pyrpl import Pyrpl
@@ -502,6 +503,7 @@ class Controller:
                         noise=self.noise, loop=self.loop, meas_seq=self.meas_seq, fps=self.fps,
                         bode=self.bode, bode_seq=self.bode_seq, meas_progress=self.meas_progress,
                         hw=dict(self.hw), req=dict(self.req), ival=self.ival, amp_cal=self.amp_cal,
+                        parked_at_ramp=self._parked_at_ramp,
                         dither_on=self.dither_on)
 
     def switches(self):
@@ -590,6 +592,7 @@ class Controller:
         self.r.asg0.setup(waveform="ramp" if shape == "triangle" else "halframp", frequency=hz,
                           amplitude=max(hi - lo, 0) / 2, offset=(hi + lo) / 2,
                           trigger_source="immediately", output_direct="out1")
+        self._parked_at_ramp = False
         self.ramp = dict(lo=lo, hi=hi, hz=hz, shape=shape)
         self._ramp_cache = None
         self._readback()
@@ -874,6 +877,14 @@ class Controller:
                 self.log("applied: " + ", ".join(f"{k}={s[k]}" for k in sorted(changed)))
         elif cmd == "view":
             self.view = arg
+        elif cmd in ("ramp_center", "ramp_nudge"):          # the Ramp / scan setpoint (buttons, typed value)
+            v = float(arg) if cmd == "ramp_center" else s["ramp_center_mv"] + float(arg)
+            v = round(max(min(v, OUT_LIMIT * 1e3), -OUT_LIMIT * 1e3), 3)
+            if v != s["ramp_center_mv"]:
+                s["ramp_center_mv"] = v
+                self.version += 1
+                SCH.apply_changed(self, {"ramp_center_mv"})
+                self.log(f"ramp setpoint {v:+g} mV")
         elif cmd == "acquire":
             self._switch("scan", True)
         elif cmd == "switch":
@@ -1024,7 +1035,8 @@ class Controller:
             elif self.mode == "acquire":
                 c = (self.ramp["lo"] + self.ramp["hi"]) / 2
                 self._park(c)
-                self.log(f"Scan off: OUT1 held at the ramp center {c*1e3:+.1f} mV")
+                self._parked_at_ramp = True
+                self.log(f"Scan off: OUT1 held at the ramp setpoint {c*1e3:+.1f} mV")
         elif name == "dither":
             if not on and self.mode == "locked":
                 self._unlock("Dither off (the error signal needs it)")
@@ -1230,6 +1242,7 @@ class Controller:
         return self._engage(an["v0"], an["slope"], ref)
 
     def _park(self, v):
+        self._parked_at_ramp = False
         self._ramp_off()
         p0 = self.r.pid0
         p0.i, p0.p = 0, 0

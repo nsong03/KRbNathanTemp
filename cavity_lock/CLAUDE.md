@@ -91,6 +91,10 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
     lock's gains per unit slope), both outputs off. Per-point amplitude keeps the copies' outputs ≈ 0.25 V. While
     scanning, OUT1 is parked at the ramp centre for the sweep and the scan restarts afterwards.
   - Stop frequency is limited to 0.45 × dither frequency.
+- **Ramp / scan setpoint** (cavity): the ramp centre `ramp_center_mv` (key unchanged, label "Ramp setpoint (centre)")
+  is an inline knob on the Ramp / scan box with ±1/±10 mV buttons (`ramp_nudge`, typed value via `RAMP_TYPED_JS` →
+  `ramp_center`, clipped to ±0.95 V). Scanning: moves asg0.offset. After Scan off (`ctl._parked_at_ramp`): moves the
+  parked OUT1 level (pid0.ival). Never while locked or held after an unlock. Test: `test/test_ramp_setpoint.py`.
 - **Intensity servo** (`intensity.py`, same architecture: main thread, version-checked settings `int_*`, snapped values):
   - Modes `off` → `scanning` → `locking` → `locked`, plus `held`, `measuring`, faults `railed` and `nolight`.
   - Power scan (Scan switch): pid2 p = i = ival = 0, asg1 triangle on out2 within the scan limits (clipped to
@@ -128,7 +132,7 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   - A **clientside** callback (`SCOPE_JS`) draws with `Plotly.react` using **SVG `scatter`**. `scattergl` redraws about 2× slower here.
   - The noise and loop figures have **their own callbacks keyed on `meas-seq`**, never in the tick response. Putting them in the tick response froze the page.
   - Numeric inputs use `step="any"` (the integer gain uses step 1).
-  - The diagram: blocks are absolutely positioned Dash components on a fixed 1340×515 canvas; every `s-{key}` input
+  - The diagram: blocks are absolutely positioned Dash components on a fixed 1340×500 canvas (intensity: 1340×470); every `s-{key}` input
     exists exactly once (inline in a box or in a hidden popover), so the version-checked apply callback is unchanged.
     `DIAG_JS` (clientside) draws the SVG wires once and updates readback text, switch pills and probe badges from
     `dcc.Store("diag")`, which the tick sends only when it changes. `POP_JS` opens/closes popovers.

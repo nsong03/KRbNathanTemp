@@ -140,7 +140,8 @@ async def main():
                     new = "sawtooth" if old != "sawtooth" else "triangle"
                 await set_value(k, new)
                 lg = await log_text()
-                ok = f"{k}=" in "\n".join(lg.splitlines()[:6])
+                head = "\n".join(lg.splitlines()[:6])
+                ok = f"{k}=" in head or (k == "ramp_center_mv" and f"ramp setpoint {float(new):+g} mV" in head)
                 rb = await pg.locator(f"#rb-{blk['id']}").inner_text()
                 check(f"{blk['id']}: {k} {old} -> {new if new is not None else 'toggled'}", ok,
                       rb.replace("\n", " | ")[:80])
@@ -215,6 +216,10 @@ async def main():
             i = max(range(len(cross["x"])), key=lambda j: min(abs(cross["x"][j] - s) for s in stars))
             ax = "yaxis2"                                            # error row (transmission is row 1)
             px = await pg.evaluate(JS_PIX, [cross["x"][i], 0, ax])
+            if px[1] > 900 or px[1] < 50:                      # bring the point into the viewport first
+                await pg.evaluate(f"window.scrollBy(0, {px[1] - 500})")
+                await pg.wait_for_timeout(300)
+                px = await pg.evaluate(JS_PIX, [cross["x"][i], 0, ax])
             await pg.mouse.click(*px)
             await pg.wait_for_timeout(1500)
             txt = await pg.locator("#target-text").inner_text()
