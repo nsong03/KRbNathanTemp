@@ -151,6 +151,18 @@ for bid, p in params:
 apply(ramp_shape="triangle", lock_same_dither=True)
 ctl.submit("tallest"); time.sleep(0.8)
 
+print("--- edits racing a controller change")
+old_v = ctl.version
+vals = {k: ctl.s[k] for k in A.KEYS}
+apply(lpf_hz=600.0)                                       # the controller snaps it to 607.1: version bumps
+snapped_lpf = ctl.s["lpf_hz"]
+stale = dict(vals, lpf_hz=vals["lpf_hz"], ugf_hz=12.5)    # the UI's next edit, still based on the old version
+ctl.submit("apply", (stale, ctl.version - 1)); wait_idle()
+check("a stale apply keeps the controller's snapped value but applies the user's other edit",
+      ctl.version > old_v and ctl.s["lpf_hz"] == snapped_lpf and ctl.s["ugf_hz"] == 12.5,
+      f"lpf {ctl.s['lpf_hz']} (snapped {snapped_lpf}), ugf {ctl.s['ugf_hz']}")
+apply(lpf_hz=vals["lpf_hz"], ugf_hz=vals["ugf_hz"])
+
 print("--- Lock switch")
 ctl.submit("switch", ("dither", False)); wait_idle()
 check("Dither off: iq0.output_direct off, switch shows off", ctl.r.iq0.output_direct == "off"

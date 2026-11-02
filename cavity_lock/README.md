@@ -11,6 +11,10 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 - **v4** (2026-11-01): the settings sidebar is now a Moku-style schematic of the real FPGA chain, with switches
   (Scan, Dither, Lock, Output, Auto-relock), probe points (2 scope channels) and Lock Assist crosshairs.
   Plan and register map: `docs/schematic_plan.md`; screenshots: `docs/screenshots/`. Tested on the fake only.
+- **Band-pass, D, dropdowns, Bode analysis** (2026-11-02): a real band-pass on IN1 (pid2 input filter, high-pass +
+  low-pass stages), a D term built on pid1 (the FPGA has no D stage; takes the OUT2 monitor while on), dropdowns of
+  the FPGA's valid corners, circuit-only Bode to MHz with copies of every block, and automatic analysis of both Bode
+  modes. Tested on the fake only.
 - **Measure Bode plot** (2026-11-02): swept-sine Bode with the internal generator (asg1) and scope, filled in point
   by point, with Stop. *closed loop* (locked): G, disturbance suppression S, closed-loop T and the plant, with the
   model, UGF and phase margin. *circuit only*: the lock-in chain and PID measured on spare copies of the blocks,

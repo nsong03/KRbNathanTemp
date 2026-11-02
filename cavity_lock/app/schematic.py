@@ -73,7 +73,7 @@ BLOCKS = [
          params=[P("setpoint_mv", "pid0.setpoint")], opts=[],
          note="pid0 subtracts this from the error. 0 = lock on the error zero crossing; a non-zero value moves "
               "the lock point by setpoint / slope."),
-    dict(id="pid", label="PID (P + I)", kind="dsp", x=800, y=125, w=140, h=110,
+    dict(id="pid", label="PID (P + I)", kind="dsp", x=800, y=125, w=150, h=110,
          params=[P("ugf_hz", "pid0.i", live="locked"), P("p_gain", "pid0.p", live="locked")],
          opts=["refine_phase", "gain_ramp"],
          note="pid0. I is given as the loop unity-gain frequency: i = -ugf/S with S the measured error slope "
@@ -81,7 +81,7 @@ BLOCKS = [
               "way. Written only while locked (i = 0 otherwise). Lock stages: scan off, park at the zero "
               "crossing, I at ugf/10, ugf/3, ugf, then D if on. D is the box below: this FPGA build has no "
               "derivative stage in the PID (DERIVATIVE = 0)."),
-    dict(id="dterm", label="D (pid1)", kind="dsp", x=800, y=250, w=140, h=86,
+    dict(id="dterm", label="D (pid1)", kind="dsp", x=800, y=250, w=168, h=64,
          params=[P("d_on", "pid1.output_direct", live="locked"),
                  P("d_ugf_hz", "pid1.p", live="locked_d"),
                  P("d_corner_hz", "pid1.inputfilter", live="locked_d", inline=False, widget="ladder:pidf"),
@@ -186,7 +186,7 @@ WIRES = [
     dict(id="lpf_amp", kind="sig", pts=[(418, 173), (446, 173)]),
     dict(id="amp_sp", kind="sig", pts=[(556, 173), (606, 173)]),
     dict(id="sp_pid", kind="sig", pts=[(716, 173), (800, 173)]),
-    dict(id="pid_lim", kind="drv", pts=[(940, 173), (968, 173)]),
+    dict(id="pid_lim", kind="drv", pts=[(950, 173), (968, 173)]),
     dict(id="lim_sum", kind="drv", pts=[(1086, 173), (1120, 173)]),
     dict(id="sum_out", kind="drv", pts=[(1160, 173), (1222, 173)]),
     dict(id="out_plant", kind="plant", pts=[(1275, 140), (1275, 41), (810, 41)]),
@@ -198,14 +198,14 @@ WIRES = [
     dict(id="ramp_sum", kind="drv", pts=[(550, 410), (1148, 410), (1148, 193)]),
     dict(id="out2", kind="mon", pts=[(1100, 465), (1222, 465)]),
     dict(id="test_sum", kind="drv", pts=[(1110, 103), (1140, 103), (1140, 153)]),
-    dict(id="err_d", kind="sig", pts=[(780, 173), (780, 293), (800, 293)]),
-    dict(id="d_sum", kind="drv", pts=[(940, 293), (1124, 293), (1124, 189)]),
+    dict(id="err_d", kind="sig", pts=[(780, 173), (780, 282), (800, 282)]),
+    dict(id="d_sum", kind="drv", pts=[(968, 282), (1124, 282), (1124, 189)]),
 ]
 
 SWITCHES = [
     dict(id="lock", label="Lock", x=766, y=173),            # (x, y) = centre of the switch, on its wire
     dict(id="output", label="Output", x=1191, y=173),
-    dict(id="dither", label="Dither", x=860, y=333),
+    dict(id="dither", label="Dither", x=700, y=333),
     dict(id="scan", label="Scan", x=860, y=410),
     dict(id="relock", label="Auto-relock", x=1027, y=258),
 ]
@@ -515,8 +515,8 @@ def diagram_state(snap, pm=None):
     i_hw, S = hw.get("pid0.i"), li.get("slope")
     pidl = []
     if mode in ("locked", "measuring") and S:
-        pidl.append((f"i {_f(i_hw, '{:+.4g}')} Hz", ""))
-        pidl.append((f"|i·S| = UGF {abs((i_hw or 0)*S):.2f} Hz", ""))
+        pidl.append((f"UGF {abs((i_hw or 0)*S):.2f} Hz (|i·S|)", ""))
+        pidl.append((f"i {_f(i_hw, '{:+.4g}')} p {_f(hw.get('pid0.p'), '{:+.3g}')}", "dim"))
         i_want = s["ugf_hz"] / abs(S)
         if not i_hw:
             pidl.append((f"I < i step {I_STEP:.4f} Hz!", W))
@@ -524,7 +524,6 @@ def diagram_state(snap, pm=None):
             pidl.append(("I quantized > 10 %", W))
     else:
         pidl.append(("open: i = 0, p = 0" if not i_hw else f"i {i_hw:+.4g} Hz", ""))
-        pidl.append((f"i step {I_STEP:.4f} Hz", "dim"))
     if pm and pm[0]:
         pidl.append((f"model PM {pm[1]:.0f}° @{pm[0]:.0f} Hz", W if pm[1] < 45 else "dim"))
     B["pid"] = pidl
@@ -548,7 +547,7 @@ def diagram_state(snap, pm=None):
         if s["p_gain"] < math.sqrt(s["ugf_hz"] / s["d_ugf_hz"]):
             B["dterm"].append((f"I/D null @{math.sqrt(s['ugf_hz']*s['d_ugf_hz']):.3g} Hz: add P", "warn"))
     else:
-        B["dterm"] = [("off (pid1 = OUT2 monitor)", "dim")]
+        B["dterm"] = [("off (pid1: OUT2 monitor)", "dim")]
     parts = [n for n, on in (("ramp", hw.get("asg0.output_direct") == "out1"),
                              ("test sine", hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0),
                              ("dither", hw.get("iq0.output_direct") == "out1"),

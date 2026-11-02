@@ -184,5 +184,7 @@ Interaction:
 - No new dependencies (Dash + scipy only).
 
 ## 8. Decisions
-- **IIR band-pass / notch on IN1:** not added (user decision). The block is labelled "Band-pass (AC high-pass)".
+- **IIR band-pass / notch on IN1:** not added (user decision). Later (2026-11-02) the user asked for a real band-pass:
+  it is built on pid2's 4-stage input filter (high-pass + low-pass stages, corners from dropdowns), not the IIR.
+- **D term (2026-11-02):** the FPGA has no D; built on pid1, which then is not the OUT2 monitor (user decision).
 - **Output switch and `off` mode:** included.

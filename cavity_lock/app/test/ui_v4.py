@@ -3,6 +3,7 @@ Edits every block parameter, flips every switch, places probes, targets a peak w
 locks with the Lock switch, runs Measure noise and Measure loop, measures redraws per second, saves screenshots."""
 import asyncio
 import json
+import re
 import sys
 
 sys.path.insert(0, "..")
@@ -16,7 +17,12 @@ NEW = dict(ramp_hz="13", ramp_mvpp="300", ramp_shape="sawtooth", ramp_center_mv=
            acq_dither_mvpp="20", phase_deg="80", ac_hz="300", lpf_hz="600", lpf_order=1, err_gain="3",
            setpoint_mv="2", out2_signal="photodiode", out2_gain="2", ugf_hz="15", p_gain="0.3", clamp_auto=None,
            clamp_mv="30", lock_same_dither=None, lock_dither_hz="2500", lock_dither_mvpp="6", in1_scale="2",
-           kappa_mhz="35", driver_bw_hz="800")
+           kappa_mhz="35", driver_bw_hz="800",
+           lpf_hz_label="607.1 Hz", ac_hz_label="151.8 Hz", bp_on=None, bp_hp_hz="607.1 Hz", bp_hp_order=2,
+           bp_lp_hz="2.429 kHz", bp_lp_order=2, d_on=None, d_ugf_hz="300", d_corner_hz="303.6 Hz",
+           d_lp_hz="2.429 kHz")
+NEW["lpf_hz"], NEW["ac_hz"] = NEW.pop("lpf_hz_label"), NEW.pop("ac_hz_label")
+WIDGET = {p["key"]: p.get("widget") for b in SCH.BLOCKS for p in b["params"]}
 FAILS = []
 
 
@@ -97,13 +103,22 @@ async def main():
         # ---- every block parameter, through its own input on the diagram ----
         print("--- editing every block parameter")
 
+        async def pick(loc, label):
+            await loc.click()
+            await pg.wait_for_timeout(250)
+            await pg.locator(".dash-dropdown-option").filter(
+                has_text=re.compile(r"^\s*" + re.escape(str(label)) + r"\s*$")).first.click()
+
         async def set_value(key, val):
-            kind = FIELD[key][4]
+            kind, w = FIELD[key][4], WIDGET.get(key) or ""
             loc = pg.locator(f"#s-{key}")
             if kind == "check":
                 await loc.locator("input").click()
-            elif key == "lpf_order":
-                await loc.locator("input").nth(int(val) - 1).click()
+            elif w.startswith("radio"):
+                opts = [int(x) for x in w.split(":")[1].split(",")]
+                await loc.locator("input").nth(opts.index(int(val))).click()
+            elif w.startswith("ladder"):
+                await pick(loc, val)
             elif kind == "select":
                 await loc.click()
                 await pg.wait_for_timeout(250)
@@ -114,13 +129,18 @@ async def main():
             await pg.wait_for_timeout(700)
 
         async def get_value(key):
-            kind = FIELD[key][4]
+            kind, w = FIELD[key][4], WIDGET.get(key) or ""
             loc = pg.locator(f"#s-{key}")
             if kind == "check":
                 return await loc.locator("input").is_checked()
-            if key == "lpf_order":
-                return 1 if await loc.locator("input").nth(0).is_checked() else 2
-            if kind == "select":
+            if w.startswith("radio"):
+                opts = [int(x) for x in w.split(":")[1].split(",")]
+                ins = loc.locator("input")
+                for i, o in enumerate(opts):
+                    if await ins.nth(i).is_checked():
+                        return o
+                return None
+            if kind == "select" or w.startswith("ladder"):
                 return (await loc.inner_text()).strip()
             return await loc.input_value()
 
@@ -198,8 +218,13 @@ async def main():
         for sig in ("out2", "pid0", "out1", "asg0"):            # back to A = out1, B = asg0
             await pg.locator(pid(type="probe", p=sig)).click()
             await pg.wait_for_timeout(500)
-        check("probes restored", (await pg.locator("#pb-out1").inner_text()) == "A"
-              and (await pg.locator("#pb-asg0").inner_text()) == "B")
+        got = None
+        for _ in range(40):                                     # the diagram follows within a few ticks
+            got = (await pg.locator("#pb-out1").inner_text(), await pg.locator("#pb-asg0").inner_text())
+            if got == ("A", "B"):
+                break
+            await pg.wait_for_timeout(250)
+        check("probes restored", got == ("A", "B"), str(got))
 
         # ---- Lock Assist: click a crosshair on another peak ----
         print("--- Lock Assist")
@@ -322,6 +347,10 @@ async def main():
         st = await bode_wait_done()
         check("circuit-only Bode completes (electronics UGF and margin)", st["n"] == 10 and "Circuit-only" in st["title"]
               and "unity gain" in st["title"], st["title"][-80:])
+        await pg.wait_for_timeout(1200)
+        an = await pg.locator("#bode-analysis").inner_text()
+        check("auto-analysis shown under the plot", "Analysis" in an and "45° margin" in an and "-3 dB" in an,
+              an.replace("\n", " | ")[:120])
         check("still locked after the circuit-only sweep", "LOCKED" in await status())
         await pg.locator("#bodefig").screenshot(path="v4_10_bode_circuit.png")
         await pg.locator(pid(type="hdr", b="measure")).click()

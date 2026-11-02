@@ -487,6 +487,7 @@ class Controller:
         self.logs = collections.deque(maxlen=300)
         self.history = collections.deque(maxlen=20000)   # (t, transmission, error mean, error rms, setpoint, mode)
         self.version = 0                                 # bumps when the controller itself changes settings
+        self._changed_at = {}                            # version -> keys the controller changed then
         self.seq = 0                                     # bumps on every new set of traces
         self.meas_seq = 0                                # bumps on every new noise / loop measurement
         self.bode = None                                 # swept-sine Bode measurement (filled point by point)
@@ -580,6 +581,22 @@ class Controller:
                         hw=dict(self.hw), req=dict(self.req), ival=self.ival, amp_cal=self.amp_cal,
                         dither_on=self.dither_on)
 
+    def _bump(self, keys):
+        """The controller changed these settings itself: new version, so the UI pushes them; remembered so that an
+        apply based on an older version keeps them but still applies the user's other edits."""
+        self.version += 1
+        self._changed_at[self.version] = set(keys)
+        for v in [v for v in self._changed_at if v < self.version - 200]:
+            del self._changed_at[v]
+
+    def _changed_since(self, base):
+        if base not in self._changed_at and base != self.version and (base + 1) not in self._changed_at:
+            return set(KEYS)                             # unknown / too old: keep everything the controller has
+        out = set()
+        for v in range(base + 1, self.version + 1):
+            out |= self._changed_at.get(v, set(KEYS))
+        return out
+
     def switches(self):
         """Switch positions, derived from the register readback and the mode (never stored)."""
         return SCH.switch_states(self.mode, self.hw, self.s)
@@ -651,12 +668,23 @@ class Controller:
         qf = float(iq.quadrature_factor)
         if abs(qf - s["err_gain"]) > 1e-9:
             snapped["err_gain"] = int(round(qf)) if abs(qf - round(qf)) < 1e-9 else qf
+        # band-pass / D corners while their block is off: snap to the FPGA's list (what the dropdowns offer)
+        ladder = getattr(self, "options", {}).get("pidf")
+        if ladder:
+            for on, keys in (("bp_on", ("bp_hp_hz", "bp_lp_hz")), ("d_on", ("d_corner_hz", "d_lp_hz"))):
+                if s.get(on):
+                    continue
+                for k in keys:
+                    if s[k] > 0 and k not in snapped:
+                        near = min(ladder, key=lambda x: abs(math.log(x / s[k])))
+                        if abs(near - s[k]) > 1e-5 * s[k]:
+                            snapped[k] = near
         if snapped:
             self.log("hardware values: " + ", ".join(f"{k} {s[k]} -> {v}" for k, v in snapped.items()))
             for k in snapped:
                 self.req[k] = s[k]                       # what was asked for, shown as "asked -> used"
             s.update(snapped)
-            self.version += 1
+            self._bump(snapped)
 
     # ---- ramp ----
     def _ramp_limits(self, center, pp):
@@ -841,7 +869,10 @@ class Controller:
         if cmd == "apply":
             arg, base_version = arg
             if base_version != self.version:
-                return              # the UI sent values from before the controller changed settings: stale
+                # the UI sent its values before it saw a change the controller made itself: keep the controller's
+                # value for the keys it changed since then, and apply the user's edit of every other key
+                mine = self._changed_since(base_version)
+                arg = {k: v for k, v in arg.items() if k not in mine}
             changed = {k for k, v in arg.items() if s.get(k) != v}
             if not changed:
                 return
@@ -899,7 +930,7 @@ class Controller:
                 s.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
             self.req.clear()
             self.configure()
-            self.version += 1
+            self._bump(KEYS)
             if self.mode == "acquire":
                 self._start_acquire(quiet=True)
             self.log("settings loaded")
@@ -987,7 +1018,7 @@ class Controller:
             return
         if name == "relock":
             s["auto_relock"] = on
-            self.version += 1
+            self._bump(["auto_relock"])
             self.log(f"auto-relock {'on' if on else 'off'}")
             return
         if name == "output":
@@ -1048,7 +1079,7 @@ class Controller:
         else:
             b, self._probe_last = sig, "b"
         s["probe_a"], s["probe_b"] = a, b
-        self.version += 1
+        self._bump(["probe_a", "probe_b"])
         self._show_panel("drive")
         self.log(f"probes: A = {a}, B = {b}")
 
@@ -1137,7 +1168,7 @@ class Controller:
             elif 0 < peak < 0.25:
                 self.log(f"  tip: error gain {max(1, round(s['err_gain'] * 0.5 / peak))} would bring the error "
                          f"peak to ~0.5 V")
-            self.version += 1
+            self._bump(["phase_deg"])
         finally:
             if self.mode == "busy":
                 self.mode = "acquire"
@@ -1200,7 +1231,7 @@ class Controller:
                 old = s["phase_deg"]
                 phi, contrast = self._fit_phase(self._grab_and_show, center, 0.9 * half)
                 self.log(f"  phase {old:+.1f} -> {phi:+.1f} deg (contrast {contrast:.0f}:1)")
-                self.version += 1
+                self._bump(["phase_deg"])
             tr = self._grab_and_show()
             an = analyze_sweep(tr, self._ctx(center * 1e3))
         finally:
@@ -1355,7 +1386,7 @@ class Controller:
     def _show_panel(self, name):
         if name not in self.s["panels"]:
             self.s["panels"] = [p for p in PANELS if p in self.s["panels"] or p == name]
-            self.version += 1                            # the UI's "Show" boxes follow
+            self._bump(["panels"])                       # the UI's "Show" boxes follow
 
     def _kappa_drive(self):
         """Linewidth in OUT1 volts: the dither-off value from Auto-optimize phase if measured, else the swept
@@ -1930,7 +1961,9 @@ def analyze_bode(B, s, f_d, lock_info):
                 out.append(("INFO", f"lock-in pipeline delay from the phase: {tau*1e9:.0f} ns "
                                     f"(Verilog count {(3 + 2 * len(bw)) * 8} ns)"))
         fp, Cp = arrays(next(cv for n, cv in cur.items() if n.startswith("P + I")))
-        sl = np.polyfit(np.log10(fp[:3]), 20 * np.log10(np.abs(Cp[:3])), 1)[0] if len(fp) >= 3 else None
+        below = fp < (0.3 * s["ugf_hz"] / s["p_gain"] if s["p_gain"] > 0 else np.inf)   # integrator-dominated
+        fp, Cp = fp[below][:4], Cp[below][:4]
+        sl = np.polyfit(np.log10(fp), 20 * np.log10(np.abs(Cp)), 1)[0] if len(fp) >= 2 else None
         if sl is not None:
             out.append(("OK" if abs(sl + 20) < 3 else "WARN",
                         f"P + I: low-frequency slope {sl:.1f} dB/decade (an integrator is -20)"))
@@ -1959,8 +1992,11 @@ def analyze_bode(B, s, f_d, lock_info):
                                 f"{math.degrees(np.angle(H)):+.0f}° (absorbed by the phase fit), group delay "
                                 f"{tg*1e6:.0f} us" + (f" = {360*fu*tg:.1f}° extra lag at the unity-gain frequency"
                                                       if fu else "")))
-            out.append(("INFO", f"band-pass rejects the dither 2nd harmonic ({2*f_d:g} Hz) by "
-                                f"{-20*math.log10(max(h2, 1e-15)):.1f} dB relative to the dither"))
+            rej = -20 * math.log10(max(h2, 1e-15))
+            out.append(("INFO", f"band-pass rejects the dither 2nd harmonic ({2*f_d:g} Hz) by {rej:.1f} dB "
+                                "relative to the dither" + ("" if rej >= 6 else
+                                                            ": to reject the 2f ripple, move the low-pass corner "
+                                                            "close to the dither frequency or add a stage")))
             fb, Hb = arrays(cur["band-pass at IN1 (carrier frequency)"])
             if len(fb):
                 pk = int(np.argmax(np.abs(Hb)))

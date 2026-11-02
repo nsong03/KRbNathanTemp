@@ -27,7 +27,7 @@ COLORS = {"A": "#e67e22", "B": "#8e44ad"}
 
 CSS = """
 body { margin: 0; font-family: sans-serif; }
-#canvas-wrap { overflow-x: auto; }
+#canvas-wrap { overflow: visible; }   /* popovers may extend below the canvas; narrow windows scroll the page */
 #canvas { position: relative; width: %(W)dpx; height: %(H)dpx; background: #fbfbfb; border: 1px solid #ddd;
           border-radius: 8px; margin: 4px 0 8px; }
 #wires { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 1; }
@@ -266,14 +266,15 @@ function(B) {
                  line: {color: '#1e8e3e', width: 1, dash: 'dash'}});
   }
   var lay = {title: {text: B.title + prog + res, font: {size: 14}, x: 0.01, xanchor: 'left'}, height: 600,
-             template: 'plotly_white', margin: {l: 60, r: 20, t: 40, b: 120}, uirevision: 'bode-' + B.mode,
+             template: 'plotly_white', margin: {l: 60, r: 20, t: 40, b: 150}, uirevision: 'bode-' + B.mode,
              shapes: shapes,
              xaxis: {type: 'log', anchor: 'y', domain: [0, 1], showticklabels: false},
              xaxis2: {type: 'log', anchor: 'y2', matches: 'x', title: {text: 'frequency [Hz]'}},
              yaxis: {domain: [0.52, 1], title: {text: 'magnitude [dB]'}},
              yaxis2: {domain: [0, 0.45], title: {text: 'phase [deg]'}},
              legend: {orientation: 'h', y: -0.13, x: 0, xanchor: 'left', yanchor: 'top'},
-             annotations: [{text: B.note, xref: 'paper', yref: 'paper', x: 0, y: -0.24, showarrow: false,
+             annotations: [{text: (B.note || '').replace(/(.{1,170})(\s|$)/g, '$1<br>'), xref: 'paper', yref: 'paper',
+                            x: 0, y: -0.22, yanchor: 'top', align: 'left', showarrow: false,
                             xanchor: 'left', font: {size: 11, color: '#555'}}],
              plot_bgcolor: 'white', paper_bgcolor: 'white'};
   return {data: data, layout: lay};

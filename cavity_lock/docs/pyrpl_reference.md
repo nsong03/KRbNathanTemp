@@ -49,11 +49,22 @@ Latency, from the Verilog simulation and datasheets:
 | scope | `input1`, `input2`, `duration`, `average`, `rolling_mode`, `trigger_source`, `trigger_delay`, `durations` | 2 channels, 16384 points per trace. Sources are any DSP signal name: `in1`, `in2`, `out1`, `out2`, `iq0`–`iq2`, `iq2_2`, `pid0`–`pid2`, `asg0`, `asg1`, `iir`, `trig` **(verify with `r.scope.inputs`)** |
 | scope (0.9.9.1) | `_start_trace_acquisition()`, `curve_ready()`, `_get_trace()` | 0.9.3 uses `_start_acquisition()` / `_get_curve()`. `single()` is the slow fallback |
 | networkanalyzer | `p.networkanalyzer.setup(start_freq, stop_freq, points, rbw, average_per_point, amplitude, input, output_direct, acbandwidth, logscale, auto_bandwidth, q_factor_min, auto_amplitude)`, `single()`, `frequencies` | uses a free IQ module. Reserve yours with `.owner` first |
-| iir | not used | available for a true band-pass or notch on IN1: route in1 → iir → iq0.input. It adds latency **(verify)** |
+| iir | not used | the band-pass is built on pid2's input filter instead (see below) |
 
 Unused modules (`asg1`, `pid2`, `iq1`, `iq2`) get `output_direct = "off"` at start-up so that nothing else writes to OUT1.
 
-"Measure Bode plot" uses `asg1`, `iq1` and `pid2` (reserved with `.owner`). Assumptions to check on hardware **(verify)**:
+Read from the 0.9.9.1 Verilog (`red_pitaya_pid_block.v`, `red_pitaya_iq_block.v`, `red_pitaya_filter_block.v`,
+`red_pitaya_dsp.v`):
+- PID: `FILTERSTAGES = 4`, `FILTERMINBW = 10`, `DERIVATIVE = 0` (no D; PyRPL comments out `pid.d`). The input filter is
+  applied before the error: `error = filtered(in) − setpoint`.
+- IQ0/IQ1: `INPUTFILTERSTAGES = 1` (the AC high-pass), `QUADRATUREFILTERSTAGES = 2`; IQ2: 4 quadrature stages.
+- Filter stage: low-pass `y += (x − y) >> shift` (2 clocks), high-pass = `x − y` (1 clock). Valid corners:
+  `−ln(1 − 2^shift / 2^MAXSHIFT) · 125 MHz / 2π` with PyRPL's correction factors (`FilterRegister.valid_frequencies`).
+
+Band-pass: pid2 as a pass-through (P = 1, I = 0) with HP and LP input stages; `iq0.input = "pid2"`. D: pid1 on `iq0`
+with a high-pass input stage and a gain to OUT1 **(verify on hardware: pid1's output summing with pid0 in OUT1)**.
+
+"Measure Bode plot" uses `asg1` and `iq1`, and pid2 (or pid1 when the band-pass holds pid2) for its copies. Assumptions to check on hardware **(verify)**:
 - `asg1.setup(waveform="sin", ...)` with `output_direct="off"` still produces the internal signal `asg1` for the scope
   and for `iq1.input`.
 - `iq1.frequency = 0` makes the mixer multiply by cos(phase), so `iq1` is the input through the low-pass stages and

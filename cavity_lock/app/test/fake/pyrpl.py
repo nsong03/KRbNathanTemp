@@ -290,7 +290,8 @@ class Engine:
                 ready_at = now + duration          # an untriggered trace still takes its duration to record
         rel1 = (ts[0] - self.rp.asg1.t0) + np.arange(n) * (duration / n)   # precise relative time axis
         sig["asg1"] = self.rp.asg1.raw(None, rel=rel1)
-        sig.update(self.copies(rel1))
+        if set(names) & {"iq1", "pid1", "pid2"}:        # only when a spare-module copy is recorded
+            sig.update(self.copies(rel1))
         p1 = self.rp.pid1                                # OUT2 monitor: pid1 pass-through (P only, clamped)
         src = sig.get(p1.input, np.zeros(n)) if p1.output_direct == "out2" else np.zeros(n)
         sig["out2"] = np.clip(p1.p * (src - p1.setpoint), p1.min_voltage, p1.max_voltage)
