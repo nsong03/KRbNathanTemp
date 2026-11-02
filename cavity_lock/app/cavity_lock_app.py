@@ -18,11 +18,18 @@ Diagnostics (while locked)
   "Measure noise"  spectra of the residual detuning (from the error signal) and of the transmitted intensity
   "Measure loop"   open-loop gain, phase margin and plant response with PyRPL's network analyzer
 
+Second feature: AOM intensity stabilization on IN2/OUT2 (intensity.py, intensity_schematic.py). Two icons at
+the top left switch between the "Cavity lock" and "Intensity" views; both loops always run in hardware and share
+the scope (frames are scheduled: the visible loop gets most, the hidden one enough for its watchdog).
+
 Wiring
   IN1  <- cavity transmission photodiode   (LV jumper for signals under 1 V, else HV + set "IN1 scale" to 20)
-  IN2     free (an external dither is not needed: the demodulation must use the Red Pitaya's own oscillator)
   OUT1 -> PZT driver MOD IN                (ramp + dither, or setpoint + dither)
-  OUT2 -> scope                            (monitor: error, setpoint, ramp or photodiode)
+  IN2  <- AOM pickoff photodiode           (1st-order beam, LV jumper, ~0.5-0.8 V at the operating point)
+  OUT2 -> 50 ohm tee -> AOM bias driver    (intensity servo pid2 + power scan asg1; 0 V = bias level)
+
+FPGA modules: cavity = iq0, asg0, pid0 (+ iq1, pid1 with outputs off during a circuit-only Bode);
+intensity = pid2, asg1; pid1 otherwise off; iq2 free for the network analyzer.
 
 Run (in the Python environment where PyRPL works)
   pip install "dash>=2.9" scipy
@@ -46,6 +53,7 @@ import numpy as np
 from scipy.signal import find_peaks, peak_widths, welch
 
 import schematic as SCH
+import intensity as INT
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(HERE, "cavity_lock_settings.json")
@@ -103,16 +111,16 @@ FIELDS = [
     ("ui_hz", "Browser refresh [Hz]", 10.0, "Display", "num", {"min": 1, "max": 30}),
     ("drive_every", "Refresh the drive plot every N traces", 3, "Display", "num", {"min": 1, "max": 100}),
     ("in1_scale", "IN1 scale [V per raw V] (1 = LV, 20 = HV)", 1.0, "Display", "num", {"min": 0.01}),
-    ("out2_signal", "OUT2 monitor", "error", "Display", "select",
-     {"options": ["error", "setpoint", "ramp", "photodiode", "off"]}),
-    ("out2_gain", "OUT2 gain", 1.0, "Display", "num", {}),
     ("probe_a", "Probe A", "out1", "Display", "select", {"options": SCH.PROBE_SIGNALS + ["off"]}),
     ("probe_b", "Probe B", "asg0", "Display", "select", {"options": SCH.PROBE_SIGNALS + ["off"]}),
 ]
+CAV_FIELDS = list(FIELDS)
+CAV_KEYS = [f[0] for f in CAV_FIELDS]
+FIELDS = CAV_FIELDS + INT.I_FIELDS      # one settings dict / file; intensity keys start with int_
 KEYS = [f[0] for f in FIELDS]
 DEFAULTS = {f[0]: f[2] for f in FIELDS}
 DEFAULTS["target_mv"] = None           # lock target (drive voltage of the chosen peak); None = tallest
-OUT2_SOURCE = SCH.OUT2_SOURCE
+# old settings files may contain out2_signal / out2_gain (the removed OUT2 monitor): not in DEFAULTS, so ignored
 SNAP_KEYS = ("lpf_hz", "lpf_order", "ac_hz", "err_gain")   # the FPGA rounds these: show requested -> used
 
 
@@ -432,25 +440,49 @@ class Controller:
         self.req = {}                                    # requested values of keys the FPGA rounds
         self.ival = None                                 # last pid0.ival read
         self._probe_last = "b"                           # probe channel assigned last
+        self.A = sys.modules[__name__]                   # analysis helpers for intensity.py
+        self.view = "cavity"                             # visible view (from the browser): scope schedule hint
+        self._owner = None                               # loop whose frame / sequence is running ("cav" / "int")
+        self._next_hidden = 0.0                          # when the hidden loop's next scope frame is due
+        self._bg_last = {"cav": 0.0, "int": 0.0}
+        self.bg_count = {"cav": 0, "int": 0}            # background watchdog checks done (diagnostics, tests)
+        self.frames = {"cav": 0, "int": 0}              # scope frames given to each loop by the scheduler
+        self._relock_pending = False
+        self.has_sampler = False
         self.log(f"connecting to {host} ...")
         from pyrpl import Pyrpl
         self.p = Pyrpl(config=config, hostname=host, gui=False)
         self.r = self.p.rp
-        for name in ("iq0", "pid0", "pid1", "asg0", "scope", "asg1", "iq1", "pid2"):   # reserve: PyRPL tools
-                                                                                   # (network analyzer) skip them
+        # Module allocation: cavity = iq0, asg0, pid0 (+ iq1, pid1 outputs off for the circuit-only Bode);
+        # intensity = pid2, asg1 (intensity.py reserves them). iq2 stays free for the network analyzer.
+        for name in ("iq0", "pid0", "pid1", "asg0", "iq1", "scope"):   # reserve: PyRPL tools skip them
             try:
                 getattr(self.r, name).owner = "cavity_lock_app"
             except Exception:
                 pass
-        for name in ("asg1", "pid2", "iq1", "iq2"):          # unused modules must not write to the outputs
+        for name in ("iq1", "iq2"):                          # spare modules must not write to the outputs
             try:
                 getattr(self.r, name).output_direct = "off"
             except Exception:
                 pass
+        try:                                                 # pid1 off (an old OUT2 monitor would add onto OUT2)
+            p1 = self.r.pid1
+            p1.output_direct = "off"
+            p1.p, p1.i = 0, 0
+            p1.ival = 0
+        except Exception:
+            pass
+        try:
+            float(self.r.sampler.in1)
+            self.has_sampler = True
+        except Exception:
+            pass
         self.r.pid0.i = 0
         self.log("connected")
         self._start_acquire()
         self._readback()
+        self.ints = INT.Intensity(self)
+        self.ints.startup()
 
     # ---- small utilities ----
     def log(self, msg):
@@ -508,13 +540,12 @@ class Controller:
 
     # ---- hardware configuration ----
     def configure(self):
-        """Write every static block of the schematic (iq0: dither, phase, filters, gain; pid0 setpoint; pid1)."""
+        """Write every static block of the schematic (iq0: dither, phase, filters, gain; pid0 setpoint)."""
         SCH.write_static(self)
-        for p in (self.r.pid0, self.r.pid1):
-            try:
-                p.inputfilter = [0, 0, 0, 0]
-            except Exception:
-                pass
+        try:
+            self.r.pid0.inputfilter = [0, 0, 0, 0]
+        except Exception:
+            pass
         self._snap_to_hardware()
 
     def _snap_to_hardware(self):
@@ -610,10 +641,11 @@ class Controller:
         if start and read and hasattr(sc, "curve_ready"):
             start()
             t_arm = time.time()
-            time.sleep(max(0.0, duration - 0.002))           # nothing can be ready before one trace length
+            self._wait(max(0.0, duration - 0.002))           # nothing can be ready before one trace length
             while not sc.curve_ready():
                 if time.time() - t_arm > timeout:
                     raise TimeoutError(f"scope did not trigger on '{trigger}'")
+                self._bg_service()
                 time.sleep(0.001)
             data = np.array(read())
         else:
@@ -687,37 +719,120 @@ class Controller:
                 self.configure()
                 self._cal_checks = max(self._cal_checks, 1)
 
-    # ---- main loop ----
+    # ---- main loop and scope schedule ----
+    HIDDEN_PERIOD = {"cav": 0.15, "int": 0.2}            # s between watchdog frames of the hidden loop
+    IDLE_PERIOD = 1.0                                    # hidden loop scanning / off: no watchdog, 1 frame/s
+
     def run(self, stop_event):
+        """Commands first; then one scope frame for one loop. The visible view's loop gets every frame except
+        the hidden loop's watchdog frames (cavity locked/held every 0.15 s, intensity locked/held/fault every
+        0.2 s, otherwise 1/s). Between and during frames, _wait()/_bg_service() run register-only watchdog checks
+        of the loop that does not own the scope."""
         while not stop_event.is_set():
             try:
                 while True:
                     cmd, arg = self.cmds.get_nowait()
+                    is_int = cmd.startswith("int_")
+                    self._owner = "int" if is_int else "cav"
                     try:
                         self._do(cmd, arg)
                     except Exception as e:
                         self.log(f"ERROR in {cmd}: {e!r}")
-                        if self.mode in ("busy", "locking", "measuring"):
+                        if is_int and self.ints.mode in INT.ISCH.BUSY:
+                            self.ints.mode = "held"
+                        elif not is_int and self.mode in ("busy", "locking", "measuring"):
                             self.mode = "held"
-                    try:
-                        self._readback()                 # the diagram shows what the registers now hold
+                    finally:
+                        self._owner = None
+                    try:                                 # the diagram shows what the registers now hold
+                        if is_int or cmd in ("apply", "load"):
+                            self.ints.readback()
+                        if not is_int:
+                            self._readback()
                     except Exception as e:
                         self.log(f"readback error: {e!r}")
             except queue.Empty:
                 pass
+            loop = self._pick()
+            self._owner = loop
+            self.frames[loop] += 1
             try:
-                if self.mode == "acquire":
-                    self._acquire_tick()
-                elif self.mode in ("locked", "held", "off"):
-                    self._live_tick()
+                if loop == "int":
+                    self.ints.frame()
                 else:
-                    time.sleep(0.05)
+                    self._cav_frame()
             except Exception as e:
-                self.log(f"acquisition error: {e!r}")
+                self.log(f"acquisition error ({loop}): {e!r}")
                 time.sleep(0.5)
+            finally:
+                self._owner = None
+
+    def _pick(self):
+        vis = "int" if self.view == "intensity" else "cav"
+        hid = "cav" if vis == "int" else "int"
+        now = time.time()
+        if now >= self._next_hidden:
+            watch = (self.mode in ("locked", "held") if hid == "cav"
+                     else self.ints.mode in ("locked", "held", "railed", "nolight"))
+            self._next_hidden = now + (self.HIDDEN_PERIOD[hid] if watch else self.IDLE_PERIOD)
+            return hid
+        return vis
+
+    def _cav_frame(self):
+        if self._relock_pending and self.mode == "held":
+            self._relock_pending = False
+            self._relock()
+            self._readback()
+            return
+        self._relock_pending = False
+        if self.mode == "acquire":
+            self._acquire_tick()
+        elif self.mode in ("locked", "held", "off"):
+            self._live_tick()
+        else:
+            self._wait(0.05)
+
+    def _wait(self, dt):
+        """Sleep for dt while servicing the other loop's register-only watchdog."""
+        t_end = time.time() + dt
+        while True:
+            self._bg_service()
+            rem = t_end - time.time()
+            if rem <= 0:
+                return
+            time.sleep(min(rem, 0.02))
+
+    def _bg_service(self):
+        now = time.time()
+        if not hasattr(self, "ints"):
+            return
+        if self._owner != "int" and now - self._bg_last["int"] >= 0.1:
+            self._bg_last["int"] = now
+            self.bg_count["int"] += 1
+            self.ints.bg_check()
+        if self._owner != "cav" and now - self._bg_last["cav"] >= 0.1:
+            self._bg_last["cav"] = now
+            self.bg_count["cav"] += 1
+            self._cav_bg_check()
+
+    def _cav_bg_check(self):
+        """Cavity watchdog from register reads (pid0.ival and, if present, the sampler's in1)."""
+        if self.mode != "locked" or not self.lock_info.get("clamp"):
+            return
+        try:
+            ival = float(self.r.pid0.ival)
+            T = None
+            if self.has_sampler:
+                T = float(np.mean([float(self.r.sampler.in1) for _ in range(4)])) * self.s["in1_scale"]
+            self._cav_watchdog(T, ival, time.time(), main=False)
+        except Exception as e:
+            self.log(f"cavity background check failed: {e!r}")
 
     def _do(self, cmd, arg):
         s = self.s
+        if cmd.startswith("int_"):
+            self.ints.do(cmd, arg)
+            return
         if cmd == "apply":
             arg, base_version = arg
             if base_version != self.version:
@@ -729,6 +844,18 @@ class Controller:
                 self.req[k] = arg[k]
             f_before = self._dither()[0]
             s.update(arg)
+            ichanged = {k for k in changed if k.startswith("int_")}
+            if ichanged:
+                self._owner = "int"
+                try:
+                    self.ints.apply(ichanged)
+                finally:
+                    self._owner = "cav"
+                if ichanged - {"int_panels", "int_probe_a", "int_probe_b", "int_window_us"}:
+                    self.log("[int] applied: " + ", ".join(f"{k}={s[k]}" for k in sorted(ichanged)))
+                changed -= ichanged
+                if not changed:
+                    return
             written = SCH.apply_changed(self, changed)      # the writers of the blocks that own these keys
             if set(written) & {"lowpass", "bandpass", "amp"}:
                 self._snap_to_hardware()
@@ -742,6 +869,8 @@ class Controller:
                     self.log(f"WARN predicted phase margin {pm:.0f} deg at {fu:.0f} Hz: the loop may oscillate")
             if changed - {"panels", "ui_hz", "drive_every"}:
                 self.log("applied: " + ", ".join(f"{k}={s[k]}" for k in sorted(changed)))
+        elif cmd == "view":
+            self.view = arg
         elif cmd == "acquire":
             self._switch("scan", True)
         elif cmd == "switch":
@@ -779,6 +908,14 @@ class Controller:
             self.version += 1
             if self.mode == "acquire":
                 self._start_acquire(quiet=True)
+            self._owner = "int"
+            try:
+                self.ints.req.clear()
+                self.ints._setpoint_changed()
+                INT.ISCH.apply_changed(self.ints, set(INT.I_KEYS))   # static + the writers live in this mode
+                self.ints._snap()
+            finally:
+                self._owner = "cav"
             self.log("settings loaded")
 
     # ---- acquisition ----
@@ -951,7 +1088,7 @@ class Controller:
         energies = []
         for k in range(4):
             self.r.iq0.phase = phi0 + 45 * k
-            time.sleep(self._filter_settle())
+            self._wait(self._filter_settle())
             tr = grab()
             w = np.abs(tr["v"] - v_t) < half
             e = tr["err"][w]
@@ -959,7 +1096,7 @@ class Controller:
         c, sn = energies[0] - energies[2], energies[1] - energies[3]
         phi = phi0 + 0.5 * math.degrees(math.atan2(sn, c))
         self.r.iq0.phase = phi
-        time.sleep(self._filter_settle())
+        self._wait(self._filter_settle())
         tr = grab()
         an = analyze_sweep(tr, self._ctx(v_t * 1e3))
         if an.get("slope") is not None and an["slope"] > 0:
@@ -1001,7 +1138,7 @@ class Controller:
             if an.get("mode_spacing"):
                 half = min(half, 0.45 * an["mode_spacing"])
             self.log("auto phase 2/2: fitting the phase")
-            time.sleep(self._filter_settle())
+            self._wait(self._filter_settle())
             phi, contrast = self._fit_phase(self._grab_and_show, tgt["v"], half)
             tr = self._grab_and_show()
             new = analyze_sweep(tr, self._ctx(s["target_mv"]))
@@ -1069,7 +1206,7 @@ class Controller:
         saved_target = s["target_mv"]
         s["target_mv"] = center * 1e3
         try:
-            time.sleep(max(1.5 / f_z, self._filter_settle()))
+            self._wait(max(1.5 / f_z, self._filter_settle()))
             if refine:
                 self.log("LOCK 2/3: fitting the phase at the lock dither")
                 old = s["phase_deg"]
@@ -1121,7 +1258,7 @@ class Controller:
                 self.log(f"  integrator gain {-u/S:.3g} Hz is below PyRPL's resolution: raise the error gain")
                 self.mode = "held"
                 return False
-            time.sleep(0.4)
+            self._wait(0.4)
             ival = float(p0.ival)
             if ival <= lo + 0.03 * (hi - lo) or ival >= hi - 0.03 * (hi - lo):
                 p0.i = 0
@@ -1155,13 +1292,23 @@ class Controller:
         self.history.append((now, T, em, erms, ival, self.mode))
         self._publish(traces=dict(kind="time", t=t, pd=pd, err=err), **({"drive": drive} if drive else {}))
         if self.mode != "locked":
-            time.sleep(0.05)
+            if self.view == "cavity":
+                self._wait(0.05)
             return
-        li = self.lock_info
+        self.lock_info.update(err_rms=erms)
+        self._cav_watchdog(T, ival, now, main=True, em=em, erms=erms)
+
+    def _cav_watchdog(self, T, ival, now, main, em=0.0, erms=0.0):
+        """Unlock when the transmission stays low for unlock_s or the setpoint reaches the clamp. From a
+        background check (main=False, T may be None without a sampler) it only holds; the relock then runs in
+        the next cavity frame."""
+        s, li = self.s, self.lock_info
         lo, hi = li["clamp"]
         at_edge = ival < lo + 0.05 * (hi - lo) or ival > hi - 0.05 * (hi - lo)
-        low = T < s["unlock_frac"] * li["height"]
-        li.update(transmission=T, frac=T / li["height"] if li["height"] else 0, err_rms=erms, setpoint=ival)
+        low = T is not None and T < s["unlock_frac"] * li["height"]
+        if T is not None:
+            li.update(transmission=T, frac=T / li["height"] if li["height"] else 0)
+        li["setpoint"] = ival
         if not (at_edge or low):
             self._bad_since = None
             self._good_ival.append(ival)
@@ -1170,13 +1317,17 @@ class Controller:
         if now - self._bad_since < s["unlock_s"] and not at_edge:
             return
         why = "setpoint at the clamp" if at_edge else "transmission low"
-        self.log(f"UNLOCK ({why}) at {ival*1e3:+.3f} mV")
-        self.history.append((now, T, em, erms, ival, "unlock"))
+        self.log(f"UNLOCK ({why}) at {ival*1e3:+.3f} mV" + ("" if main else " (background check)"))
+        self.history.append((now, T if T is not None else 0.0, em, erms, ival, "unlock"))
         self.r.pid0.i = 0
         self.mode = "held"
         if s["auto_relock"]:
-            self._relock()
-        self._readback()
+            if main:
+                self._relock()
+            else:
+                self._relock_pending = True
+        if main:
+            self._readback()
 
     def _relock(self):
         li = self.lock_info
@@ -1193,7 +1344,7 @@ class Controller:
         self.log(f"relock {tries+1}: searching {lo*1e3:+.1f}..{hi*1e3:+.1f} mV")
         self.mode = "locking"
         self._ramp_on(lo, hi, f, "triangle")
-        time.sleep(max(1.5 / f, self._filter_settle()))
+        self._wait(max(1.5 / f, self._filter_settle()))
         saved = self.s["target_mv"]
         self.s["target_mv"] = None
         try:
@@ -1346,7 +1497,7 @@ class Controller:
             if self.mode == "measuring":
                 self.mode = "locked"
 
-    # ---- swept-sine Bode measurement (internal generator asg1 + scope) ----
+    # ---- swept-sine Bode measurement (internal generator asg0 + scope) ----
     def stop_measurement(self):
         """Called from the UI thread: the running sweep stops after the present point."""
         self._stop_meas.set()
@@ -1359,12 +1510,15 @@ class Controller:
 
     def _measure_bode(self):
         """Swept-sine Bode plot, filled in point by point.
-        closed loop (locked): asg1 adds a small sine at the OUT1 sum; the scope records it with the PID output
-            (pid0) and with the error (iq0). c/x gives the open-loop gain G = -T/(1+T), the sensitivity
-            S = 1/(1+G) = 1 + c/x and the closed-loop response G/(1+G); the plant is (e/x)/S.
-        circuit only (any mode, OUT1 untouched): spare copies of the blocks (iq1 = lock-in chain with the same
-            low-pass and gain, its oscillator at 0 Hz so the chain is seen at baseband; pid2 = the PID with the
-            loop gains per unit error slope) are driven by asg1, which is not routed to any output."""
+        closed loop (locked): asg0 (idle while locked: the ramp is off) adds a small sine at the OUT1 sum; the
+            scope records it with the PID output (pid0) and with the error (iq0). c/x gives the open-loop gain
+            G = -T/(1+T), the sensitivity S = 1/(1+G) = 1 + c/x and the closed-loop response G/(1+G); the plant
+            is (e/x)/S.
+        circuit only (OUT1 untouched): spare copies of the blocks (iq1 = lock-in chain with the same low-pass and
+            gain, its oscillator at 0 Hz so the chain is seen at baseband; pid1 = the PID with the loop gains per
+            unit error slope), both with their outputs off, are driven by asg0, which is not routed to any
+            output. While scanning, OUT1 is parked at the ramp centre for the sweep and the scan restarts after.
+        Never touches pid2 / asg1 (the intensity servo) or OUT2."""
         s = self.s
         closed = s["bode_mode"] == "closed loop"
         if self.mode in SCH.BUSY:
@@ -1380,6 +1534,9 @@ class Controller:
             self.log(f"Bode: stop frequency limited to {f_stop:.0f} Hz (0.45 x dither: the lock-in cannot pass more)")
         fs = np.geomspace(f_start, f_stop, int(s["bode_points"]))
         prev = self.mode
+        rp_saved = dict(self.ramp) if (prev == "acquire" and self.ramp) else None
+        if rp_saved:                                     # asg0 is the scan: park OUT1 at the ramp centre
+            self._park((rp_saved["lo"] + rp_saved["hi"]) / 2)
         self.mode = "measuring"
         self._stop_meas.clear()
         self._show_panel("Bode (swept)")
@@ -1389,10 +1546,11 @@ class Controller:
             else:
                 self._bode_circuit(fs, prev)
         finally:
-            a1 = self.r.asg1
-            a1.output_direct, a1.amplitude = "off", 0
+            a0 = self.r.asg0
+            a0.output_direct = "off"
+            a0.amplitude, a0.offset = 0, 0
             for m, attrs in (("iq1", {"output_direct": "off", "amplitude": 0}),
-                             ("pid2", {"output_direct": "off", "i": 0, "p": 0, "ival": 0})):
+                             ("pid1", {"output_direct": "off", "i": 0, "p": 0, "ival": 0, "input": "off"})):
                 for k, v in attrs.items():
                     try:
                         setattr(getattr(self.r, m), k, v)
@@ -1400,23 +1558,26 @@ class Controller:
                         pass
             self.meas_progress = ""
             if self.mode == "measuring":
-                self.mode = prev
+                self.mode = prev if prev != "acquire" else "held"
+            if rp_saved and self.mode == "held":
+                self._start_acquire(quiet=True)
+                self.log("Bode done: scanning again")
             if self.bode:
                 self._bode_publish(dict(self.bode, done=True))
 
     def _bode_capture(self, sig, f, cycles):
-        """Two-channel capture (asg1, sig) long enough for `cycles` periods; complex amplitudes at f."""
+        """Two-channel capture (asg0, sig) long enough for `cycles` periods; complex amplitudes at f."""
         dur = float(np.clip(cycles / f, 2e-3, 2.1))      # 2.1 s: the scope then picks 2.15 s, not 4.3 s
-        t, x, y = self.capture("asg1", sig, dur)
+        t, x, y = self.capture("asg0", sig, dur)
         return fit_sine(t, x, f), fit_sine(t, y, f)
 
-    def _bode_point_live(self, f, amp, out):
-        a1 = self.r.asg1
-        a1.setup(waveform="sin", frequency=float(f), amplitude=float(amp), offset=0.0,
+    def _bode_point_live(self, f, amp, out, offset=0.0):
+        a0 = self.r.asg0
+        a0.setup(waveform="sin", frequency=float(f), amplitude=float(amp), offset=offset,
                  trigger_source="immediately", output_direct=out)
         with self._pub_lock:
-            self.hw.update({"asg1.frequency": float(f), "asg1.amplitude": float(amp), "asg1.output_direct": out,
-                            "asg1.waveform": "sin"})
+            self.hw.update({"asg0.frequency": float(f), "asg0.amplitude": float(amp), "asg0.output_direct": out,
+                            "asg0.waveform": "sin", "asg0.offset": offset})
 
     def _bode_closed(self, fs):
         s, li, r = self.s, self.lock_info, self.r
@@ -1441,12 +1602,12 @@ class Controller:
                 break
             self.meas_progress = f"Bode {k+1}/{len(fs)} at {f:.3g} Hz"
             self._bode_point_live(f, amp, "out1")
-            time.sleep(min(max(3 / f, settle_loop, self._filter_settle()), 1.5))
+            self._wait(min(max(3 / f, settle_loop, self._filter_settle()), 1.5))
             X, C = self._bode_capture("pid0", f, s["bode_cycles"])
             X2, E = self._bode_capture("iq0", f, s["bode_cycles"])
             ival = float(r.pid0.ival)
             if ival <= lo + 0.03 * (hi - lo) or ival >= hi - 0.03 * (hi - lo):
-                r.asg1.output_direct = "off"
+                r.asg0.output_direct = "off"
                 r.pid0.i = 0
                 self.mode = "held"
                 self.log(f"Bode: the lock ran to the clamp at {f:.3g} Hz; stopped and holding (lower the excitation)")
@@ -1470,13 +1631,13 @@ class Controller:
         s, r = self.s, self.r
         S = self.lock_info.get("slope")
         Sn = abs(S) if S else 1.0
-        iq, p2 = r.iq1, r.pid2
+        iq, p2 = r.iq1, r.pid1
         # copy of the lock-in chain at baseband (oscillator at 0 Hz: the mixer multiplies by cos(0) = 1)
         iq.output_direct = "off"
         iq.amplitude = 0
         iq.frequency = 0
         iq.phase = 0
-        iq.input = "asg1"
+        iq.input = "asg0"
         iq.acbandwidth = 0
         iq.gain = 0
         iq.bandwidth = [s["lpf_hz"]] * int(s["lpf_order"])
@@ -1504,13 +1665,13 @@ class Controller:
             ("lock-in chain (normalized)", "#1f5fa8", L_m), (f"PID x slope (i = {i_reg:.3g} Hz, p = {p_reg:.3g})",
                                                              "#7d3c98", C_m),
             ("electronics open loop", "#1e8e3e", L_m * C_m)],
-            title="Circuit-only Bode (spare copies iq1 + pid2 driven by asg1; OUT1 untouched)",
+            title="Circuit-only Bode (spare copies iq1 + pid1 driven by asg0, outputs off; OUT1 untouched)",
             note=(f"lock-in at baseband: low-pass {' + '.join(f'{b:.1f}' for b in bw)} Hz, gain x{s['err_gain']:g}; "
                   f"input high-pass at the dither: x{hp_fd:.3f} (not in the copy). PID with i = UGF, p = P gain: "
                   f"the lock uses i/|S|" + (f" (|S| = {Sn:.1f}/V)" if S else " (slope not measured yet)") +
                   ". Driver and cavity are not included."))
         self._bode_publish(B)
-        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.3g} Hz on iq1 + pid2 (OUT1 untouched)")
+        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.3g} Hz on iq1 + pid1 (OUT1 untouched)")
         L0 = None
         for k, f in enumerate(fs):
             if self._stop_meas.is_set():
@@ -1521,10 +1682,10 @@ class Controller:
             amp = float(np.clip(min(0.25 / max(abs(L_m[k] * C_m[k]), 1e-9), 0.6 / max(abs(L_m[k]), 1e-9)),
                                 1e-3, s["bode_amp_mv"] * 1e-3))
             self._bode_point_live(f, amp, "off")
-            time.sleep(min(max(3 / f, self._filter_settle()), 1.5))
+            self._wait(min(max(3 / f, self._filter_settle()), 1.5))
             p2.ival = 0
             X, Y = self._bode_capture("iq1", f, s["bode_cycles"])
-            X2, Z = self._bode_capture("pid2", f, s["bode_cycles"])
+            X2, Z = self._bode_capture("pid1", f, s["bode_cycles"])
             L, T = Y / X, Z / X2
             L0 = L0 or L
             for cv, val in zip(B["curves"], (L / L0, T / L, T / L0)):

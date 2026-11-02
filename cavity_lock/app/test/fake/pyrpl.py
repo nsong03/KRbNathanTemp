@@ -1,8 +1,11 @@
 """TEST ONLY: a stand-in for pyrpl.Pyrpl so the app can be exercised without hardware.
 Cavity with three modes, PZT lag on the dither, quasi-static IQ demodulation with an n-pole low-pass,
-PyRPL-style PID (quantized i, clamps), scope with 'asg0' trigger and the Qt-free acquisition calls."""
+PyRPL-style PID (quantized i, clamps), scope with 'asg0'/'asg1' triggers and the Qt-free acquisition calls.
+OUT2: pid2 + asg1 summed into an AOM intensity plant (class AOM). Every register write by app code is logged
+in WRITES as (time, module, attribute, value, app source file) for the isolation tests."""
 import math
 import os
+import sys
 import threading
 import time
 
@@ -26,6 +29,45 @@ def lan():
     if LAN_S:
         time.sleep(LAN_S)                # the "hardware" dither is 4 % bigger than requested (tests the calibration)
 I_STEP = 1.0 / (2 ** 32 * 2 * math.pi * 8e-9)
+P_STEP = 2.0 ** -12
+I_MAX, P_MAX = (2 ** 23 - 1) * I_STEP, (2 ** 23 - 1) * P_STEP
+
+WRITES = []                      # (t, module, attr, value, source file of the app frame that wrote it)
+WRITE_N = [0]                    # all logged writes
+WRITE_N_NONSCOPE = [0]           # logged writes to anything but the scope
+_BUILDING = [False]              # True while the fake builds its modules (constructor writes are not logged)
+_HERE = os.path.abspath(__file__)
+
+
+def _src():
+    """File name of the first app frame on the stack (None for the fake's own engine thread)."""
+    if _BUILDING[0]:
+        return None
+    f = sys._getframe(2)
+    while f is not None:
+        fn = f.f_code.co_filename
+        if os.path.abspath(fn) != _HERE:
+            b = os.path.basename(fn)
+            return None if b == "threading.py" else b
+        f = f.f_back
+    return None
+
+
+class Mod:
+    """A hardware module whose attribute writes are logged (private names and 'owner' are not registers)."""
+    _name = "?"
+
+    def __setattr__(self, k, v):
+        if not k.startswith("_") and k not in ("owner", "eng", "rp", "iq"):
+            src = _src()
+            if src is not None:
+                WRITE_N[0] += 1
+                if self._name != "scope":
+                    WRITE_N_NONSCOPE[0] += 1
+                if len(WRITES) < 400000:
+                    WRITES.append((time.time(), self._name, k, v if isinstance(v, (int, float, str, bool, type(None)))
+                                   else repr(v), src))
+        object.__setattr__(self, k, v)
 
 
 def h1(x, m):
@@ -37,10 +79,12 @@ class Obj:
     pass
 
 
-class PID:
-    def __init__(self):
+class PID(Mod):
+    def __init__(self, name):
+        object.__setattr__(self, "_name", name)
         self.input, self.output_direct, self.setpoint, self.p, self._i, self.ival = "off", "off", 0.0, 0.0, 0.0, 0.0
-        self.min_voltage, self.max_voltage, self.inputfilter = -1.0, 1.0, [0, 0, 0, 0]
+        self.min_voltage, self.max_voltage = -1.0, 1.0
+        object.__setattr__(self, "_filt", [0, 0, 0, 0])
 
     @property
     def i(self):
@@ -48,11 +92,29 @@ class PID:
 
     @i.setter
     def i(self, v):
-        self._i = round(v / I_STEP) * I_STEP
+        self._i = float(np.clip(round(v / I_STEP), -2 ** 23 + 1, 2 ** 23 - 1)) * I_STEP
+
+    @property
+    def p(self):
+        return self._p
+
+    @p.setter
+    def p(self, v):
+        self._p = float(np.clip(round(v / P_STEP), -2 ** 23 + 1, 2 ** 23 - 1)) * P_STEP
+
+    @property
+    def inputfilter(self):
+        return list(self._filt)
+
+    @inputfilter.setter
+    def inputfilter(self, v):
+        v = [b for b in np.atleast_1d(v)][:4]
+        self._filt = [math.copysign(nearest_log(abs(b), LPF_LADDER), b) if b else 0 for b in v] + [0] * (4 - len(v))
 
 
-class ASG:
-    def __init__(self, eng):
+class ASG(Mod):
+    def __init__(self, eng, name):
+        object.__setattr__(self, "_name", name)
         self.eng, self.waveform, self.frequency, self.amplitude, self.offset = eng, "ramp", 1.0, 0.0, 0.0
         self.output_direct, self.trigger_source, self.t0 = "off", "off", 0.0
 
@@ -61,11 +123,23 @@ class ASG:
             setattr(self, k, v)
         self.t0 = time.time()
 
-    def value(self, t):
-        """What this ASG adds to OUT1 (zero unless routed there)."""
-        if self.output_direct == "off" or self.amplitude == 0:
+    def value(self, t, out="out1"):
+        """What this ASG adds to output `out` (zero unless routed there)."""
+        if self.output_direct not in (out, "both") or self.amplitude == 0:
             return np.zeros_like(np.asarray(t, dtype=float))
         return self.raw(t)
+
+    def raw_rel(self, t0, trel):
+        """The internal signal at times t0 + trel, without losing precision on epoch times."""
+        trel = np.asarray(trel, dtype=float)
+        if self.amplitude == 0:
+            return np.zeros_like(trel) + self.offset
+        ph = (((t0 - self.t0) * self.frequency) % 1.0 + trel * self.frequency) % 1.0
+        if self.waveform in ("sin", "cos"):
+            return self.offset + self.amplitude * np.sin(2 * np.pi * ph + (np.pi / 2 if self.waveform == "cos" else 0))
+        if self.waveform == "halframp":
+            return self.offset + self.amplitude * (2 * ph - 1)
+        return self.offset + self.amplitude * (1 - 4 * np.abs(ph - 0.5))
 
     def raw(self, t):
         """The ASG's internal signal (what the scope sees as 'asg0' / 'asg1'), routed or not."""
@@ -79,6 +153,185 @@ class ASG:
         return self.offset + self.amplitude * (1 - 4 * np.abs(ph - 0.5))      # triangle from -1
 
 
+AOM_DELAY = float(os.environ.get("FAKE_AOM_DELAY_US", "0.5")) * 1e-6   # loop delay: RP + acoustic + PD [s]
+RIN_SCALE = float(os.environ.get("FAKE_RIN", "1.0"))                     # scales all intensity noise
+
+
+class AOM:
+    """OUT2 -> inverting bias driver (V_drv = BIAS - 10 u) -> Schottky + 100 ohm -> mixer IF current (positive
+    only, limited to 25 mA) -> RF amplitude (proportional, saturating) -> amplifier -> AOM diffraction
+    efficiency sin^2 (peak at RF amplitude A_PK, falls beyond) -> photodiode (gain, delay, 5 MHz pole, noise).
+    The loop runs at ~100 kHz, far too fast to step in real time, so:
+      * slow state (every 2 ms): light level drift, step disturbance, blocked beam, and pid2's integrator,
+        which (much faster than 2 ms) runs to its stable equilibrium or to a clamp;
+      * scope windows are synthesized: open loop nonlinear (scan), closed loop linearized around the equilibrium
+        with the noise and an asg1 test sine shaped by the loop with the true delay."""
+    BIAS, GAIN, V_D, R_S, I_LIM = 1.2, 10.0, 0.3, 100.0, 0.025
+    A_PK = 0.75                       # RF amplitude (relative to full IF) at the diffraction-efficiency peak
+    PD_PEAK = 0.9                     # photodiode volts at the efficiency peak
+    PD_BW = 5e6
+    WHITE, FLICKER = 2e-6, 3e-5       # relative ASD: white [1/rtHz]; 1/f: FLICKER/sqrt(f)
+    LINES = [(120.0, 4e-4), (1300.0, 1.5e-4), (17e3, 6e-5)]   # vibration lines (frequency, relative amplitude)
+
+    def __init__(self, rp, rng):
+        self.rp, self.rng = rp, rng
+        self.delay, self.rin = AOM_DELAY, RIN_SCALE
+        self.drift = 0.0               # slow relative drift of the light (Ornstein-Uhlenbeck, ~1 %)
+        self.disturb = 1.0             # step disturbance (tests)
+        self.blocked = False           # beam blocked (tests)
+        self.ug = np.linspace(-1.2, 1.2, 4801)
+        self.eg = self.eta(self.ug)
+
+    def eta(self, u):
+        vd = np.clip(self.BIAS - self.GAIN * np.asarray(u, dtype=float), -4.5, 4.5)
+        cur = np.clip((vd - self.V_D) / self.R_S, 0, self.I_LIM)
+        arf = np.tanh(1.2 * cur / self.I_LIM) / math.tanh(1.2)
+        return np.sin(np.pi / 2 * arf / self.A_PK) ** 2
+
+    def eta_i(self, u):
+        return np.interp(u, self.ug, self.eg)
+
+    def light(self):
+        return 0.0 if self.blocked else (1 + self.drift) * self.disturb
+
+    def pd(self, u):
+        return self.PD_PEAK * self.light() * self.eta_i(u)
+
+    def slope(self, u, d=2e-4):
+        return float((self.pd(u + d) - self.pd(u - d)) / (2 * d))
+
+    def _ext(self, t):
+        """Slow part of what asg1 adds to OUT2 (a fast test sine averages out)."""
+        a = self.rp.asg1
+        if a.output_direct not in ("out2", "both"):
+            return 0.0
+        if a.amplitude == 0 or a.frequency > 200:
+            return float(a.offset)
+        return float(a.raw(t))
+
+    def pid_out(self):
+        p2 = self.rp.pid2
+        return float(np.clip(p2.ival, p2.min_voltage, p2.max_voltage)) if p2.output_direct in ("out2", "both") else 0.0
+
+    def update(self, t, dt):
+        self.drift += -self.drift * dt / 2.0 + 0.01 * self.rin * math.sqrt(dt) * self.rng.standard_normal()
+        p2 = self.rp.pid2
+        if p2.input != "in2" or p2.i == 0:
+            return
+        lo, hi = p2.min_voltage, p2.max_voltage
+        ext = self._ext(t)
+        routed = p2.output_direct in ("out2", "both")
+        v0 = float(np.clip(p2.ival, lo, hi))
+        e0 = float(self.pd(v0 + ext if routed else ext)) - p2.setpoint
+        step = 2 * math.pi * p2.i * e0 * dt
+        if not routed:                                 # its output does not reach the AOM: it just integrates
+            p2.ival = float(np.clip(v0 + step, lo, hi))
+            return
+        d = 1 if step > 0 else -1
+        v = np.linspace(v0, hi if d > 0 else lo, 400)
+        e = self.pd(v + ext) - p2.setpoint
+        flip = np.flatnonzero(np.sign(p2.i * e) != np.sign(p2.i * e0))
+        if len(flip):
+            k = flip[0]
+            target = float(v[k - 1] - e[k - 1] * (v[k] - v[k - 1]) / (e[k] - e[k - 1])) if k > 0 else v0
+        else:
+            target = float(v[-1])
+        p2.ival = target if abs(step) >= abs(target - v0) else v0 + step
+
+    def sample_pd(self):
+        return float(self.pd(self.pid_out() + self._ext(time.time()))) + 0.001 * self.rng.standard_normal()
+
+    def noise_spec(self, n, dt):
+        """Broadband relative intensity noise (white + 1/f) as an rfft spectrum (periodic in the window, so
+        filtering it in the frequency domain is exact), and the vibration lines as complex amplitudes."""
+        f = np.fft.rfftfreq(n, dt)
+        f1 = f.copy()
+        f1[0] = f[1] if n > 1 else 1.0
+        asd = np.sqrt(self.WHITE ** 2 + self.FLICKER ** 2 / f1) * self.rin
+        Z = np.fft.rfft(self.rng.standard_normal(n)) * asd / math.sqrt(2 * dt)
+        Z[0] = 0
+        lines = [(fl, a * self.rin * np.exp(1j * self.rng.uniform(0, 2 * np.pi))) for fl, a in self.LINES]
+        return Z, lines
+
+    @staticmethod
+    def adc_noise(n, dt, rng):
+        """Measurement noise of the scope: ~63 nV/rtHz up to 62.5 MHz (0.5 mV rms per 8 ns sample), averaged by
+        the decimation."""
+        return 6.3e-8 * math.sqrt(0.5 / max(dt, 8e-9)) * rng.standard_normal(n)
+
+    def filt(self, f):
+        """pid2's input filter: positive corners low-pass, negative high-pass (1st order each)."""
+        F = np.ones(len(f), dtype=complex)
+        for b in self.rp.pid2.inputfilter:
+            if b > 0:
+                F = F / (1 + 1j * f / b)
+            elif b < 0:
+                F = F * (1j * f / -b) / (1 + 1j * f / -b)
+        return F
+
+    def synth(self, t0, trel):
+        rp = self.rp
+        p2, a1 = rp.pid2, rp.asg1
+        n = len(trel)
+        dt = float(trel[1] - trel[0])
+        Z, lines = self.noise_spec(n, dt)
+        tt = np.asarray(trel, dtype=float)
+        a1_raw = a1.raw_rel(t0, trel)
+        a1_out = a1_raw if (a1.output_direct in ("out2", "both") and a1.amplitude != 0) else np.zeros(n)
+        routed = p2.output_direct in ("out2", "both")
+        lo, hi = p2.min_voltage, p2.max_voltage
+        ival = float(np.clip(p2.ival, lo, hi))
+        u_pid = ival if routed else 0.0
+        closed = routed and p2.input == "in2" and (p2.i != 0 or p2.p != 0) and self.light() > 0 \
+            and lo + 1e-4 < ival < hi - 1e-4
+        sine = a1.waveform == "sin" and a1.amplitude != 0 and a1.output_direct in ("out2", "both")
+        if closed:
+            u_eq = u_pid + (float(a1.offset) if sine else float(np.mean(a1_out)))
+            pd_eq = float(self.pd(u_eq))
+            K = self.slope(u_eq)
+            f = np.fft.rfftfreq(n, dt)
+            f1 = f.copy()
+            f1[0] = 1e-3
+            H = np.exp(-2j * np.pi * f1 * self.delay) / (1 + 1j * f1 / self.PD_BW)
+            C = (p2.p + p2.i / (1j * f1)) * self.filt(f1)
+            G = -K * H * C
+            D = pd_eq * Z
+            e = np.fft.irfft(D / (1 + G), n)
+            c = np.fft.irfft(C * D / (1 + G), n)
+            for fl, a in lines:                         # each vibration line through the loop, exactly
+                Hl = np.exp(-2j * np.pi * fl * self.delay) / (1 + 1j * fl / self.PD_BW)
+                Cl = (p2.p + p2.i / (1j * fl)) * self.filt(np.array([fl]))[0]
+                Sl = 1 / (1 - K * Hl * Cl)
+                zl = pd_eq * a * np.exp(2j * np.pi * fl * tt)
+                e = e + np.real(Sl * zl)
+                c = c + np.real(Cl * Sl * zl)
+            if sine:
+                f0 = float(a1.frequency)
+                H0 = np.exp(-2j * np.pi * f0 * self.delay) / (1 + 1j * f0 / self.PD_BW)
+                C0 = (p2.p + p2.i / (1j * f0)) * self.filt(np.array([f0]))[0]
+                G0 = -K * H0 * C0
+                ph = 2 * np.pi * ((((t0 - a1.t0) * f0) % 1.0) + trel * f0)
+                xh = a1.amplitude * np.exp(1j * (ph - np.pi / 2))       # sin as the real part
+                e = e + np.real(K * H0 / (1 + G0) * xh)
+                c = c + np.real(C0 * K * H0 / (1 + G0) * xh)
+            in2 = p2.setpoint + e if abs(pd_eq - p2.setpoint) < 0.02 else pd_eq + e
+            pid2 = np.clip(ival + c, lo, hi)
+        else:
+            u = u_pid + np.asarray(a1.raw_rel(t0, trel - self.delay) if np.any(a1_out) else a1_out)
+            r = np.fft.irfft(Z, n)
+            for fl, a in lines:
+                r = r + np.real(a * np.exp(2j * np.pi * fl * tt))
+            in2 = self.pd(u) * (1 + r)
+            k = 1 - math.exp(-2 * math.pi * self.PD_BW * dt)
+            if k < 0.999:
+                in2 = lfilter([k], [1, -(1 - k)], in2, zi=[in2[0] * (1 - k)])[0]
+            e = in2 - p2.setpoint
+            pid2 = np.clip(p2.p * e + ival, lo, hi) if p2.p != 0 else np.full(n, ival)
+        in2 = in2 + self.adc_noise(n, dt, self.rng)
+        out2 = np.clip((pid2 if routed else 0.0) + a1_out, -1, 1)
+        return {"in2": in2, "pid2": pid2, "asg1": a1_raw, "out2": out2}
+
+
 class Engine:
     def __init__(self, rp):
         self.rp = rp
@@ -88,6 +341,8 @@ class Engine:
         self.hist = []                 # (t, drive, pd, err, pid_out)
         self.lock = threading.Lock()
         self.t = time.time()
+        self.aom = AOM(rp, np.random.default_rng(7))
+        self._n = 0
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
@@ -133,8 +388,12 @@ class Engine:
     def step(self, t):
         self.vc += 0.0002 * DT + 0.0002 * math.sqrt(DT) * self.rng.standard_normal()
         p0 = self.rp.pid0
-        asg = float(self.rp.asg0.value(t)) + float(self.rp.asg1.value(t))
-        pid_out = float(np.clip(p0.ival, p0.min_voltage, p0.max_voltage)) if p0.output_direct != "off" else 0.0
+        self._n += 1
+        if self._n % 4 == 0:
+            self.aom.update(t, 4 * DT)
+        asg = float(self.rp.asg0.value(t, "out1")) + float(self.rp.asg1.value(t, "out1"))
+        pid_out = float(np.clip(p0.ival, p0.min_voltage, p0.max_voltage)) if p0.output_direct in ("out1", "both") \
+            else 0.0
         v = asg + pid_out
         y = float(self.err_raw(v)[0])
         for k, a in enumerate(self.lpf_coeffs(DT)):
@@ -149,10 +408,10 @@ class Engine:
             del self.hist[:20000]
 
     def copies(self, ts):
-        """The spare iq1 -> pid2 chain driven by an ASG (circuit-only Bode). iq1 with its oscillator at 0 Hz is
-        input x cos(phase) through its low-pass stages and integer gain; pid2 is P + I of its input."""
+        """The spare iq1 -> pid1 chain driven by an ASG (circuit-only Bode). iq1 with its oscillator at 0 Hz is
+        input x cos(phase) through its low-pass stages and integer gain; pid1 is P + I of its input."""
         rp = self.rp
-        iq, p2 = rp.iq1, rp.pid2
+        iq, p2 = rp.iq1, rp.pid1
         n, dt = len(ts), float(ts[-1] - ts[0]) / (len(ts) - 1)   # not ts[1]-ts[0]: epoch times lose precision
         bws = [b for b in np.atleast_1d(iq.bandwidth) if b > 0]
         npre = int(min(8 / (2 * math.pi * min(bws)) if bws else 0.0, 0.5) / dt) + 1
@@ -174,18 +433,28 @@ class Engine:
 
     # scope traces
     def traces(self, names, duration, trigger, t_start=None):
-        """Scope data. Triggered on asg0: computed analytically. Untriggered: the recorded window
-        [t_start, t_start + duration] of the simulation (the real scope records after it is armed)."""
+        """Scope data. Triggered on asg0/asg1: computed analytically. Untriggered: the recorded window
+        [t_start, t_start + duration] of the simulation (the real scope records after it is armed).
+        Intensity signals (in2, pid2, out2, asg1) come from the AOM model for the same window."""
         n = 2 ** 14
+        trel = np.arange(n) * duration / n
+        cav_names = {"in1", "iq0", "asg0", "pid0", "out1", "iq1", "pid1"}
         with self.lock:
             asg = self.rp.asg0
             now = time.time()
+            sig = {}
+            if trigger in ("asg0", "asg1"):
+                g = asg if trigger == "asg0" else self.rp.asg1
+                per = 1 / g.frequency
+                t0 = g.t0 + math.ceil((now - g.t0) / per) * per
+                ready_at = t0 + duration
+            else:
+                t0 = None
+                ready_at = now + duration          # an untriggered trace still takes its duration to record
             if trigger == "asg0" and asg.output_direct != "off":
-                per = 1 / asg.frequency
-                t0 = asg.t0 + math.ceil((now - asg.t0) / per) * per
-                ts = t0 + np.arange(n) * duration / n
+                ts = t0 + trel
                 p0 = self.rp.pid0
-                pid_out = p0.ival if p0.output_direct != "off" else 0.0
+                pid_out = p0.ival if p0.output_direct in ("out1", "both") else 0.0
                 v = asg.value(ts) + pid_out
                 bws = [b for b in np.atleast_1d(self.rp.iq0.bandwidth) if b > 0]
                 pre = 6 * 4 / (2 * math.pi * max(min(bws), 1)) if bws else 0.0
@@ -199,26 +468,23 @@ class Engine:
                 err = y[npre:] + NOISE_ERR * self.rng.standard_normal(n)
                 pd = self.pd_avg(v) + NOISE_PD * self.rng.standard_normal(n)
                 d = self.dither_pp() / 2
-                sig = {"in1": pd, "iq0": err, "asg0": asg.value(ts), "pid0": np.full(n, pid_out),
-                       "out1": v + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)}
-                ready_at = t0 + duration
-            else:
+                sig.update({"in1": pd, "iq0": err, "asg0": asg.value(ts), "pid0": np.full(n, pid_out),
+                            "out1": v + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+            elif cav_names & set(names) or t0 is None:
                 h = np.array(self.hist[-int((self.t - (t_start or self.t) + duration) / DT) - 4:])
                 tt = h[:, 0]
                 t_end = min(tt[-1], (t_start or tt[-1] - duration) + duration)
+                if t0 is None:
+                    t0 = t_end - duration
                 ts = np.linspace(t_end - duration, t_end, n)
                 d = self.dither_pp() / 2
                 drive = np.interp(ts, tt, h[:, 1])
-                sig = {"in1": np.interp(ts, tt, h[:, 2]), "iq0": np.interp(ts, tt, h[:, 3]),
-                       "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.value(ts),
-                       "out1": drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)}
-                ready_at = now + duration          # an untriggered trace still takes its duration to record
-        sig["asg1"] = self.rp.asg1.raw(ts)
-        sig["iq1"], sig["pid2"] = self.copies(ts)
-        p1 = self.rp.pid1                                # OUT2 monitor: pid1 pass-through (P only, clamped)
-        src = sig.get(p1.input, np.zeros(n)) if p1.output_direct == "out2" else np.zeros(n)
-        sig["out2"] = np.clip(p1.p * (src - p1.setpoint), p1.min_voltage, p1.max_voltage)
-        sig["in2"] = 0.0005 * self.rng.standard_normal(n)
+                sig.update({"in1": np.interp(ts, tt, h[:, 2]), "iq0": np.interp(ts, tt, h[:, 3]),
+                            "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.raw_rel(t0, trel),
+                            "out1": drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+            if "iq1" in names or "pid1" in names:
+                sig["iq1"], sig["pid1"] = self.copies(t0 + trel)
+            sig.update(self.aom.synth(t0, trel))
         return [sig.get(nm, np.zeros(n)) for nm in names], ready_at
 
 
@@ -232,9 +498,16 @@ class Scope:
                          _arm=None).items():
             object.__setattr__(self, k, v)
 
+    _name = "scope"
+
     def __setattr__(self, k, v):
         if not k.startswith("_"):
             lan()                                        # a register write on the real board
+            if k != "owner" and _src() is not None:
+                WRITE_N[0] += 1
+                if len(WRITES) < 400000:
+                    WRITES.append((time.time(), "scope", k, v if isinstance(v, (int, float, str)) else repr(v),
+                                   _src()))
         object.__setattr__(self, k, v)
 
     @property
@@ -277,7 +550,19 @@ class Sampler:
 
     @property
     def in1(self):
+        lan()
         return self.eng.hist[-1][2] if self.eng.hist else 0.0
+
+    @property
+    def in2(self):
+        lan()
+        return self.eng.aom.sample_pd()
+
+    @property
+    def pid2(self):
+        lan()
+        p2 = self.eng.rp.pid2
+        return float(np.clip(p2.ival, p2.min_voltage, p2.max_voltage))
 
 
 LPF_LADDER = [125e6 / (2 * math.pi) / 2 ** k for k in range(1, 30)]
@@ -289,7 +574,7 @@ def nearest_log(v, ladder):
     return min(pos, key=lambda x: abs(math.log(x / v)))
 
 
-class IQ:
+class IQ(Mod):
     """FPGA-like rounding: factor-2 filter ladder, 2 filter stages, integer quadrature factor."""
     @property
     def bandwidth(self):
@@ -321,21 +606,24 @@ class IQ:
 class RP:
     def __init__(self):
         self.iq0, self.iq1, self.iq2 = IQ(), IQ(), IQ()
-        for iq in (self.iq0, self.iq1, self.iq2):
+        for nm, iq in (("iq0", self.iq0), ("iq1", self.iq1), ("iq2", self.iq2)):
+            object.__setattr__(iq, "_name", nm)
             iq.input, iq.frequency, iq.amplitude, iq.phase = "in1", 1000.0, 0.0, 0.0
             iq.bandwidth, iq.acbandwidth, iq.gain, iq.quadrature_factor = [250.0, 250.0], 100.0, 0.0, 1.0
             iq.output_signal, iq.output_direct = "quadrature", "off"
-        self.pid0, self.pid1, self.pid2 = PID(), PID(), PID()
+        self.pid0, self.pid1, self.pid2 = PID("pid0"), PID("pid1"), PID("pid2")
         self.pid0.ival = 0.0
-        self.asg0 = ASG(None)
-        self.asg1 = ASG(None)
+        self.asg0 = ASG(None, "asg0")
+        self.asg1 = ASG(None, "asg1")
         self.eng = Engine(self)
         self.scope = Scope(self.eng)
         self.sampler = Sampler(self.eng)
 
 
-class NetworkAnalyzer:
+class NetworkAnalyzer(Mod):
     """Model transfer functions of the fake loop (plant = error slope x demodulation low-pass)."""
+    _name = "networkanalyzer"
+
     def __init__(self, rp):
         self.rp = rp
         self.start_freq, self.stop_freq, self.points, self.rbw, self.amplitude = 10.0, 1000.0, 30, 100.0, 0.001
@@ -368,5 +656,9 @@ class NetworkAnalyzer:
 
 class Pyrpl:
     def __init__(self, config=None, hostname=None, gui=False, **kw):
-        self.rp = RP()
-        self.networkanalyzer = NetworkAnalyzer(self.rp)
+        _BUILDING[0] = True
+        try:
+            self.rp = RP()
+            self.networkanalyzer = NetworkAnalyzer(self.rp)
+        finally:
+            _BUILDING[0] = False

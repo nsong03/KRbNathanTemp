@@ -16,8 +16,11 @@ def check(name, ok, info=""):
 
 # ---- the model: every FIELDS key has exactly one home; every block parameter names a FIELDS key ----
 print("--- schematic model")
-check("every FIELDS key belongs to exactly one block / home", not SCH.ownership_problems(A.KEYS),
-      "; ".join(SCH.ownership_problems(A.KEYS)))
+check("every cavity FIELDS key belongs to exactly one block / home", not SCH.ownership_problems(A.CAV_KEYS),
+      "; ".join(SCH.ownership_problems(A.CAV_KEYS)))
+check("the OUT2 monitor is gone (no out2 block, wire, probe or settings key)",
+      not any("out2" in b["id"] for b in SCH.BLOCKS) and not any(w["id"] == "out2" for w in SCH.WIRES)
+      and "out2" not in SCH.PROBE_SIGNALS and "out2_signal" not in A.DEFAULTS and "out2_gain" not in A.DEFAULTS)
 HW_KEYS = [p["key"] for b in SCH.BLOCKS for p in b["params"] if p["attr"]]
 check("hardware-affecting keys are owned by exactly one block",
       all(sum(p["key"] == k for b in SCH.BLOCKS for p in b["params"]) == 1 for k in HW_KEYS))
@@ -106,7 +109,7 @@ def wait_idle(timeout=30):
 
 NEW = dict(ramp_hz=13.0, ramp_mvpp=300.0, ramp_shape="triangle", ramp_center_mv=30.0, acq_dither_hz=1700.0,
            acq_dither_mvpp=20.0, phase_deg=80.0, ac_hz=300.0, lpf_hz=600.0, lpf_order=1, err_gain=3,
-           setpoint_mv=2.0, out2_signal="photodiode", out2_gain=2.0,
+           setpoint_mv=2.0,
            ugf_hz=15.0, p_gain=0.3, clamp_auto=False, clamp_mv=30.0,
            lock_same_dither=False, lock_dither_hz=2500.0, lock_dither_mvpp=6.0)
 params = [(b["id"], p) for b in SCH.BLOCKS for p in b["params"] if p["attr"]]
@@ -202,32 +205,36 @@ print("--- probes")
 apply(probe_a="out1", probe_b="asg0")
 ctl._probe_last = "b"
 for sig, want in (("iq0", ("iq0", "asg0")), ("asg0", ("iq0", "off")), ("pid0", ("iq0", "pid0")),
-                  ("out2", ("out2", "pid0")), ("in1", ("out2", "in1")), ("out2", ("off", "in1"))):
+                  ("out1", ("out1", "pid0")), ("in1", ("out1", "in1")), ("out1", ("off", "in1"))):
     ctl.submit("probe", sig); wait_idle()
     got = (ctl.s["probe_a"], ctl.s["probe_b"])
     check(f"probe click {sig}: A/B = {want}", got == want, str(got))
 ctl.submit("probe", "hp"); wait_idle()
 check("a grey probe point is refused", (ctl.s["probe_a"], ctl.s["probe_b"]) == ("off", "in1"))
-apply(probe_a="out2", probe_b="pid0", drive_every=1)
+apply(probe_a="iq0", probe_b="pid0", drive_every=1)
 time.sleep(1.5)
 d = ctl.drive or {}
-check("probe capture of out2 / pid0 reaches the scope panel", d.get("a_name") == "out2" and d.get("b") is not None
+check("probe capture of iq0 / pid0 reaches the scope panel", d.get("a_name") == "iq0" and d.get("b") is not None
       and d.get("a") is not None and abs(np.mean(d["a"]) - np.mean(d["a"])) == 0, str(d.get("pair")))
 apply(probe_a="out1", probe_b="asg0", drive_every=3)
 
-print("--- Bode plot (swept sine, asg1 + scope)")
+print("--- Bode plot (swept sine, asg0 + scope)")
 apply(bode_mode="closed loop", bode_points=8, bode_start_hz=4.0, bode_stop_hz=300.0, bode_cycles=6)
 ctl.submit("bode"); wait_idle()
-check("closed-loop Bode refused while not locked", ctl.mode == "acquire" and ctl.r.asg1.output_direct == "off")
+check("closed-loop Bode refused while not locked", ctl.mode == "acquire" and ctl.r.asg0.waveform != "sin")
 outs = []
-_setup = ctl.r.asg1.setup
-ctl.r.asg1.setup = lambda **kw: (outs.append(kw.get("output_direct")), _setup(**kw))[1]
+_setup = ctl.r.asg0.setup
+ctl.r.asg0.setup = lambda **kw: (outs.append(kw.get("output_direct")) if kw.get("waveform") == "sin" else None,
+                                 _setup(**kw))[1]
 apply(bode_mode="circuit only")
 ctl.submit("bode"); time.sleep(0.5); wait_idle(120)
 B = ctl.bode
 check("circuit only: every point measured, mode restored", B and B["done"] and B["n"] == 8 and ctl.mode == "acquire",
       f"n={B and B['n']}")
-check("circuit only: asg1 never routed to an output (OUT1 untouched)", outs and set(outs) == {"off"}, str(set(outs)))
+check("circuit only: the asg0 test sine never routed to an output (OUT1 untouched)", outs and set(outs) == {"off"},
+      str(set(outs)))
+check("circuit only: iq1 and pid1 back to off afterwards", ctl.r.iq1.output_direct == "off"
+      and ctl.r.pid1.output_direct == "off" and ctl.r.pid1.i == 0 and ctl.r.pid1.p == 0)
 for cv in B["curves"]:
     r_ = np.abs(np.array(cv["c"]) / np.array(cv["model"][:len(cv["c"])]))
     ph = np.degrees(np.angle(np.array(cv["c"]) / np.array(cv["model"][:len(cv["c"])])))
@@ -235,7 +242,7 @@ for cv in B["curves"]:
           np.all(np.abs(r_ - 1) < 0.05) and np.all(np.abs(ph) < 5), f"{np.round(r_, 3)}")
 check("circuit only: electronics UGF = loop bandwidth setting", B["ugf"] and abs(B["ugf"] - ctl.s["ugf_hz"]) < 0.1 *
       ctl.s["ugf_hz"], f"{B['ugf']}")
-ctl.r.asg1.setup = _setup
+ctl.r.asg0.setup = _setup
 ctl.submit("lock"); time.sleep(0.5); ok = wait_mode("locked", 60)
 apply(bode_mode="closed loop", na_amp_frac=0.1)   # low frequencies: G comes from 1 + c/x, so excite enough
 ctl.submit("bode"); time.sleep(0.5); wait_idle(180)
@@ -246,8 +253,8 @@ Gt = -(ctl.r.pid0.i / (1j * f_)) * eng_S
 for bw_ in [b for b in ctl.r.iq0.bandwidth if b > 0]:
     Gt = Gt / (1 + 1j * f_ / bw_)
 lowf = f_ < 100
-check("closed loop: every point, still locked, asg1 off afterwards", ok and B["n"] == 8 and ctl.mode == "locked"
-      and ctl.r.asg1.output_direct == "off")
+check("closed loop: every point, still locked, asg0 off afterwards", ok and B["n"] == 8 and ctl.mode == "locked"
+      and ctl.r.asg0.output_direct == "off")
 check("closed loop: measured G = the fake's true loop gain below 100 Hz (5 %)",
       np.all(np.abs(np.abs(G_[lowf] / Gt[lowf]) - 1) < 0.05), f"{np.round(np.abs(G_ / Gt), 3)}")
 check("closed loop: disturbance suppressed at low frequency (|S| < 0.5 at 4 Hz)", abs(S_[0]) < 0.5, f"{abs(S_[0]):.2f}")
@@ -257,7 +264,7 @@ apply(bode_points=30, bode_start_hz=2.0, na_amp_frac=0.03)
 ctl.submit("bode"); time.sleep(3.0)
 ctl.stop_measurement(); wait_idle(60)
 check("Stop ends the sweep early and the lock stays", ctl.bode["done"] and ctl.bode["n"] < 30 and ctl.mode == "locked"
-      and ctl.r.asg1.output_direct == "off", f"n={ctl.bode['n']}")
+      and ctl.r.asg0.output_direct == "off", f"n={ctl.bode['n']}")
 ctl.submit("switch", ("scan", True)); wait_idle(); time.sleep(1.5)
 
 print("--- Lock Assist crosshairs")

@@ -1,6 +1,11 @@
 # AOM intensity stabilization on IN2/OUT2: plan
 
-Status: **draft, waiting for approval** (2026-11-02).
+Status: **approved with changes** (2026-11-02). Decisions: cavity Bode closed loop on asg0, circuit-only on
+iq1 + pid1 borrowed (outputs off); start-up resets OUT2 to 0 V unless pid2 has non-zero gains (adopt as locked);
+a setpoint adjuster (slider + ± steps); P / I / D dropdowns on the stabilizer (D shown disabled: not in this
+bitstream); **no intensity-noise analysis** (RIN spectrum and rms history dropped): the intensity view measures a
+swept-sine Bode plot only (asg1 injected on OUT2, scope on pid2 and in2, same plot/Stop as the cavity). The two
+loops never run a Bode at the same time.
 
 ## 1. What the current code looks like (branch base = main @ 66052d5, v4 + swept-sine Bode)
 
@@ -42,8 +47,9 @@ Proposal (needs your choice, see §9):
 | OUT1 | cavity | only cavity modules route to out1 |
 | pid2 | intensity | input in2, output_direct out2 (the servo) |
 | asg1 | intensity | power scan, output_direct out2; scope trigger for the scan |
-| pid1 | nobody | off (p = i = 0, output off). Kept free: only pid0/pid1 pair in differential mode |
-| iq1, iq2 | network analyzer | free (NA takes one); iq1 also the cavity circuit-only copy (proposal) |
+| pid1 | nobody | off (p = i = 0, output off). Kept free: only pid0/pid1 pair in differential mode. Borrowed with output off by the cavity circuit-only Bode, restored to off |
+| iq1 | cavity (measurement only) | circuit-only Bode copy of the lock-in (output off) |
+| iq2 | network analyzer | free (cavity "Measure loop" NA takes it) |
 | scope | shared | scheduled, §6 |
 
 Isolation rules, enforced by `test_isolation.py` on a fake that logs every register write with the source file
@@ -82,7 +88,8 @@ still running does not add onto the servo's OUT2. Old settings files: `out2_sign
 | `int_gain_mode` | bandwidth / manual | bandwidth | how p, i are found |
 | `int_ugf_khz` | kHz | 30 | i = −f_u/K |
 | `int_corner_khz` | kHz | 1000 | p = i / f_corner |
-| `int_p`, `int_i_hz` | –, Hz (signed, as written) | 0, 0 | pid2.p / pid2.i in manual mode |
+| `int_p`, `int_i_hz` | –, Hz (magnitudes; dropdowns on a 1-2-5 ladder) | 0.001, 1000 | pid2.p / pid2.i in manual mode, sign = −sign(K) |
+| (D dropdown) | – | off | not a key: disabled, "not in this FPGA build" |
 | `int_gain_ramp` | bool | True | engage in steps f_u/10, f_u/3, f_u |
 | `int_clamp_auto` | bool | True | clamp from the scan |
 | `int_clamp_margin` | fraction of peak light | 0.05 | bright clamp where light = (1 − margin)·peak, on the near side of the peak |
@@ -92,10 +99,8 @@ still running does not add onto the servo's OUT2. Old settings files: `out2_sign
 | `int_auto_reengage` | bool | True | re-lock when the light is back for 0.2 s |
 | `int_mw_per_v` | mW/V | 0 (off) | show photodiode power in mW |
 | `int_window_us` | µs | 1050 | live trace length (snapped to a scope duration) |
-| `int_noise_avg` | – | 3 | RIN traces per band |
-| `int_rin_mode` | closed / open vs closed | closed | RIN measurement |
-| `int_na_start_hz`, `int_na_stop_hz`, `int_na_points` | Hz, Hz, – | 1e3, 2e6, 40 | network analyzer |
-| `int_na_amp_frac` | × setpoint | 0.02 | NA excitation, converted with K, kept inside the clamp |
+| `int_bode_start_hz`, `int_bode_stop_hz`, `int_bode_points`, `int_bode_cycles` | Hz, Hz, –, – | 1e3, 1e6, 30, 20 | swept-sine Bode |
+| `int_bode_amp_frac` | × setpoint | 0.02 | test-sine amplitude on OUT2 = frac·setpoint/\|K\|, kept inside the clamp |
 | `int_probe_a`, `int_probe_b` | signal | in2, pid2 | scope probes of the intensity view |
 | `int_panels` | list | traces, history, scan | intensity panels |
 | display only (plant, grey) | | | |
@@ -135,16 +140,14 @@ Modes: `off` → `scanning` → `locking` → `locked`, plus `held`, `measuring`
   - ival within 2 % of the clamp span of either clamp for longer than `int_rail_s` → `railed`: hold at the last
     good drive, log it, stay there until the user acts (no auto re-engage: the setpoint is probably unreachable).
 - **Start-up**: if pid2.output_direct is out2 and p or i ≠ 0 → adopt as `locked` (K from `intensity_scan.json` if
-  present, else "K unknown: gain changes need a scan"). If out2 with zero gains and ival ≠ 0 → adopt as `held`
-  (no light change). Otherwise write nothing except asg1 off → OUT2 = 0 V (bias level).
+  present, else "K unknown: gain changes need a scan"; setpoint and filter are read from the registers, not
+  written). Otherwise pid2 p = i = ival = 0, output off, asg1 off → OUT2 = 0 V (bias level), mode `off`.
 
-### Measurements (intensity view)
-- **Measure RIN** (locked): Welch spectra of in2 in two bands (8.4 ms @ 0.5 µs → up to 1 MHz; 134 ms → 3.7 Hz
-  resolution), RIN = √S/⟨V⟩, shown in 1/√Hz and dBc/Hz with band rms; title "in-loop RIN (underestimates the
-  real noise)". Mode *open vs closed*: closed, then hold (same drive, loop open), open, then re-engage.
-- **Measure loop** (locked): PyRPL network analyzer with output_direct out2, inputs pid2 then in2.
-  T = c/x, G = −T/(1+T), plant = (in2/x)/(1+T); amplitude = `int_na_amp_frac`·setpoint/|K|, capped so
-  ival ± amplitude stays inside the clamp. UGF and phase margin, with the model.
+### Measurement (intensity view)
+- **Measure Bode plot** (locked): swept sine from asg1 on OUT2 (summed with pid2), scope captures (asg1, pid2) and
+  (asg1, in2) per point, `fit_sine` at the exact frequency. T = c/x, G = −T/(1+T), S = 1+T, closed loop −T,
+  plant = (in2/x)/S. Amplitude = `int_bode_amp_frac`·setpoint/|K|, capped so ival ± amplitude stays inside the
+  clamp; stops and holds if the output reaches a clamp. Model: K·(p + i/jf)·filter·delay·PD pole. Stop button.
 
 ## 6. Scope schedule (both loops always run in hardware)
 
@@ -153,11 +156,11 @@ One scope, one controller thread. Each pass of `Controller.run()` takes the next
 - **hidden loop**: a watchdog frame when due: cavity locked/held every 0.15 s (≥ 6.7/s; its 33 ms frame), intensity
   locked/held/fault every 0.2 s (its ~1 ms frame); scanning or off: 1 frame/s (keeps its panel fresh, no watchdog);
 - **background checks** (no scope): while one loop runs a blocking sequence or measurement (lock sequence, scope
-  captures up to 2.1 s, NA sweeps), the other loop's watchdog runs from register reads every ≤ 0.1 s inside the
+  captures up to 2.1 s, NA and Bode sweeps), the other loop's watchdog runs from register reads every ≤ 0.1 s inside the
   waits (`_wait()` replaces `time.sleep` in sequences and in `capture()`'s arm-to-ready wait): cavity = pid0.ival +
   sampler.in1 (averaged over a few reads), intensity = pid2.ival + sampler.in2. A background check may only hold
   its own loop (write its own PID); re-engage/relock waits for the main loop.
-- A measurement in one loop writes only its own modules (NA on iq1/iq2 for out2 or out1) and only takes scope
+- A measurement in one loop writes only its own modules (cavity: NA/asg0 on out1, iq1/pid1 outputs off; intensity: asg1 on out2) and only takes scope
   frames; the other loop keeps its watchdog through the background checks.
 - Expected rates (fake): cavity visible + intensity locked hidden: ~9/s cavity frames; intensity visible + cavity
   locked hidden: ≥ 10/s intensity redraws, cavity watchdog ≥ 6/s.
@@ -199,8 +202,8 @@ Switches: Scan (asg1.output_direct), Lock (pid2 gains), Output (pid2.output_dire
 level estimated from the present drive: I_IF ≈ (|V_bias| − 10·V_OUT2 − 0.3 V)/100 Ω limited to 25 mA,
 mixer RF ≈ −1 dBm + 20·log10(I/25 mA), amplifier +32 dB, warning above the AOM rating.
 
-Intensity panels: live traces (probes A/B, default in2 + pid2 with error and setpoint lines), history (mean and
-rms relative intensity, drive), power scan (light vs OUT2 with peak, clamp, setpoint, K), RIN spectrum, loop Bode.
+Intensity panels: live traces (probes A/B, default in2 + pid2 with the setpoint line), history (mean photodiode
+level and drive; no noise analysis), power scan (light vs OUT2 with peak, clamp, setpoint, K), swept-sine Bode.
 Cavity view: unchanged except the OUT2 monitor block is gone (and the Bode test-sine box names asg0).
 
 ## 8. Code and tests
@@ -211,17 +214,18 @@ Cavity view: unchanged except the OUT2 monitor block is gone (and the Bode test-
   namespaced (`("int_switch", …)`, `("int_probe", …)`, `("int_measure", …)`). Run command unchanged.
 - Fake: register-write log (module, attr, value, app file); pid2 + asg1 summed on out2; AOM plant
   (driver with bias → mixer: RF ∝ IF current, saturating, positive only → amplifier → sin² efficiency with a peak →
-  photodiode gain, ~0.5 µs delay/lag, RIN = 1/f + vibration lines + white; `FAKE_AOM_DELAY_US`, `FAKE_RIN`).
+  photodiode gain, ~0.5 µs delay/lag, intensity noise = 1/f + vibration lines + white; `FAKE_AOM_DELAY_US`, `FAKE_RIN`).
   The µs loop cannot run in real time in Python, so: slow state at the engine step (implicit-Euler integrator,
   clamps, drifts, step disturbances, blocked beam) + scope windows synthesized from the linearized loop
-  (noise shaped by S = 1/(1+G) with the true delay); the NA uses the same G.
+  (noise and the asg1 test sine shaped by the closed loop with the true delay).
 - `test_intensity.py`: the six scenarios of the task. `test_isolation.py`: both loops locked, scan, measurements,
   view-independent; write-log assertions in both directions. `test_v3.py` adapted (OUT2 checks removed, Bode on
   asg0). `ui_v5.py` (Playwright): icons + dots, switching while both locked writes nothing, every intensity block
   parameter/switch/probe, both measurements, redraws/s per view, screenshots.
 - Docs: CLAUDE.md, README (wiring IN2/OUT2), `docs/intensity_hardware.md`, `docs/pyrpl_reference.md`.
 
-## 9. Decisions needed
-1. Cavity Bode: closed loop on **asg0** (proposed) and circuit-only on **iq1 + pid1 (output off, borrowed during the
-   sweep)**, or (b) iq1 measured + PID computed from pid0's registers, or (c) drop circuit-only.
-2. Start-up adoption of a *held* servo (out2, zero gains, ival ≠ 0) as `held` instead of resetting OUT2 to 0 V.
+## 9. Decisions (2026-11-02)
+1. Cavity Bode: closed loop on asg0; circuit-only on iq1 + pid1 borrowed with output off (restored to off).
+2. Start-up: reset OUT2 to 0 V unless pid2 drives out2 with non-zero gains.
+3. Setpoint adjuster (slider + ±1/±10 mV + number box) and P / I / D dropdowns on the stabilizer block.
+4. No intensity-noise analysis in the app; the intensity measurement is the swept-sine Bode plot.
