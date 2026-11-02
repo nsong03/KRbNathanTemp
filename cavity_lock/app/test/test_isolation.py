@@ -6,7 +6,6 @@ import threading
 import time
 
 sys.path.insert(0, "fake"); sys.path.insert(0, "..")
-import numpy as np
 import cavity_lock_app as A
 import pyrpl as F
 
@@ -72,7 +71,18 @@ for view, hid in (("intensity", "cav"), ("cavity", "int")):
     vis = "int" if hid == "cav" else "cav"
     fv = (ctl.frames[vis] - f0[vis]) / dt
     check(f"view {view}: hidden {hid} gets >= 5 watchdog checks/s (frames {fr:.1f}/s + register checks {bg:.1f}/s)",
-          fr + bg >= 5 and fr >= 4, f"visible {vis} {fv:.1f} frames/s")
+          fr + bg >= 5 and fr >= 0.8, f"visible {vis} {fv:.1f} frames/s")
+
+print("--- without a sampler the hidden loop gets scope watchdog frames")
+ctl.has_sampler = it.has_sampler = False
+for view, hid in (("intensity", "cav"), ("cavity", "int")):
+    ctl.view = view
+    time.sleep(0.5)
+    f0, t0 = dict(ctl.frames), time.time()
+    time.sleep(3.0)
+    fr = (ctl.frames[hid] - f0[hid]) / (time.time() - t0)
+    check(f"no sampler, view {view}: hidden {hid} gets >= 4 scope frames/s", fr >= 4, f"{fr:.1f}/s")
+ctl.has_sampler = it.has_sampler = True
 
 print("--- a cavity unlock while the intensity view is shown is caught and relocked")
 ctl.view = "intensity"

@@ -2,6 +2,10 @@
 
 Status: **approved** (2026-11-01): no IIR; Output switch and `off` mode in; layout as sketched.
 
+Update 2026-11-02 (v5): the **OUT2 monitor (pid1) block, wire, probe and keys `out2_signal`/`out2_gain` are removed**;
+OUT2 now belongs to the AOM intensity servo (`docs/intensity_plan.md`). The Bode test sine moved from asg1 to asg0
+(shown on the Ramp block), the circuit-only copies are iq1 → pid1. The tables below keep the v4 design for reference.
+
 Note on sources: the Moku manual PDFs (download.liquidinstruments.com, photonics.laser2000.co.uk) are outside this
 session's allowed network domains, so this plan relies on the summary in `moku_reference.md`.
 

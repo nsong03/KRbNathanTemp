@@ -67,12 +67,12 @@ BLOCKS = [
          params=[P("int_filter_hz", "pid2.inputfilter"), P("int_filter_stages", "pid2.inputfilter")], opts=[],
          note="pid2.inputfilter: up to 4 first-order stages on a factor-2 ladder; positive corner = low-pass, "
               "negative = high-pass, 0 = off. Any filter adds phase lag inside a 100 kHz loop: usually off."),
-    dict(id="i_setpoint", label="Setpoint adjuster", kind="dsp", x=230, y=200, w=250, h=112,
+    dict(id="i_setpoint", label="Setpoint adjuster", kind="dsp", x=230, y=200, w=250, h=134,
          params=[P("int_setpoint_mv", "pid2.setpoint")], opts=[],
          note="pid2.setpoint in photodiode volts. The error is IN2 - setpoint. Slider (0 .. the most light the "
               "power scan allows), +/- steps or type a value; written live, also while locked (the gains are "
               "re-derived from the scan's K at the new setpoint)."),
-    dict(id="i_pid", label="PI (pid2)", kind="dsp", x=530, y=200, w=245, h=162,
+    dict(id="i_pid", label="PI (pid2)", kind="dsp", x=530, y=200, w=245, h=188,
          params=[P("int_gain_mode", "pid2.i", live="locked", widget="select"),
                  P("int_ugf_khz", "pid2.i", live="locked"),
                  P("int_p", "pid2.p", live="locked", widget="select"),
@@ -98,7 +98,7 @@ BLOCKS = [
          note="Every module with output_direct = out2 is summed digitally onto OUT2: pid2 and asg1."),
     dict(id="i_out2", label="OUT2", kind="node", x=1210, y=220, w=110, h=66, params=[], opts=[],
          note="OUT2 -> 50 ohm tee -> bias driver. Useful range only about +/-0.1-0.2 V (x10 driver gain)."),
-    dict(id="i_scan", label="Power scan (asg1)", kind="dsp", x=230, y=372, w=330, h=88,
+    dict(id="i_scan", label="Power scan (asg1)", kind="dsp", x=230, y=372, w=280, h=88,
          params=[P("int_scan_lo_mv", "asg1.offset", live="scanning"), P("int_scan_hi_mv", "asg1.amplitude",
                                                                          live="scanning"),
                  P("int_scan_hz", "asg1.frequency", live="scanning", inline=False),
@@ -158,7 +158,7 @@ WIRES = [
     dict(id="mix_amp", kind="plant", pts=[(800, 43), (725, 43)]),
     dict(id="amp_aom", kind="plant", pts=[(545, 43), (470, 43)]),
     dict(id="aom_pd", kind="plant", pts=[(290, 43), (200, 43)]),
-    dict(id="scan_sum", kind="drv", pts=[(560, 416), (1110, 416), (1110, 273)]),
+    dict(id="scan_sum", kind="drv", pts=[(510, 416), (1110, 416), (1110, 273)]),
 ]
 
 SWITCHES = [
@@ -180,7 +180,7 @@ PROBES = [
     dict(id="err", signal=None, x=212, y=250, why="after the input filter / error: inside pid2, not a scope "
                                                   "signal; probe in2 and subtract the setpoint"),
     dict(id="pid2", signal="pid2", x=990, y=253, label="pid2: servo output (after the limiter)"),
-    dict(id="asg1", signal="asg1", x=610, y=416, label="asg1: power scan / Bode test sine"),
+    dict(id="asg1", signal="asg1", x=560, y=416, label="asg1: power scan / Bode test sine"),
     dict(id="out2", signal="out2", x=1170, y=253, label="out2: total OUT2 (pid2 + asg1)"),
 ]
 PROBE_SIGNALS = [p["signal"] for p in PROBES if p["signal"]]

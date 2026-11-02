@@ -151,6 +151,11 @@ Modes: `off` → `scanning` → `locking` → `locked`, plus `held`, `measuring`
 
 ## 6. Scope schedule (both loops always run in hardware)
 
+As built: with a sampler (present in the 0.9.9.1 source, verify on the board) the register-only checks below are the
+hidden loop's watchdog (≈ 7–10 per second measured on the fake) and the hidden loop gets 1 scope frame/s; the
+watchdog frames every 0.15 s / 0.2 s described next are the fallback without a sampler. This kept the visible view's
+redraw rate at the v4 level.
+
 One scope, one controller thread. Each pass of `Controller.run()` takes the next scope frame for one loop:
 - **visible loop**: every frame not taken below;
 - **hidden loop**: a watchdog frame when due: cavity locked/held every 0.15 s (≥ 6.7/s; its 33 ms frame), intensity

@@ -725,9 +725,11 @@ class Controller:
 
     def run(self, stop_event):
         """Commands first; then one scope frame for one loop. The visible view's loop gets every frame except
-        the hidden loop's watchdog frames (cavity locked/held every 0.15 s, intensity locked/held/fault every
-        0.2 s, otherwise 1/s). Between and during frames, _wait()/_bg_service() run register-only watchdog checks
-        of the loop that does not own the scope."""
+        the hidden loop's frames. Between and during frames, _wait()/_bg_service() run register-only watchdog
+        checks (pid ival + the sampler's photodiode value, every 0.1 s) of the loop that does not own the scope.
+        With a sampler those checks are the hidden loop's watchdog and it gets 1 scope frame/s (keeps its panels
+        fresh); without a sampler it gets watchdog frames: cavity locked/held every 0.15 s, intensity
+        locked/held/fault every 0.2 s (scanning / off: 1/s)."""
         while not stop_event.is_set():
             try:
                 while True:
@@ -774,7 +776,8 @@ class Controller:
         if now >= self._next_hidden:
             watch = (self.mode in ("locked", "held") if hid == "cav"
                      else self.ints.mode in ("locked", "held", "railed", "nolight"))
-            self._next_hidden = now + (self.HIDDEN_PERIOD[hid] if watch else self.IDLE_PERIOD)
+            regs = self.has_sampler if hid == "cav" else self.ints.has_sampler   # register checks suffice
+            self._next_hidden = now + (self.HIDDEN_PERIOD[hid] if watch and not regs else self.IDLE_PERIOD)
             return hid
         return vis
 

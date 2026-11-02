@@ -37,7 +37,8 @@ COLORS = {"A": "#e67e22", "B": "#8e44ad"}
 
 CSS = """
 body { margin: 0; font-family: sans-serif; }
-.canvas-wrap { overflow-x: auto; }
+.canvas-wrap { position: relative; z-index: 3; }   /* no overflow clip: popovers may extend over the scope */
+.canvas { min-width: max-content; }
 .canvas { position: relative; background: #fbfbfb; border: 1px solid #ddd; border-radius: 8px; margin: 4px 0 8px; }
 .wires { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 1; }
 .views { display: flex; gap: 6px; margin-right: 10px; }
@@ -54,7 +55,7 @@ body { margin: 0; font-family: sans-serif; }
 .vdot.fault { background: #d0302b; } .vdot.off { background: #9e9e9e; }
 .spadj { display: flex; align-items: center; gap: 3px; margin-top: 2px; }
 .spadj button { font-size: 10.5px; padding: 0 4px; cursor: pointer; }
-.spslider { width: 232px; margin: -4px 0 -10px -14px; }
+.spslider { width: 236px; height: 22px; margin: 2px 0 0 0; position: relative; overflow: hidden; }
 .ic .Select, .ic .dash-dropdown { font-size: 11px; }
 .ddis { font-size: 11px; color: #999; border: 1px solid #ddd; border-radius: 3px; padding: 1px 4px; background: #f3f3f3;
         cursor: not-allowed; }
@@ -386,6 +387,18 @@ function(v) {
 }
 """
 
+# Setpoint box: Dash 4's debounced number input does not re-send a value it sent itself before, even after a callback
+# changed the box (type 500, nudge to 510, type 500 again: nothing). On Enter / blur, read the typed number from the
+# DOM and send it as a direct setpoint command.
+SP_TYPED_JS = """
+function(ns, nb) {
+  var el = document.getElementById('s-int_setpoint_mv');
+  if (!el) { return window.dash_clientside.no_update; }
+  var v = parseFloat(el.value);
+  return isNaN(v) ? window.dash_clientside.no_update : {v: v, t: Date.now()};
+}
+"""
+
 # Popovers: clicking a block title opens its popover (and closes the others); x or a second click closes it.
 POP_JS = """
 function(hdr, px, styles) {
@@ -678,6 +691,8 @@ def build_app(ctl, A):
             dcc.Store(id="view", storage_type="local", data="cavity"),
             dcc.Store(id="view-ack"),
             dcc.Store(id="synced", data=-1),                  # -1: the first tick pushes all present values
+            dcc.Store(id="push-version"),
+            dcc.Store(id="sp-typed"),
             dcc.Store(id="frame"),
             dcc.Store(id="frame-seq", data=-1),
             dcc.Store(id="meas-seq", data=-1),
@@ -811,6 +826,15 @@ def build_app(ctl, A):
             ctl.submit("target", float(pts[0]["x"]))
         return time.time()
 
+    app.clientside_callback(SP_TYPED_JS, Output("sp-typed", "data"), Input("s-int_setpoint_mv", "n_submit"),
+                            Input("s-int_setpoint_mv", "n_blur"), prevent_initial_call=True)
+
+    @app.callback(Output("ack", "data", allow_duplicate=True), Input("sp-typed", "data"), prevent_initial_call=True)
+    def on_sp_typed(d):
+        if d and abs(float(d["v"]) - ctl.s["int_setpoint_mv"]) > 1e-9:
+            ctl.submit("int_setpoint", float(d["v"]))
+        return time.time()
+
     app.clientside_callback(VIEW_CLICK_JS, Output("view", "data"), Input("vbtn-cav", "n_clicks"),
                             Input("vbtn-int", "n_clicks"), prevent_initial_call=True)
     app.clientside_callback(VIEW_SHOW_JS, [Output("view-cavity", "style"), Output("view-intensity", "style"),
@@ -928,7 +952,7 @@ def build_app(ctl, A):
         return fr
 
     def cav_status(snap):
-        s, mode, li = snap["settings"], snap["mode"], snap["lock"]
+        mode, li = snap["mode"], snap["lock"]
         f_d, d_mvpp = snap["dither"]
         dm = f" (measured {snap['dither_meas']:.1f})" if snap["dither_meas"] else ""
         color = {"locked": "#1e8e3e", "acquire": "#2471a3", "held": "#b9770e", "busy": "#7d3c98",
@@ -953,7 +977,7 @@ def build_app(ctl, A):
 
     def int_status(snap):
         label, color, _ = it.status()
-        s, li, sc = snap["settings"], snap["lock"], snap["scan"] or {}
+        s, li = snap["settings"], snap["lock"]
         mw = (lambda v: f" ({v*s['int_mw_per_v']:.3g} mW)") if s.get("int_mw_per_v") else (lambda v: "")
         extra = ""
         if snap["pd"] is not None:
@@ -1013,16 +1037,16 @@ def build_app(ctl, A):
                      Output("iscan-seq", "data"), Output("ianalysis", "children"),
                      Output("iscope", "style"), Output("ihistory", "style"), Output("iscan", "style"),
                      Output("ibodefig", "style"), Output("dot-cav", "className"), Output("dot-int", "className"),
-                     Output("int-sp-slider", "value"), Output("int-sp-slider", "max")]
-                    + [Output(f"s-{k}", "value") for k in KEYS] + [Output("synced", "data")])
+                     Output("push-version", "data")])
     N_CAV = 16
 
     @app.callback(tick_outputs, Input("tick", "n_intervals"), State("synced", "data"), State("frame-seq", "data"),
                   State("meas-seq", "data"), State("diag-key", "data"), State("bode-seq", "data"),
                   State("view", "data"), State("iframe-seq", "data"), State("idiag-key", "data"),
-                  State("ibode-seq", "data"), State("iscan-seq", "data"))
+                  State("ibode-seq", "data"), State("iscan-seq", "data"), State("dot-cav", "className"),
+                  State("dot-int", "className"), State("push-version", "data"))
     def on_tick(_, synced, frame_seq, meas_seq, diag_key, bode_seq, view, iframe_seq, idiag_key, ibode_seq,
-                iscan_seq):
+                iscan_seq, dot_cav, dot_int, pushed):
         view = "intensity" if view == "intensity" else "cavity"
         if ctl.view != view:
             ctl.view = view                       # scope-schedule hint only: no hardware access
@@ -1031,6 +1055,7 @@ def build_app(ctl, A):
         version_new = snap["version"] != synced
         logs = "\n".join(reversed(snap["logs"][-80:]))
         dots = ["vdot " + CAV_DOT.get(snap["mode"], "off"), "vdot " + it.status()[2]]
+        dots = [d if d != old else no_update for d, old in zip(dots, (dot_cav, dot_int))]   # only on change
         cav = [no_update] * N_CAV
         ints = [no_update] * 12
         if view == "cavity":
@@ -1109,14 +1134,18 @@ def build_app(ctl, A):
             cav[5] = logs
         if version_new:
             cav[10] = int(1000 / max(float(s["ui_hz"]), 1))
-            sc = it.scan or {}
-            smax = math.ceil(max(sc.get("peak", 1.0) * 1e3, s["int_setpoint_mv"], 10.0) / 10) * 10
-            slider = [s["int_setpoint_mv"], smax]
-            vals = [to_ui(k, s[k]) for k in KEYS] + [snap["version"]]
-        else:
-            slider = [no_update, no_update]
-            vals = [no_update] * len(KEYS) + [no_update]
-        return cav + ints + dots + slider + vals
+        return cav + ints + dots + [snap["version"] if version_new and pushed != snap["version"] else no_update]
+
+    # Settings push: only when the controller changed settings (version). Kept out of the fast tick, whose
+    # output list would otherwise carry every settings input of both views.
+    @app.callback([Output("int-sp-slider", "value"), Output("int-sp-slider", "max")]
+                  + [Output(f"s-{k}", "value") for k in KEYS] + [Output("synced", "data")],
+                  Input("push-version", "data"), prevent_initial_call=True)
+    def on_push(v):
+        s = dict(ctl.s)
+        sc = it.scan or {}
+        smax = math.ceil(max(sc.get("peak", 1.0) * 1e3, s["int_setpoint_mv"], 10.0) / 10) * 10
+        return [s["int_setpoint_mv"], smax] + [to_ui(k, s[k]) for k in KEYS] + [v]
 
     # The measurement plots get their own callbacks: sending both figures inside the 10 Hz tick response made
     # the browser drop the whole update (seen with Dash 4.5), freezing the page.

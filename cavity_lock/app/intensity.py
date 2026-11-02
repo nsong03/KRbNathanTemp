@@ -558,7 +558,7 @@ class Intensity:
     def _probe_due(self):
         return self._tick % max(int(self.s.get("drive_every", 3)), 1) == 0
 
-    MIN_FRAME_S = 1 / 30                 # live frames at most 30/s (the browser draws ~10/s)
+    MIN_FRAME_S = 1 / 15                 # live frames at most 15/s (the browser draws ~10/s)
 
     def _live_frame(self):
         s = self.s

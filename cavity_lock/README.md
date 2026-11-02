@@ -7,11 +7,26 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 2. Open the folder in Claude Code. `CLAUDE.md` loads automatically as project memory.
 3. Paste the prompt from `CLAUDE_CODE_PROMPT.md`, the schematic / Moku-style UI task.
 
+## Wiring (Red Pitaya STEMlab 125-14)
+| Port | Connection | Feature |
+| --- | --- | --- |
+| IN1 | cavity transmission photodiode (LV jumper below 1 V, else HV + "IN1 scale" 20) | cavity lock |
+| OUT1 | PZT driver MOD IN (ramp + dither, or setpoint + dither; never beyond ±0.95 V) | cavity lock |
+| IN2 | AOM pickoff photodiode, 1st-order beam (LV jumper, ~0.5–0.8 V at the operating point) | intensity servo |
+| OUT2 | 50 Ω tee → inverting bias driver → mixer IF → RF amp → AOM (0 V = bias level) | intensity servo |
+
+OUT2 is no longer a scope monitor. The intensity hardware is described in `docs/intensity_hardware.md` (not built yet).
+
 ## Status
+- **v5 — AOM intensity stabilization** (2026-11-02): a second feature on IN2/OUT2 (`pid2` servo, `asg1` power scan).
+  Two icons at the top left switch between the *Cavity lock* and *Intensity* views; each icon has a status dot, both
+  loops always run in hardware and share the scope (scheduled). Intensity: power scan (efficiency peak, clamp below
+  it, measured plant gain K), PI lock from a target bandwidth or P/I dropdowns, setpoint adjuster, watchdog (railed,
+  no light + re-engage), swept-sine Bode plot. Plan: `docs/intensity_plan.md`. Tested on the fake only.
 - **v4** (2026-11-01): the settings sidebar is now a Moku-style schematic of the real FPGA chain, with switches
   (Scan, Dither, Lock, Output, Auto-relock), probe points (2 scope channels) and Lock Assist crosshairs.
   Plan and register map: `docs/schematic_plan.md`; screenshots: `docs/screenshots/`. Tested on the fake only.
-- **Measure Bode plot** (2026-11-02): swept-sine Bode with the internal generator (asg1) and scope, filled in point
+- **Measure Bode plot** (2026-11-02): swept-sine Bode with the internal generator (now asg0) and scope, filled in point
   by point, with Stop. *closed loop* (locked): G, disturbance suppression S, closed-loop T and the plant, with the
   model, UGF and phase margin. *circuit only*: the lock-in chain and PID measured on spare copies of the blocks,
   OUT1 untouched. Tested on the fake only.
@@ -27,7 +42,11 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 | `CLAUDE_CODE_PROMPT.md` | Ready-to-paste prompt for the next task (schematic block-diagram UI) |
 | `app/cavity_lock_app.py` | The app (analysis + Controller). Run: `python app\cavity_lock_app.py --host rp-f0fa92.local` |
 | `app/schematic.py` | The block diagram as data: blocks, parameter → register map, writers, wires, switches, probes |
-| `app/ui.py` | Dash UI: schematic canvas, popovers, embedded scope |
+| `app/ui.py` | Dash UI: the two views (schematic canvases, popovers, embedded scopes), view icons |
+| `app/intensity.py` | AOM intensity servo: settings, power-scan analysis, controller (pid2 / asg1) |
+| `app/intensity_schematic.py` | The intensity block diagram as data (blocks, registers, writers, wires, switches, probes) |
+| `docs/intensity_plan.md` | Intensity plan: module allocation, settings, modes, watchdog, scope schedule, layout |
+| `docs/intensity_hardware.md` | Intensity hardware: photodiode, bias driver, mixer, RF chain, what it means for the software |
 | `app/test/` | `fake/pyrpl.py` hardware stand-in; `test_v3.py` controller + schematic test; `serve_v3.py` + `ui_v4.py` Playwright UI test; timing probes |
 | `docs/schematic_plan.md` | Schematic UI plan: blocks → FIELDS keys → PyRPL attributes, switches and interlocks, probe map, layout |
 | `docs/findings.md` | One-page summary of all findings |
@@ -44,7 +63,9 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 ```
 cd app\test
 python test_v3.py                              # controller end to end on the fake
-python serve_v3.py   (then, in a 2nd terminal)  python ui_v4.py   # browser test, needs: pip install playwright; playwright install chromium
+python test_intensity.py                       # intensity servo on the fake
+python test_isolation.py                       # both loops at once: register isolation, scope schedule
+python serve_v3.py   (then, in a 2nd terminal)  python ui_v4.py ; python ui_v5.py   # browser tests (pip install playwright; playwright install chromium)
 ```
 
 ## Online copies

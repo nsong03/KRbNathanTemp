@@ -1,4 +1,4 @@
-# Cavity PZT dither lock (Red Pitaya + PyRPL) — project memory
+# Cavity PZT dither lock + AOM intensity servo (Red Pitaya + PyRPL) — project memory
 
 Owner: Nathan Song (KRb lab). Windows 10/11 laptop, VS Code, Python environment where `import pyrpl` works.
 Working folder on the laptop: `C:\Users\songo\Desktop\P-Physics\KRbGeneral\redpitaya_locking\lockcavityPZTtolaser`.
@@ -7,15 +7,19 @@ Working folder on the laptop: `C:\Users\songo\Desktop\P-Physics\KRbGeneral\redpi
 A browser app (`app/cavity_lock_app.py`, Dash + Plotly) that locks the length of an optical cavity to a laser.
 It dithers the cavity PZT, demodulates the transmitted intensity with the Red Pitaya's own lock-in (PyRPL `iq0`),
 and integrates the error with `pid0`. The user confirmed that v2 **locks and is robust** on the real hardware. v3 added speed + diagnostics;
-v4 (current) replaces the settings sidebar with a Moku-style **schematic** of the real signal chain (`docs/schematic_plan.md`).
-v3 and v4 have been tested only against the fake so far.
+v4 replaces the settings sidebar with a Moku-style **schematic** of the real signal chain (`docs/schematic_plan.md`).
+v5 (current, 2026-11-02) adds a second feature on IN2/OUT2: **AOM intensity stabilization** (`pid2` + `asg1`), with two
+icons at the top left that switch between a "Cavity lock" and an "Intensity" view (`docs/intensity_plan.md`,
+hardware: `docs/intensity_hardware.md`, not built yet). v3–v5 have been tested only against the fake so far.
 
 ## Hardware
 - Red Pitaya STEMlab 125-14, hostname `rp-f0fa92.local`. PyRPL 0.9.9.1. Its FPGA bitstream matches the GitHub `pyrpl-fpga/pyrpl` Verilog at tag 0.9.9.1.
 - IN1 ← cavity transmission photodiode. Use the LV jumper below 1 V; with HV, set the app's "IN1 scale" to 20.
 - OUT1 → PZT driver MOD IN. OUT1 carries the ramp plus the dither, or the setpoint plus the dither. The app never commands beyond ±0.95 V.
-- OUT2 → scope monitor (`pid1` used as a pass-through: error, setpoint, ramp or photodiode).
-- IN2 is free.
+- IN2 ← AOM pickoff photodiode (1st-order beam, LV jumper, about 0.5–0.8 V at the operating point).
+- OUT2 → 50 Ω tee → inverting bias driver (V_drv = |V_bias| − 10·V_OUT2) → Schottky + 100 Ω → ZX05-1+ mixer IF
+  (current-controlled attenuator; LO = 80 MHz, +4 dBm) → ZHL-1-2W+ (32 dB) → AOM. More OUT2 = less light (K < 0);
+  OUT2 = 0 V = bias level (safe default). Useful OUT2 range only about ±0.1–0.2 V. The old OUT2 monitor is gone.
 - PZT driver: model unknown. Its bandwidth with the PZT is assumed to be 1 kHz (setting `driver_bw_hz`).
 - Cavity linewidth κ ≈ 40 MHz (setting `kappa_mhz`). It is used only to convert volts to Hz.
 - Earlier setups used a Rigol DG922 (dither and reference) and an SR810 lock-in. Both are now replaced by the Red Pitaya; see `earlier/`.
@@ -29,10 +33,26 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 - Settings are saved to `cavity_lock_settings.json` next to the app with the Save and Load buttons. Keep the keys backward compatible: the user has saved files.
 - Ctrl-C quits. The Red Pitaya keeps its state, so a running lock stays on.
 
+## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
+| Module | Owner | Use |
+| --- | --- | --- |
+| iq0, asg0, pid0, OUT1 | cavity | dither + demodulation, ramp (and the cavity Bode test sine), lock |
+| iq1, pid1 | cavity, measurement only | copies for the circuit-only Bode, **outputs off**, restored to off after |
+| pid2, asg1 | intensity | servo (input in2, output_direct out2), power scan / Bode test sine on out2 |
+| pid1 (otherwise) | nobody | off. Keep it free: it is pid0's only partner in PyRPL's differential mode |
+| iq2 | network analyzer | free (the cavity "Measure loop" NA takes it) |
+| scope | shared | scheduled (see "Scope schedule") |
+- Cavity code (`cavity_lock_app.py`, `schematic.py`) never writes pid2 or asg1 and never sets any `output_direct` to
+  `out2`/`both`. Intensity code (`intensity.py`, `intensity_schematic.py`) never writes iq0, asg0, pid0 and never routes
+  to `out1`/`both`. Start-up sets pid1 off (an old v4 OUT2 monitor would add onto the servo).
+- Old settings files with `out2_signal` / `out2_gain` load fine (keys not in `DEFAULTS` are ignored).
+
 ## Architecture (keep it)
-- Files: `app/cavity_lock_app.py` (analysis, `Controller`, `main`), `app/schematic.py` (the diagram as data: blocks,
-  parameters → FIELDS key → PyRPL attribute, block writers, wires, switches, probes, readback text),
-  `app/ui.py` (Dash layout and callbacks, `build_app(ctl, A)`; `cavity_lock_app.build_app(ctl)` wraps it).
+- Files: `app/cavity_lock_app.py` (analysis, `Controller`, `main`), `app/schematic.py` (the cavity diagram as data:
+  blocks, parameters → FIELDS key → PyRPL attribute, block writers, wires, switches, probes, readback text),
+  `app/intensity.py` (`I_FIELDS`, power-scan analysis, `Intensity` servo controller, run by the Controller),
+  `app/intensity_schematic.py` (the intensity diagram, same structure, element ids prefixed `i-`),
+  `app/ui.py` (Dash layout and callbacks for both views, `build_app(ctl, A)`; `cavity_lock_app.build_app(ctl)` wraps it).
 - **One model, two consumers.** `configure()` = `SCH.write_static(ctl)` (+ snapping); an apply runs only the writers of
   the blocks that own the changed keys (`SCH.apply_changed`). Ramp, PID and limiter writers are live only in
   `acquire` / `locked`. The UI draws the same `BLOCKS`/`WIRES`/`SWITCHES`/`PROBES`.
@@ -48,7 +68,7 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   - `ctl.version` increments when the controller changes a setting itself, for example on hardware snapping or a phase fit.
   - The UI pushes the new values only then, so the UI and the controller never fight.
   - Applies are version-checked: `("apply", (values, version))`.
-- `configure()` writes `iq0`, `pid1` and the input filters.
+- `configure()` writes `iq0`, `pid0.setpoint` and pid0's input filter.
   - `_snap_to_hardware()` reads back what the FPGA really uses (filter corners on a factor-2 ladder, integer `quadrature_factor`) and shows those values in the UI.
 - Modes: `connecting` → `acquire` ↔ `locking` → `locked` / `held`, plus `measuring` and `off` (Output switch).
   - `_lock()` → `_zoom_and_lock()`: a slow sweep across the chosen peak with the lock dither, then a 4-phase cos² fit of the phase, then the zero crossing and slope.
@@ -58,19 +78,52 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 - Diagnostics while locked:
   - `_measure_noise()`: Welch spectra in two bands, with band rms.
   - `_measure_loop()`: PyRPL network analyzer on `pid0` and `iq0`. With T = c/x, G = −T/(1+T) and P = (e/x)/(1+T).
-- **Measure Bode plot** (`_measure_bode`, toolbar button + mode selector + Stop): swept sine from `asg1` recorded with
-  the scope (2 channels: asg1 and the response), complex amplitude by least squares at the exact frequency
+- **Measure Bode plot** (`_measure_bode`, toolbar button + mode selector + Stop): swept sine from `asg0` recorded with
+  the scope (2 channels: asg0 and the response), complex amplitude by least squares at the exact frequency
   (`fit_sine`: cos, sin, offset, drift). Filled in point by point (`ctl.bode`, `bode_seq` → `dcc.Store("bode")` →
   clientside `BODE_JS`); Stop is a `threading.Event` set from the UI thread (the sweep blocks the command queue).
-  - `closed loop` (locked only): asg1 → OUT1 sum, amplitude = `na_amp_frac` × linewidth. Captures (asg1, pid0) and
-    (asg1, iq0) per point: G = −T/(1+T), S = 1+T, closed loop = −T, plant = (e/x)/S. Stops and holds if the PID
+  - `closed loop` (locked only; asg0 is idle then): asg0 → OUT1 sum, amplitude = `na_amp_frac` × linewidth. Captures (asg0, pid0) and
+    (asg0, iq0) per point: G = −T/(1+T), S = 1+T, closed loop = −T, plant = (e/x)/S. Stops and holds if the PID
     output reaches the clamp. At low frequency G comes from 1 + c/x (the loop cancels the sine), so it needs enough
     excitation: 0.03 linewidth gave ±20 % at 4 Hz on the fake, 0.1 gave ±3 %.
-  - `circuit only` (any mode, OUT1 untouched; asg1 output stays off): spare copies `iq1` (oscillator at 0 Hz → the
-    lock-in chain at baseband: same low-pass and integer gain, no high-pass) → `pid2` (i = UGF, p = P gain, i.e. the
-    lock's gains per unit slope). Per-point amplitude keeps the copies' outputs ≈ 0.25 V (linear, so ratios hold).
+  - `circuit only` (OUT1 untouched; the asg0 sine stays off any output): spare copies `iq1` (oscillator at 0 Hz → the
+    lock-in chain at baseband: same low-pass and integer gain, no high-pass) → `pid1` (i = UGF, p = P gain, i.e. the
+    lock's gains per unit slope), both outputs off. Per-point amplitude keeps the copies' outputs ≈ 0.25 V. While
+    scanning, OUT1 is parked at the ramp centre for the sweep and the scan restarts afterwards.
   - Stop frequency is limited to 0.45 × dither frequency.
+- **Intensity servo** (`intensity.py`, same architecture: main thread, version-checked settings `int_*`, snapped values):
+  - Modes `off` → `scanning` → `locking` → `locked`, plus `held`, `measuring`, faults `railed` and `nolight`.
+  - Power scan (Scan switch): pid2 p = i = ival = 0, asg1 triangle on out2 within the scan limits (clipped to
+    `int_out2_limit_mv`), scope (in2, asg1) triggered on asg1. `analyze_scan`: efficiency peak, bright direction,
+    auto clamp (bright side where light = (1 − margin) × peak, dark side = scan limit), K = dV_IN2/dV_OUT2 at the
+    setpoint, OUT2 for the setpoint, max lockable light. Saved to `intensity_scan.json` (runtime, gitignored).
+  - Lock: asg1 off → setpoint → clamp → ival = OUT2 for the setpoint → gains in steps (f_u/10, f_u/3, f_u, 30 ms).
+    Bandwidth mode: i = −f_u/K, p = i/f_corner. Manual mode: P and I dropdowns (1-2-5 ladders, magnitudes), sign
+    −sign(K). D is shown as a disabled dropdown (not in this bitstream). i ≤ 38.9 kHz → cap 38.9 kHz × |K| (warned).
+  - Setpoint adjuster: slider (0 .. scan peak) + ±0.1/1/10 mV buttons + number box (`int_setpoint`, `int_nudge`
+    commands); written live; while locked the gains are re-derived from the scan's K at the new setpoint.
+  - Watchdog: light < `int_light_frac` × setpoint twice → `nolight` (hold at the median of the last good drives; with
+    Re-engage on, lock again after 0.2 s of light). Output within 2 % of a clamp for > `int_rail_s` → `railed`
+    (hold, log; no auto re-engage).
+  - Start-up: pid2 on out2 with non-zero gains → adopted as `locked`, registers untouched (setpoint/filter read
+    back). Otherwise pid2 p = i = ival = 0, output off, asg1 off → OUT2 = 0 V, mode `off`.
+  - Measure Bode plot (locked): asg1 sine on OUT2 (summed with pid2), captures (asg1, pid2) and (asg1, in2),
+    T = c/x, G = −T/(1+T), S = 1+T, plant = (in2/x)/S; amplitude = `int_bode_amp_frac` × setpoint/|K| inside the
+    clamp; stops and holds if the output reaches a clamp. No intensity-noise analysis in the app (user decision).
+- **Scope schedule** (`Controller.run` / `_pick`): one frame per pass for one loop. The visible view's loop gets the
+  frames; the hidden loop gets 1 frame/s. Its watchdog is the register-only check (`_bg_service`: pid ival + sampler
+  photodiode value, every 0.1 s) that runs inside the visible loop's captures and inside every `_wait()` of a
+  sequence or measurement (all `time.sleep`s in sequences are `_wait`). Without a sampler the hidden loop instead
+  gets watchdog frames every 0.15 s (cavity locked/held) / 0.2 s (intensity locked/held/fault). A background check
+  only holds its own loop; a cavity relock it triggers runs in the next cavity frame. Intensity live frames are
+  capped at 15/s. `ctl.frames` / `ctl.bg_count` count both.
 - UI:
+  - Two icons at the top left (`vbtn-cav`, `vbtn-int`) with status dots (green locked, blue scanning/locking/
+    measuring, amber held, red fault, grey off). The view lives in `dcc.Store("view", storage_type="local")`; a
+    clientside callback only toggles `display`, so switching writes nothing to the hardware. The tick reads the
+    view, sets `ctl.view` (scheduler hint) and builds frame/diagram/Bode data for the visible view only.
+  - Settings values are pushed by their own callback (`push-version` → `on_push`), not by the tick, so the tick's
+    output list stays short with both views' inputs on the page.
   - The server sends compact data in `dcc.Store("frame")`.
   - A **clientside** callback (`SCOPE_JS`) draws with `Plotly.react` using **SVG `scatter`**. `scattergl` redraws about 2× slower here.
   - The noise and loop figures have **their own callbacks keyed on `meas-seq`**, never in the tick response. Putting them in the tick response froze the page.
@@ -79,6 +132,9 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
     exists exactly once (inline in a box or in a hidden popover), so the version-checked apply callback is unchanged.
     `DIAG_JS` (clientside) draws the SVG wires once and updates readback text, switch pills and probe badges from
     `dcc.Store("diag")`, which the tick sends only when it changes. `POP_JS` opens/closes popovers.
+  - Intensity view: `iframe` / `idiag` / `ibode` / `iscan-seq` stores, `ISCOPE_JS` (live probes A/B or the scan),
+    `scan_fig` (last scan, server-side, keyed on `iscan-seq`); main capture in2 + pid2, other probe pairs every
+    `drive_every` frames.
   - Probes: the main capture stays in1 + iq0. Probe pairs inside {in1, iq0} reuse it; others take a second capture
     every `drive_every` traces (the old "drive" capture; the `panels` key "drive" is shown as "probes A/B").
 
@@ -93,12 +149,27 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 - ASG waveforms: `"ramp"` is a **triangle**, `"halframp"` is a sawtooth.
 - Scope acquisition calls differ by version. 0.9.9.1 uses `_start_trace_acquisition`/`_get_trace`/`curve_ready`; 0.9.3 uses `_start_acquisition`/`_get_curve`. The app handles both.
 - Reserve modules with `module.owner = "..."` so PyRPL tools (the network analyzer uses an IQ module) don't take them. The network analyzer is `p.networkanalyzer`.
-- Every module with `output_direct="out1"` is summed digitally into OUT1, then clipped to ±1 V.
+- Every module with `output_direct="out1"` is summed digitally into OUT1, then clipped to ±1 V (same for out2:
+  pid2 + asg1).
+- From the 0.9.9.1 Python source (fetched 2026-11-02): the scope's trigger sources include `asg1`; `r.sampler.<signal>`
+  reads the present value of any DSP signal (one register) — **verify on hardware**; pid `p` ≤ ~2048 (step 2^-12),
+  `i` ≤ ~38.9 kHz; `inputfilter` up to 4 stages, negative = high-pass; D commented out; differential mode only
+  pid0/pid1.
 
 ## Testing without hardware
+- Playwright in this container: `pip install playwright`; the tests launch `/opt/pw-browsers/chromium` (env `CHROME`).
 - `app/test/fake/pyrpl.py` is a stand-in `pyrpl` module.
   - It simulates a cavity with 3 modes, PZT lag on the dither, the IQ demodulator with n-pole low-pass, a PyRPL-style quantized PID with clamps, the scope, the ASG and a NetworkAnalyzer.
   - Environment variables: `FAKE_DT`; `FAKE_LAN_S` emulates the per-register LAN delay; `REG_COUNT` counts register accesses.
+  - `WRITES` logs every register write by app code as (t, module, attr, value, app source file); `WRITE_N`,
+    `WRITE_N_NONSCOPE` count them (constructor writes are not logged). `serve_v3.py` exposes `/_test/writes` and
+    `/_test/stats`.
+  - OUT2: `class AOM`: inverting driver with bias → mixer (RF ∝ IF current, saturating, positive only) → sin²
+    efficiency (peak at OUT2 ≈ −63 mV, 0.9 V) → photodiode (delay `FAKE_AOM_DELAY_US`, default 0.5 µs, 5 MHz pole,
+    noise 1/f + lines 120 Hz/1.3 kHz/17 kHz + white, scaled by `FAKE_RIN`; ADC noise ~63 nV/√Hz). Slow state every
+    2 ms (drift, `aom.disturb`, `aom.blocked`, pid2 running to its equilibrium or a clamp); scope windows synthesized
+    (closed loop linearized with the true delay, lines and the asg1 test sine exact).
+  - Module sums are routing-aware (`ASG.value(t, out)`); the circuit-only copies are iq1 → pid1 driven by asg0.
   - The fake dither is 4 % larger than requested (DITHER_SCALE 1.04) to exercise the amplitude calibration.
 - Run these from `app/test`:
   - `python test_v3.py` is the controller test. It runs acquire → pick peak → auto-phase → lock with a different lock dither → noise → loop → kick and relock → unlock → lock from held → acquire → sawtooth.
@@ -108,10 +179,22 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
     edits every block parameter through its own input, flips every switch (incl. the Scan-while-locked confirm),
     places probes, clicks a crosshair, locks with the switch, runs both measurements, redraws/s, screenshots.
   - `tick_timing.py`, `render_timing.py`, `prof_tick.py` and `bench_v2style.py` are performance probes.
+- `python test_intensity.py`: scan (peak, clamp below it, K sign and value), lock (gains, |i·K|, setpoint), 120 Hz line
+  ×200 and 0.1–3 kHz ×28 suppression, step recovery, beam block → hold → re-engage, Re-engage off, railed fault,
+  setpoint adjuster, manual P/I, cap warning, every intensity block parameter → its register, probes, switches,
+  Bode vs the fake's true loop gain (< 10 %), Stop, old settings file, restart adoption / reset.
+- `python test_isolation.py`: both loops locked; hidden-loop checks ≥ 5/s in both views (with and without a
+  sampler); a cavity unlock while hidden is caught and relocked; intensity watchdog while hidden; measurements in
+  one loop with the other locked; view switching writes nothing; the write log in both directions.
+- `ui_v5.py` (Playwright, after `serve_v3.py`): icons/dots, both loops locked through the UI, view switching writes
+  nothing (fake counter), view remembered after reload, every intensity block parameter through its own input,
+  setpoint buttons/slider, probes, switches incl. the Scan-while-locked confirm, intensity Bode + Stop, redraws/s
+  per view, screenshots `v5_*.png`.
 - Bode tests: `test_v3.py` checks that the circuit-only sweep matches its model (< 5 %, < 5°), that asg1 is never
   routed to an output during it, that the closed-loop G equals the fake's true loop gain below 100 Hz (< 5 %), and Stop.
   `ui_v4.py` checks that the plot fills in point by point, both modes complete, and Stop.
 - The fake scope records **after** it is armed (untriggered), like the hardware; it used to return the past window.
+- Results 2026-11-02, v5 (this container, 4 cores): see the end of this section (filled in after the runs).
 - Results 2026-11-02 (Bode added, a slower container): `test_v3.py` 63/63; `ui_v4.py` 56/58 functional checks pass,
   the 2 redraw-rate checks fail on that host for the old and the new code alike (A/B: 5–6/s both; tick 7.0 ms old vs
   7.5 ms new there).
@@ -132,6 +215,12 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 - Only one process may own the Red Pitaya, so close the PyRPL GUI or notebooks before running the app.
 - PyRPL's `iq.phase` register sign is inverted relative to the naive formula. Trust the attribute, not hand-written registers.
 - On Windows, `import pyrpl` failed once because VS Code used a different interpreter; pick the environment where PyRPL is installed.
+- Dash 4 debounced number inputs: after a callback rewrote the box, re-typing the value the box itself sent before is
+  swallowed (type 500, nudge to 510, type 500: no callback). The intensity setpoint box therefore also has a
+  clientside Enter/blur path that reads the DOM value (`SP_TYPED_JS` → `int_setpoint`). Other boxes still have the quirk.
+- Dash 4 slider: its root element intercepts clicks on anything it overlaps; never give it negative margins.
+- Pattern-matching ids with floats render as JSON numbers (`{"d":10}`, not `10.0`): select by text in tests.
+- Killing test servers with `pkill -f serve_v3.py` also kills the calling shell (its command line matches).
 
 ## Style the user likes
 Direct, physics-literate explanations; settings shown in real units; values on screen equal what the hardware uses;
