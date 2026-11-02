@@ -51,7 +51,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(HERE, "cavity_lock_settings.json")
 OUT_LIMIT = SCH.OUT_LIMIT             # never command OUT1 beyond +/- this [V]
 RP_LATENCY = 211e-9                   # analog-in to analog-out delay of the lock-in path (FPGA simulation)
-PANELS = ["transmission", "error", "drive", "setpoint history", "noise spectrum", "loop (Bode)"]
+PANELS = ["transmission", "error", "drive", "setpoint history", "noise spectrum", "loop (Bode)", "Bode (swept)"]
 
 # ---------------------------------------------------------------------------------------------
 # Settings: (key, label, default, group, kind, options)   -- UI units (mV, Hz, deg)
@@ -91,6 +91,14 @@ FIELDS = [
     ("na_stop_hz", "Loop: stop frequency [Hz]", 2000.0, "Diagnostics", "num", {"min": 2}),
     ("na_points", "Loop: points", 30, "Diagnostics", "num", {"min": 3, "max": 400}),
     ("na_amp_frac", "Loop: excitation [x linewidth]", 0.03, "Diagnostics", "num", {"min": 0.001, "max": 0.5}),
+    ("bode_mode", "Bode: what to measure", "closed loop", "Diagnostics", "select",
+     {"options": ["closed loop", "circuit only"]}),
+    ("bode_start_hz", "Bode: start frequency [Hz]", 3.0, "Diagnostics", "num", {"min": 0.5}),
+    ("bode_stop_hz", "Bode: stop frequency [Hz] (max 0.45 x dither)", 500.0, "Diagnostics", "num", {"min": 1}),
+    ("bode_points", "Bode: points", 30, "Diagnostics", "num", {"min": 3, "max": 200}),
+    ("bode_cycles", "Bode: sine cycles per point", 6, "Diagnostics", "num", {"min": 2, "max": 50}),
+    ("bode_amp_mv", "Bode circuit only: max test amplitude [mV]", 400.0, "Diagnostics", "num",
+     {"min": 1, "max": 900}),
     ("panels", "Show", ["transmission", "error", "drive", "setpoint history"], "Display", "multi", {"options": PANELS}),
     ("ui_hz", "Browser refresh [Hz]", 10.0, "Display", "num", {"min": 1, "max": 30}),
     ("drive_every", "Refresh the drive plot every N traces", 3, "Display", "num", {"min": 1, "max": 100}),
@@ -393,6 +401,10 @@ class Controller:
         self.version = 0                                 # bumps when the controller itself changes settings
         self.seq = 0                                     # bumps on every new set of traces
         self.meas_seq = 0                                # bumps on every new noise / loop measurement
+        self.bode = None                                 # swept-sine Bode measurement (filled point by point)
+        self.bode_seq = 0
+        self.meas_progress = ""
+        self._stop_meas = threading.Event()              # set from the UI thread: stop the running sweep
         self.mode = "connecting"
         self.ctx = "acq"                                 # which dither is on OUT1: "acq" or "lock"
         self.traces = None
@@ -424,7 +436,8 @@ class Controller:
         from pyrpl import Pyrpl
         self.p = Pyrpl(config=config, hostname=host, gui=False)
         self.r = self.p.rp
-        for name in ("iq0", "pid0", "pid1", "asg0", "scope"):   # reserve: PyRPL tools (network analyzer) skip them
+        for name in ("iq0", "pid0", "pid1", "asg0", "scope", "asg1", "iq1", "pid2"):   # reserve: PyRPL tools
+                                                                                   # (network analyzer) skip them
             try:
                 getattr(self.r, name).owner = "cavity_lock_app"
             except Exception:
@@ -455,6 +468,7 @@ class Controller:
                         settings=dict(self.s), version=self.version, seq=self.seq, ramp=self.ramp,
                         kappa=self.kappa, dither=self._dither(), dither_meas=self.dither_meas, ctx=self.ctx,
                         noise=self.noise, loop=self.loop, meas_seq=self.meas_seq, fps=self.fps,
+                        bode=self.bode, bode_seq=self.bode_seq, meas_progress=self.meas_progress,
                         hw=dict(self.hw), req=dict(self.req), ival=self.ival, amp_cal=self.amp_cal,
                         dither_on=self.dither_on)
 
@@ -751,6 +765,8 @@ class Controller:
             self._measure_noise()
         elif cmd == "loop":
             self._measure_loop()
+        elif cmd == "bode":
+            self._measure_bode()
         elif cmd == "save":
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(s, f, indent=2)
@@ -1329,6 +1345,238 @@ class Controller:
         finally:
             if self.mode == "measuring":
                 self.mode = "locked"
+
+    # ---- swept-sine Bode measurement (internal generator asg1 + scope) ----
+    def stop_measurement(self):
+        """Called from the UI thread: the running sweep stops after the present point."""
+        self._stop_meas.set()
+
+    def _bode_publish(self, B):
+        B = dict(B, curves=[dict(cv, f=list(cv["f"]), c=list(cv["c"])) for cv in B["curves"]])  # a snapshot
+        with self._pub_lock:
+            self.bode = B
+            self.bode_seq += 1
+
+    def _measure_bode(self):
+        """Swept-sine Bode plot, filled in point by point.
+        closed loop (locked): asg1 adds a small sine at the OUT1 sum; the scope records it with the PID output
+            (pid0) and with the error (iq0). c/x gives the open-loop gain G = -T/(1+T), the sensitivity
+            S = 1/(1+G) = 1 + c/x and the closed-loop response G/(1+G); the plant is (e/x)/S.
+        circuit only (any mode, OUT1 untouched): spare copies of the blocks (iq1 = lock-in chain with the same
+            low-pass and gain, its oscillator at 0 Hz so the chain is seen at baseband; pid2 = the PID with the
+            loop gains per unit error slope) are driven by asg1, which is not routed to any output."""
+        s = self.s
+        closed = s["bode_mode"] == "closed loop"
+        if self.mode in SCH.BUSY:
+            self.log(f"Bode: busy ({self.mode})")
+            return
+        if closed and self.mode != "locked":
+            self.log("Bode (closed loop) works while locked; use 'circuit only' to measure the electronics alone")
+            return
+        f_d = self._dither()[0]
+        f_stop = min(s["bode_stop_hz"], 0.45 * f_d)
+        f_start = min(s["bode_start_hz"], f_stop / 2)
+        if f_stop < s["bode_stop_hz"]:
+            self.log(f"Bode: stop frequency limited to {f_stop:.0f} Hz (0.45 x dither: the lock-in cannot pass more)")
+        fs = np.geomspace(f_start, f_stop, int(s["bode_points"]))
+        prev = self.mode
+        self.mode = "measuring"
+        self._stop_meas.clear()
+        self._show_panel("Bode (swept)")
+        try:
+            if closed:
+                self._bode_closed(fs)
+            else:
+                self._bode_circuit(fs, prev)
+        finally:
+            a1 = self.r.asg1
+            a1.output_direct, a1.amplitude = "off", 0
+            for m, attrs in (("iq1", {"output_direct": "off", "amplitude": 0}),
+                             ("pid2", {"output_direct": "off", "i": 0, "p": 0, "ival": 0})):
+                for k, v in attrs.items():
+                    try:
+                        setattr(getattr(self.r, m), k, v)
+                    except Exception:
+                        pass
+            self.meas_progress = ""
+            if self.mode == "measuring":
+                self.mode = prev
+            if self.bode:
+                self._bode_publish(dict(self.bode, done=True))
+
+    def _bode_capture(self, sig, f, cycles):
+        """Two-channel capture (asg1, sig) long enough for `cycles` periods; complex amplitudes at f."""
+        dur = float(np.clip(cycles / f, 2e-3, 2.1))      # 2.1 s: the scope then picks 2.15 s, not 4.3 s
+        t, x, y = self.capture("asg1", sig, dur)
+        return fit_sine(t, x, f), fit_sine(t, y, f)
+
+    def _bode_point_live(self, f, amp, out):
+        a1 = self.r.asg1
+        a1.setup(waveform="sin", frequency=float(f), amplitude=float(amp), offset=0.0,
+                 trigger_source="immediately", output_direct=out)
+        with self._pub_lock:
+            self.hw.update({"asg1.frequency": float(f), "asg1.amplitude": float(amp), "asg1.output_direct": out,
+                            "asg1.waveform": "sin"})
+
+    def _bode_closed(self, fs):
+        s, li, r = self.s, self.lock_info, self.r
+        kap, _ = self._kappa_drive()
+        amp = float(np.clip(s["na_amp_frac"] * (kap or 0.005), 1e-4, 0.05))
+        ugf = li.get("ugf_actual", s["ugf_hz"])
+        Gm = loop_model(fs, ugf, s["p_gain"], self._lp_list(), s["driver_bw_hz"], RP_LATENCY)
+        B = bode_init("closed loop", fs, [
+            ("G open loop", "#1f5fa8", Gm), ("S = 1/(1+G): disturbance suppression", "#c0392b", 1 / (1 + Gm)),
+            ("T = G/(1+G): closed loop", "#1e8e3e", Gm / (1 + Gm))],
+            title=f"Closed-loop Bode (sine {amp*1e3:.2f} mV at OUT1, lock {ugf:.1f} Hz)",
+            note="measured: solid with markers; model (integrator + low-pass + driver pole + delay): dotted")
+        B["curves"].append(dict(name="plant P (normalized)", color="#d35400", f=[], c=[], model=False))
+        self._bode_publish(B)
+        self.log(f"Bode closed loop: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.3g} Hz, sine {amp*1e3:.2f} mV on OUT1")
+        lo, hi = li["clamp"]
+        settle_loop = 4 / (2 * math.pi * max(ugf, 0.1))
+        p0 = None
+        for k, f in enumerate(fs):
+            if self._stop_meas.is_set():
+                self.log(f"Bode stopped after {k} points")
+                break
+            self.meas_progress = f"Bode {k+1}/{len(fs)} at {f:.3g} Hz"
+            self._bode_point_live(f, amp, "out1")
+            time.sleep(min(max(3 / f, settle_loop, self._filter_settle()), 1.5))
+            X, C = self._bode_capture("pid0", f, s["bode_cycles"])
+            X2, E = self._bode_capture("iq0", f, s["bode_cycles"])
+            ival = float(r.pid0.ival)
+            if ival <= lo + 0.03 * (hi - lo) or ival >= hi - 0.03 * (hi - lo):
+                r.asg1.output_direct = "off"
+                r.pid0.i = 0
+                self.mode = "held"
+                self.log(f"Bode: the lock ran to the clamp at {f:.3g} Hz; stopped and holding (lower the excitation)")
+                break
+            Tc, Ex = C / X, E / X2                       # c/x and e/x
+            G, S = -Tc / (1 + Tc), 1 + Tc
+            P = Ex / S
+            p0 = p0 or P                                 # normalize to the first point (magnitude and sign)
+            for cv, val in zip(B["curves"], (G, S, -Tc, P / p0)):
+                cv["f"].append(float(f))
+                cv["c"].append(val)
+            fu, pm = margins(np.array(B["curves"][0]["f"]), np.array(B["curves"][0]["c"])) \
+                if len(B["curves"][0]["f"]) > 1 else (None, None)
+            B.update(ugf=fu, pm=pm, n=k + 1)
+            self._bode_publish(dict(B))
+        fu, pm = B.get("ugf"), B.get("pm")
+        self.log("Bode closed loop: " + (f"unity gain {fu:.1f} Hz, phase margin {pm:.0f} deg" if fu else
+                                         "no unity-gain crossing in the measured range"))
+
+    def _bode_circuit(self, fs, prev):
+        s, r = self.s, self.r
+        S = self.lock_info.get("slope")
+        Sn = abs(S) if S else 1.0
+        iq, p2 = r.iq1, r.pid2
+        # copy of the lock-in chain at baseband (oscillator at 0 Hz: the mixer multiplies by cos(0) = 1)
+        iq.output_direct = "off"
+        iq.amplitude = 0
+        iq.frequency = 0
+        iq.phase = 0
+        iq.input = "asg1"
+        iq.acbandwidth = 0
+        iq.gain = 0
+        iq.bandwidth = [s["lpf_hz"]] * int(s["lpf_order"])
+        iq.quadrature_factor = s["err_gain"]
+        iq.output_signal = "quadrature"
+        # copy of the PID with the loop gains per unit slope: i = UGF, p = P gain (the lock divides by |S|)
+        p2.output_direct = "off"
+        p2.input = "iq1"
+        p2.setpoint = 0
+        p2.p, p2.i = s["p_gain"], s["ugf_hz"]
+        p2.min_voltage, p2.max_voltage = -1.0, 1.0
+        try:
+            p2.inputfilter = [0, 0, 0, 0]
+        except Exception:
+            pass
+        p_reg, i_reg = float(p2.p), float(p2.i)
+        bw = [float(b) for b in np.atleast_1d(iq.bandwidth) if b > 0]
+        L_m = np.ones(len(fs), dtype=complex)
+        for b in bw:
+            L_m = L_m / (1 + 1j * fs / b)
+        C_m = i_reg / (1j * fs) + p_reg
+        hp = float(r.iq0.acbandwidth)
+        hp_fd = abs(1 / (1 + hp / (1j * self._dither()[0]))) if hp > 0 else 1.0
+        B = bode_init("circuit only", fs, [
+            ("lock-in chain (normalized)", "#1f5fa8", L_m), (f"PID x slope (i = {i_reg:.3g} Hz, p = {p_reg:.3g})",
+                                                             "#7d3c98", C_m),
+            ("electronics open loop", "#1e8e3e", L_m * C_m)],
+            title="Circuit-only Bode (spare copies iq1 + pid2 driven by asg1; OUT1 untouched)",
+            note=(f"lock-in at baseband: low-pass {' + '.join(f'{b:.1f}' for b in bw)} Hz, gain x{s['err_gain']:g}; "
+                  f"input high-pass at the dither: x{hp_fd:.3f} (not in the copy). PID with i = UGF, p = P gain: "
+                  f"the lock uses i/|S|" + (f" (|S| = {Sn:.1f}/V)" if S else " (slope not measured yet)") +
+                  ". Driver and cavity are not included."))
+        self._bode_publish(B)
+        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.3g} Hz on iq1 + pid2 (OUT1 untouched)")
+        L0 = None
+        for k, f in enumerate(fs):
+            if self._stop_meas.is_set():
+                self.log(f"Bode stopped after {k} points")
+                break
+            self.meas_progress = f"Bode {k+1}/{len(fs)} at {f:.3g} Hz"
+            # keep the copies' outputs well inside +/-1 V and well above the 14-bit step: linear, so the ratio holds
+            amp = float(np.clip(min(0.25 / max(abs(L_m[k] * C_m[k]), 1e-9), 0.6 / max(abs(L_m[k]), 1e-9)),
+                                1e-3, s["bode_amp_mv"] * 1e-3))
+            self._bode_point_live(f, amp, "off")
+            time.sleep(min(max(3 / f, self._filter_settle()), 1.5))
+            p2.ival = 0
+            X, Y = self._bode_capture("iq1", f, s["bode_cycles"])
+            X2, Z = self._bode_capture("pid2", f, s["bode_cycles"])
+            L, T = Y / X, Z / X2
+            L0 = L0 or L
+            for cv, val in zip(B["curves"], (L / L0, T / L, T / L0)):
+                cv["f"].append(float(f))
+                cv["c"].append(val)
+            fu, pm = margins(np.array(B["curves"][2]["f"]), np.array(B["curves"][2]["c"])) \
+                if len(B["curves"][2]["f"]) > 1 else (None, None)
+            B.update(ugf=fu, pm=pm, n=k + 1, dc_gain=abs(L0))
+            self._bode_publish(dict(B))
+        self.log(f"Bode circuit only: lock-in DC gain {abs(L0 or 0):.3f} V/V" +
+                 (f"; electronics alone: unity gain {B['ugf']:.1f} Hz, phase margin {B['pm']:.0f} deg"
+                  if B.get("ugf") else ""))
+
+
+def fit_sine(t, y, f):
+    """Complex amplitude Z of the component of y at f (y ~ Re(Z exp(2 pi i f t)) + offset + drift),
+    by least squares; the offset and linear drift terms absorb integrator offsets and slow drifts."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    k = max(1, len(t) // 4096)
+    t, y = t[::k], y[::k]
+    w = 2 * np.pi * f * t
+    M = np.column_stack([np.cos(w), np.sin(w), np.ones_like(t), t - t.mean()])
+    c = np.linalg.lstsq(M, y, rcond=None)[0]
+    return complex(c[0], -c[1])
+
+
+def bode_init(mode, fs, models, title, note):
+    """Data for the Bode plot: one curve per (name, colour, model array); measured points are appended."""
+    return dict(mode=mode, title=title, note=note, f_plan=[float(x) for x in fs], n=0, n_total=len(fs), done=False,
+                ugf=None, pm=None, curves=[dict(name=n, color=c, f=[], c=[], model=[complex(v) for v in m])
+                                           for n, c, m in models])
+
+
+def bode_json(B):
+    """Compact plot data (dB, unwrapped degrees) for the browser."""
+    if not B:
+        return None
+    out = dict(mode=B["mode"], title=B["title"], note=B["note"], n=B["n"], n_total=B["n_total"], done=B["done"],
+               ugf=B.get("ugf"), pm=B.get("pm"), fp=[round(x, 5) for x in B["f_plan"]], curves=[])
+    for cv in B["curves"]:
+        d = dict(name=cv["name"], color=cv["color"], f=[round(x, 5) for x in cv["f"]])
+        if cv["c"]:
+            c = np.asarray(cv["c"], dtype=complex)
+            d["db"] = np.round(20 * np.log10(np.maximum(np.abs(c), 1e-12)), 3).tolist()
+            d["ph"] = np.round(np.degrees(np.unwrap(np.angle(c))), 2).tolist()
+        if cv.get("model"):
+            m = np.asarray(cv["model"], dtype=complex)
+            d["mdb"] = np.round(20 * np.log10(np.maximum(np.abs(m), 1e-12)), 3).tolist()
+            d["mph"] = np.round(np.degrees(np.unwrap(np.angle(m))), 2).tolist()
+        out["curves"].append(d)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------

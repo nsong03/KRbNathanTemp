@@ -108,6 +108,10 @@ BLOCKS = [
          params=[P("out2_signal", "pid1.input", widget="select"), P("out2_gain", "pid1.p", inline=False)], opts=[],
          note="pid1 as a pass-through (i = 0, P = gain) from error (iq0), setpoint (pid0), ramp (asg0) or "
               "photodiode (in1) to OUT2, for an external scope."),
+    dict(id="testgen", label="Test sine (asg1)", kind="dsp", x=880, y=86, w=230, h=34, params=[], opts=[],
+         note="asg1, the swept-sine generator of 'Measure Bode plot'. Closed loop: a small sine summed into OUT1 "
+              "(amplitude = Loop excitation x linewidth). Circuit only: it drives spare copies of the blocks "
+              "(iq1, pid2) and is not routed to any output. Off otherwise."),
     dict(id="out2term", label="OUT2", kind="node", x=1222, y=445, w=106, h=40, params=[], opts=[],
          note="OUT2 -> external scope."),
 ]
@@ -117,7 +121,9 @@ BLOCK = {b["id"]: b for b in BLOCKS}
 HOMES = {
     "scope": ["averages", "prominence", "lock_window_ms", "ui_hz", "drive_every"],
     "scope_bar": ["panels", "probe_a", "probe_b"],
-    "measure": ["noise_avg", "na_start_hz", "na_stop_hz", "na_points", "na_amp_frac"],
+    "measure": ["noise_avg", "na_start_hz", "na_stop_hz", "na_points", "na_amp_frac", "bode_start_hz",
+                "bode_stop_hz", "bode_points", "bode_cycles", "bode_amp_mv"],
+    "measure_bar": ["bode_mode"],
 }
 
 OWNER = {}                                         # FIELDS key -> block id (or home name)
@@ -168,6 +174,7 @@ WIRES = [
     dict(id="dith_sum", kind="drv", pts=[(270, 362), (290, 362), (290, 333), (1132, 333), (1132, 193)]),
     dict(id="ramp_sum", kind="drv", pts=[(550, 410), (1148, 410), (1148, 193)]),
     dict(id="out2", kind="mon", pts=[(1100, 465), (1222, 465)]),
+    dict(id="test_sum", kind="drv", pts=[(1110, 103), (1140, 103), (1140, 153)]),
 ]
 
 SWITCHES = [
@@ -195,6 +202,7 @@ PROBES = [
     dict(id="asg0", signal="asg0", x=610, y=410, label="asg0: ramp"),
     dict(id="out1", signal="out1", x=1275, y=100, label="out1: total drive (ramp + dither + PID)"),
     dict(id="out2", signal="out2", x=1160, y=465, label="out2: OUT2 monitor"),
+    dict(id="asg1", signal="asg1", x=1140, y=128, label="asg1: Bode test sine"),
 ]
 PROBE_SIGNALS = [p["signal"] for p in PROBES if p["signal"]]
 
@@ -316,6 +324,7 @@ READBACK = {
     "pid0": ["i", "p", "setpoint", "min_voltage", "max_voltage", "output_direct", "input"],
     "asg0": ["waveform", "frequency", "amplitude", "offset", "output_direct"],
     "pid1": ["input", "p", "output_direct"],
+    "asg1": ["waveform", "frequency", "amplitude", "output_direct"],
 }
 
 
@@ -429,6 +438,7 @@ def diagram_state(snap, pm=None):
             lim.append((f"out {iv*1e3:+.2f} mV", "dim"))
     B["limiter"] = lim
     parts = [n for n, on in (("ramp", hw.get("asg0.output_direct") == "out1"),
+                             ("test sine", hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0),
                              ("dither", hw.get("iq0.output_direct") == "out1"),
                              ("PID", hw.get("pid0.output_direct") == "out1")) if on]
     B["sum"] = []
@@ -461,12 +471,19 @@ def diagram_state(snap, pm=None):
     else:
         B["out2"] = [("off", "dim")]
     B["out2term"] = []
+    if (hw.get("asg1.amplitude") or 0) > 0 and mode == "measuring":
+        a1 = hw["asg1.amplitude"]
+        B["testgen"] = [(f"sine {_f(hw.get('asg1.frequency'), '{:.3g}')} Hz, {a1*1e3:.3g} mV → "
+                         + ("OUT1" if hw.get("asg1.output_direct") == "out1" else "iq1/pid2 copies"), "")]
+    else:
+        B["testgen"] = [("off", "dim")]
     wires = dict(
         pd_in1=True, bp_mix=True, mix_lpf=True, lpf_amp=True, amp_sp=True, nco_phase=True, lo_mix=True,
         sp_pid=hw.get("pid0.input") == "iq0" and bool(hw.get("pid0.i")),
         pid_lim=hw.get("pid0.output_direct") == "out1", lim_sum=hw.get("pid0.output_direct") == "out1",
         sum_out=mode != "off", out_plant=mode != "off", drv_cav=True, cav_pd=True,
-        dith_sum=sw["dither"], ramp_sum=sw["scan"], out2=hw.get("pid1.output_direct") == "out2")
+        dith_sum=sw["dither"], ramp_sum=sw["scan"], out2=hw.get("pid1.output_direct") == "out2",
+        test_sum=hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0)
     busy = mode in BUSY
     swd = {}
     for k, on in sw.items():

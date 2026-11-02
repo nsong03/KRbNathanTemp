@@ -269,6 +269,71 @@ async def main():
         check("Measure noise ran", "noise: residual detuning" in lg)
         check("Measure loop ran", "loop: unity gain" in lg)
         await pg.screenshot(path="v4_7_diag.png", full_page=True)
+
+        # ---- swept-sine Bode plot, point by point ----
+        print("--- Bode plot")
+        JS_BODE = """() => { const gd = document.querySelector('#bodefig .js-plotly-plot');
+          if (!gd || !gd.layout || !gd.data) return {n: -1, title: ''};
+          const m = gd.data.filter(d => d.mode === 'lines+markers');
+          return {n: m.length ? m[0].x.length : 0, title: (gd.layout.title || {}).text || ''}; }"""
+        await pg.locator(pid(type="hdr", b="measure")).click()
+        await pg.wait_for_timeout(300)
+        for k, v in (("bode_points", "10"), ("bode_start_hz", "4"), ("bode_stop_hz", "300"), ("na_amp_frac", "0.1")):
+            loc = pg.locator(f"#s-{k}")
+            await loc.fill(v); await loc.press("Enter"); await pg.wait_for_timeout(400)
+        await pg.locator(pid(type="popx", b="measure")).click()
+
+        async def bode_wait_done(timeout=150):
+            for _ in range(timeout * 2):
+                st = await pg.evaluate(JS_BODE)
+                if "measuring" not in st["title"] and st["n"] > 0:
+                    return st
+                await pg.wait_for_timeout(500)
+            return await pg.evaluate(JS_BODE)
+
+        await pg.click("#btn-bode")
+        seen = []                                      # point counts drawn while the sweep runs
+        stat = ""
+        for _ in range(240):
+            st = await pg.evaluate(JS_BODE)
+            if st["n"] >= 0 and (not seen or st["n"] != seen[-1]):
+                seen.append(st["n"])
+            if "Bode" in await status():
+                stat = await status()
+            if st["n"] >= 4:
+                break
+            await pg.wait_for_timeout(250)
+        check("closed-loop Bode fills in point by point", len([n for n in seen if 0 < n < 10]) >= 3,
+              f"point counts seen: {seen}")
+        check("status shows the sweep progress", "Bode" in stat and "MEASURING" in stat, stat[:70])
+        await pg.locator("#rb-testgen").scroll_into_view_if_needed()
+        await pg.screenshot(path="v4_8_bode_running.png", clip={"x": 0, "y": 0, "width": 1500, "height": 560})
+        st = await bode_wait_done()
+        check("closed-loop Bode completes with UGF and phase margin", st["n"] == 10 and "unity gain" in st["title"],
+              st["title"][-70:])
+        await pg.locator("#bodefig").scroll_into_view_if_needed()
+        await pg.locator("#bodefig").screenshot(path="v4_9_bode_closed.png")
+        await pg.locator("#s-bode_mode").click()
+        await pg.wait_for_timeout(250)
+        await pg.locator(".dash-dropdown-option", has_text="circuit only").first.click()
+        await pg.wait_for_timeout(700)
+        await pg.click("#btn-bode")
+        await pg.wait_for_timeout(2500)
+        st = await bode_wait_done()
+        check("circuit-only Bode completes (electronics UGF and margin)", st["n"] == 10 and "Circuit-only" in st["title"]
+              and "unity gain" in st["title"], st["title"][-80:])
+        check("still locked after the circuit-only sweep", "LOCKED" in await status())
+        await pg.locator("#bodefig").screenshot(path="v4_10_bode_circuit.png")
+        await pg.locator(pid(type="hdr", b="measure")).click()
+        await pg.wait_for_timeout(300)
+        loc = pg.locator("#s-bode_points")
+        await loc.fill("30"); await loc.press("Enter"); await pg.wait_for_timeout(400)
+        await pg.locator(pid(type="popx", b="measure")).click()
+        await pg.click("#btn-bode")
+        await pg.wait_for_timeout(4000)
+        await pg.click("#btn-stop")
+        st = await bode_wait_done(60)
+        check("Stop ends the sweep early", "stopped" in st["title"], st["title"][-60:])
         await flip("lock")
         check("Lock switch off -> HELD", await wait_status("HELD", 10))
         print("analysis:", (await pg.locator("#analysis").inner_text())[-300:])

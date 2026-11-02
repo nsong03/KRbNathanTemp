@@ -11,6 +11,10 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 - **v4** (2026-11-01): the settings sidebar is now a Moku-style schematic of the real FPGA chain, with switches
   (Scan, Dither, Lock, Output, Auto-relock), probe points (2 scope channels) and Lock Assist crosshairs.
   Plan and register map: `docs/schematic_plan.md`; screenshots: `docs/screenshots/`. Tested on the fake only.
+- **Measure Bode plot** (2026-11-02): swept-sine Bode with the internal generator (asg1) and scope, filled in point
+  by point, with Stop. *closed loop* (locked): G, disturbance suppression S, closed-loop T and the plant, with the
+  model, UGF and phase margin. *circuit only*: the lock-in chain and PID measured on spare copies of the blocks,
+  OUT1 untouched. Tested on the fake only.
 - `app/cavity_lock_app.py` **v3** added speed and diagnostics:
   - v2 locks robustly on the real hardware.
   - v3 adds speed (about 10 redraws/s), *Measure noise*, *Measure loop* and the loop model. It is tested against the fake; check it on hardware.

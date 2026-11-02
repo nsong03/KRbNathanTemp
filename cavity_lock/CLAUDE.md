@@ -58,6 +58,18 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 - Diagnostics while locked:
   - `_measure_noise()`: Welch spectra in two bands, with band rms.
   - `_measure_loop()`: PyRPL network analyzer on `pid0` and `iq0`. With T = c/x, G = −T/(1+T) and P = (e/x)/(1+T).
+- **Measure Bode plot** (`_measure_bode`, toolbar button + mode selector + Stop): swept sine from `asg1` recorded with
+  the scope (2 channels: asg1 and the response), complex amplitude by least squares at the exact frequency
+  (`fit_sine`: cos, sin, offset, drift). Filled in point by point (`ctl.bode`, `bode_seq` → `dcc.Store("bode")` →
+  clientside `BODE_JS`); Stop is a `threading.Event` set from the UI thread (the sweep blocks the command queue).
+  - `closed loop` (locked only): asg1 → OUT1 sum, amplitude = `na_amp_frac` × linewidth. Captures (asg1, pid0) and
+    (asg1, iq0) per point: G = −T/(1+T), S = 1+T, closed loop = −T, plant = (e/x)/S. Stops and holds if the PID
+    output reaches the clamp. At low frequency G comes from 1 + c/x (the loop cancels the sine), so it needs enough
+    excitation: 0.03 linewidth gave ±20 % at 4 Hz on the fake, 0.1 gave ±3 %.
+  - `circuit only` (any mode, OUT1 untouched; asg1 output stays off): spare copies `iq1` (oscillator at 0 Hz → the
+    lock-in chain at baseband: same low-pass and integer gain, no high-pass) → `pid2` (i = UGF, p = P gain, i.e. the
+    lock's gains per unit slope). Per-point amplitude keeps the copies' outputs ≈ 0.25 V (linear, so ratios hold).
+  - Stop frequency is limited to 0.45 × dither frequency.
 - UI:
   - The server sends compact data in `dcc.Store("frame")`.
   - A **clientside** callback (`SCOPE_JS`) draws with `Plotly.react` using **SVG `scatter`**. `scattergl` redraws about 2× slower here.
@@ -96,6 +108,13 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
     edits every block parameter through its own input, flips every switch (incl. the Scan-while-locked confirm),
     places probes, clicks a crosshair, locks with the switch, runs both measurements, redraws/s, screenshots.
   - `tick_timing.py`, `render_timing.py`, `prof_tick.py` and `bench_v2style.py` are performance probes.
+- Bode tests: `test_v3.py` checks that the circuit-only sweep matches its model (< 5 %, < 5°), that asg1 is never
+  routed to an output during it, that the closed-loop G equals the fake's true loop gain below 100 Hz (< 5 %), and Stop.
+  `ui_v4.py` checks that the plot fills in point by point, both modes complete, and Stop.
+- The fake scope records **after** it is armed (untriggered), like the hardware; it used to return the past window.
+- Results 2026-11-02 (Bode added, a slower container): `test_v3.py` 63/63; `ui_v4.py` 56/58 functional checks pass,
+  the 2 redraw-rate checks fail on that host for the old and the new code alike (A/B: 5–6/s both; tick 7.0 ms old vs
+  7.5 ms new there).
 - Last results (v4, 2026-11-01, Linux sandbox, fake):
   - `test_v3.py`: 51/51 checks pass. `ui_v4.py`: 52/52 checks pass.
   - Lock, noise, loop (UGF 9.5–12.5 Hz, phase margin 87°), relock and lock-from-held are OK.
@@ -103,6 +122,7 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   - Tick callback 3.0 ms incl. frame JSON (`prof_tick.py`); diagram state + hash 0.06 ms.
 
 ## Pitfalls already hit
+- Fake: `ts[1] - ts[0]` on epoch timestamps (~1.8e9 s) loses precision (float64 step 0.24 µs); use the mean spacing.
 - Dash 4 wraps `dcc.Input(type="number")` in `.dash-input-container` with ± steppers; size that container, not the input.
 - Every FIELDS key needs exactly one `s-{key}` component in the layout, or the tick callback errors ("ID not found").
 - A switch click sends the desired state (`not ctl.switches()[name]`), so a double click cannot toggle twice.

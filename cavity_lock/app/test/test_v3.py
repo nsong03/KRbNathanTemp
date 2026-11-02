@@ -215,6 +215,51 @@ check("probe capture of out2 / pid0 reaches the scope panel", d.get("a_name") ==
       and d.get("a") is not None and abs(np.mean(d["a"]) - np.mean(d["a"])) == 0, str(d.get("pair")))
 apply(probe_a="out1", probe_b="asg0", drive_every=3)
 
+print("--- Bode plot (swept sine, asg1 + scope)")
+apply(bode_mode="closed loop", bode_points=8, bode_start_hz=4.0, bode_stop_hz=300.0, bode_cycles=6)
+ctl.submit("bode"); wait_idle()
+check("closed-loop Bode refused while not locked", ctl.mode == "acquire" and ctl.r.asg1.output_direct == "off")
+outs = []
+_setup = ctl.r.asg1.setup
+ctl.r.asg1.setup = lambda **kw: (outs.append(kw.get("output_direct")), _setup(**kw))[1]
+apply(bode_mode="circuit only")
+ctl.submit("bode"); time.sleep(0.5); wait_idle(120)
+B = ctl.bode
+check("circuit only: every point measured, mode restored", B and B["done"] and B["n"] == 8 and ctl.mode == "acquire",
+      f"n={B and B['n']}")
+check("circuit only: asg1 never routed to an output (OUT1 untouched)", outs and set(outs) == {"off"}, str(set(outs)))
+for cv in B["curves"]:
+    r_ = np.abs(np.array(cv["c"]) / np.array(cv["model"][:len(cv["c"])]))
+    ph = np.degrees(np.angle(np.array(cv["c"]) / np.array(cv["model"][:len(cv["c"])])))
+    check(f"circuit only: '{cv['name'][:28]}' matches its model (|ratio-1| < 5 %, < 5 deg)",
+          np.all(np.abs(r_ - 1) < 0.05) and np.all(np.abs(ph) < 5), f"{np.round(r_, 3)}")
+check("circuit only: electronics UGF = loop bandwidth setting", B["ugf"] and abs(B["ugf"] - ctl.s["ugf_hz"]) < 0.1 *
+      ctl.s["ugf_hz"], f"{B['ugf']}")
+ctl.r.asg1.setup = _setup
+ctl.submit("lock"); time.sleep(0.5); ok = wait_mode("locked", 60)
+apply(bode_mode="closed loop", na_amp_frac=0.1)   # low frequencies: G comes from 1 + c/x, so excite enough
+ctl.submit("bode"); time.sleep(0.5); wait_idle(180)
+B = ctl.bode
+f_ = np.array(B["curves"][0]["f"]); G_ = np.array(B["curves"][0]["c"]); S_ = np.array(B["curves"][1]["c"])
+eng_S = float((eng.err_raw(eng.vc + 1e-5) - eng.err_raw(eng.vc - 1e-5))[0] / 2e-5)
+Gt = -(ctl.r.pid0.i / (1j * f_)) * eng_S
+for bw_ in [b for b in ctl.r.iq0.bandwidth if b > 0]:
+    Gt = Gt / (1 + 1j * f_ / bw_)
+lowf = f_ < 100
+check("closed loop: every point, still locked, asg1 off afterwards", ok and B["n"] == 8 and ctl.mode == "locked"
+      and ctl.r.asg1.output_direct == "off")
+check("closed loop: measured G = the fake's true loop gain below 100 Hz (5 %)",
+      np.all(np.abs(np.abs(G_[lowf] / Gt[lowf]) - 1) < 0.05), f"{np.round(np.abs(G_ / Gt), 3)}")
+check("closed loop: disturbance suppressed at low frequency (|S| < 0.5 at 4 Hz)", abs(S_[0]) < 0.5, f"{abs(S_[0]):.2f}")
+check("closed loop: UGF and phase margin found", B["ugf"] and 5 < B["ugf"] < 15 and B["pm"] > 45,
+      f"UGF {B['ugf']}, PM {B['pm']}")
+apply(bode_points=30, bode_start_hz=2.0, na_amp_frac=0.03)
+ctl.submit("bode"); time.sleep(3.0)
+ctl.stop_measurement(); wait_idle(60)
+check("Stop ends the sweep early and the lock stays", ctl.bode["done"] and ctl.bode["n"] < 30 and ctl.mode == "locked"
+      and ctl.r.asg1.output_direct == "off", f"n={ctl.bode['n']}")
+ctl.submit("switch", ("scan", True)); wait_idle(); time.sleep(1.5)
+
 print("--- Lock Assist crosshairs")
 time.sleep(1.0)
 an = ctl.analysis

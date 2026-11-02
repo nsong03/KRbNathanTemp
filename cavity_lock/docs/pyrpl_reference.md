@@ -53,6 +53,13 @@ Latency, from the Verilog simulation and datasheets:
 
 Unused modules (`asg1`, `pid2`, `iq1`, `iq2`) get `output_direct = "off"` at start-up so that nothing else writes to OUT1.
 
+"Measure Bode plot" uses `asg1`, `iq1` and `pid2` (reserved with `.owner`). Assumptions to check on hardware **(verify)**:
+- `asg1.setup(waveform="sin", ...)` with `output_direct="off"` still produces the internal signal `asg1` for the scope
+  and for `iq1.input`.
+- `iq1.frequency = 0` makes the mixer multiply by cos(phase), so `iq1` is the input through the low-pass stages and
+  `quadrature_factor` (the app reports the measured DC gain of this copy; the plot normalizes it).
+- The scope accepts `asg1`, `iq1` and `pid2` as inputs (they are DSP signals like `iq0` and `pid0`).
+
 ## Signals that can and cannot be probed
 The scope sees only DSP signal names. With the app's routing:
 

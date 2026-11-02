@@ -37,11 +37,12 @@ body { margin: 0; font-family: sans-serif; }
 .blk { position: absolute; box-sizing: border-box; background: white; border: 1.5px solid #555; border-radius: 6px;
        z-index: 2; font-size: 12px; padding: 0 6px 4px; overflow: hidden; }
 .blk.plant { background: #eeeeee; border: 1.5px dashed #aaa; color: #777; }
-.blk.plant .hdr, .blk.plant .rb { display: inline-block; margin-right: 6px; }
+.blk.plant .hdr, .blk.plant .rb, .b-testgen .hdr, .b-testgen .rb { display: inline-block; margin-right: 6px; }
 .blk.node { border-radius: 50%%; padding: 0; display: flex; align-items: center; justify-content: center;
             font-size: 20px; cursor: pointer; }
 .blk.node.term { border-radius: 5px; font-size: 13px; font-weight: bold; flex-direction: column; }
 .blk.node .rb { font-size: 10px; text-align: center; }
+.blk.node.term .rb { white-space: normal; padding: 0 3px; }
 .hdr { font-weight: bold; cursor: pointer; padding: 3px 0 2px; line-height: 1.15; }
 .hdr:hover { color: #1f5fa8; text-decoration: underline; }
 .rb { font-family: Consolas, Menlo, monospace; font-size: 10.5px; line-height: 1.3; white-space: nowrap; }
@@ -228,6 +229,49 @@ function(d, g) {
 }
 """
 
+# Swept-sine Bode plot, filled in point by point: measured (solid, markers) over the model (dotted).
+BODE_JS = """
+function(B) {
+  var nu = window.dash_clientside.no_update;
+  if (!B) { return nu; }
+  var data = [];
+  B.curves.forEach(function(c) {
+    if (c.mdb) {
+      data.push({type: 'scatter', mode: 'lines', x: B.fp, y: c.mdb, name: c.name + ' (model)', legendgroup: c.name,
+                 showlegend: false, line: {color: c.color, dash: 'dot', width: 1.5}, xaxis: 'x', yaxis: 'y'});
+      data.push({type: 'scatter', mode: 'lines', x: B.fp, y: c.mph, legendgroup: c.name, showlegend: false,
+                 line: {color: c.color, dash: 'dot', width: 1.5}, xaxis: 'x2', yaxis: 'y2', hoverinfo: 'skip'});
+    }
+    data.push({type: 'scatter', mode: 'lines+markers', x: c.f, y: c.db || [], name: c.name, legendgroup: c.name,
+               line: {color: c.color, width: 2}, marker: {size: 5}, xaxis: 'x', yaxis: 'y'});
+    data.push({type: 'scatter', mode: 'lines+markers', x: c.f, y: c.ph || [], legendgroup: c.name, showlegend: false,
+               line: {color: c.color, width: 2}, marker: {size: 5}, xaxis: 'x2', yaxis: 'y2'});
+  });
+  var prog = B.done ? (B.n < B.n_total ? ' (stopped at ' + B.n + '/' + B.n_total + ')' : '')
+                    : '  measuring ' + B.n + '/' + B.n_total + ' ...';
+  var res = (B.ugf ? '   unity gain ' + B.ugf.toFixed(1) + ' Hz, phase margin ' + B.pm.toFixed(0) + ' deg' : '');
+  var shapes = [{type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: 0, y1: 0, line: {color: 'gray', width: 1}},
+                {type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y2', y0: -180, y1: -180,
+                 line: {color: 'red', width: 1, dash: 'dot'}}];
+  if (B.ugf) {
+    shapes.push({type: 'line', xref: 'x', x0: B.ugf, x1: B.ugf, yref: 'paper', y0: 0, y1: 1,
+                 line: {color: '#1e8e3e', width: 1, dash: 'dash'}});
+  }
+  var lay = {title: {text: B.title + prog + res, font: {size: 14}, x: 0.01, xanchor: 'left'}, height: 600,
+             template: 'plotly_white', margin: {l: 60, r: 20, t: 40, b: 120}, uirevision: 'bode-' + B.mode,
+             shapes: shapes,
+             xaxis: {type: 'log', anchor: 'y', domain: [0, 1], showticklabels: false},
+             xaxis2: {type: 'log', anchor: 'y2', matches: 'x', title: {text: 'frequency [Hz]'}},
+             yaxis: {domain: [0.52, 1], title: {text: 'magnitude [dB]'}},
+             yaxis2: {domain: [0, 0.45], title: {text: 'phase [deg]'}},
+             legend: {orientation: 'h', y: -0.13, x: 0, xanchor: 'left', yanchor: 'top'},
+             annotations: [{text: B.note, xref: 'paper', yref: 'paper', x: 0, y: -0.24, showarrow: false,
+                            xanchor: 'left', font: {size: 11, color: '#555'}}],
+             plot_bgcolor: 'white', paper_bgcolor: 'white'};
+  return {data: data, layout: lay};
+}
+"""
+
 # Popovers: clicking a block title opens its popover (and closes the others); x or a second click closes it.
 POP_JS = """
 function(hdr, px, styles) {
@@ -326,7 +370,7 @@ def build_app(ctl, A):
                                      style={"fontSize": "11px", "padding": "1px 6px", "cursor": "pointer"}))
         if knobs:
             kids.append(html.Div(knobs, className="inl"))
-        return html.Div(kids, className="blk " + b["kind"], style=pos)
+        return html.Div(kids, className=f"blk {b['kind']} b-{b['id']}", style=pos)
 
     def block_pop(b):
         rest = [p["key"] for p in b["params"] if not p["inline"]]
@@ -389,6 +433,12 @@ def build_app(ctl, A):
                 html.Div(id="status", style={"fontSize": "16px", "fontWeight": "bold", "flex": "1"}),
                 html.Button("Measure noise", id="btn-noise", className="btn"),
                 html.Button("Measure loop", id="btn-loop", className="btn"),
+                html.Button("Measure Bode plot", id="btn-bode", className="btn",
+                            title="swept sine from the internal generator (asg1), recorded with the scope, point by "
+                                  "point. closed loop: while locked, a small sine at OUT1. circuit only: spare copies "
+                                  "of the lock-in and PID, OUT1 untouched"),
+                control("bode_mode", ""),
+                html.Button("Stop", id="btn-stop", className="btn", title="stop the running Bode sweep"),
                 html.Span("⚙", id={"type": "hdr", "b": "measure"}, className="gear", title="measurement settings"),
                 html.Button("Save settings", id="btn-save", className="btn"),
                 html.Button("Load settings", id="btn-load", className="btn"),
@@ -413,6 +463,7 @@ def build_app(ctl, A):
             dcc.Graph(id="history", config={"displaylogo": False}),
             dcc.Graph(id="noise", config={"displaylogo": False}, style={"display": "none"}),
             dcc.Graph(id="loopfig", config={"displaylogo": False}, style={"display": "none"}),
+            dcc.Graph(id="bodefig", config={"displaylogo": False}, style={"display": "none"}),
             html.Div([
                 html.Div(id="analysis", style={"flex": "1", "fontSize": "13px", "whiteSpace": "pre-wrap"}),
                 html.Pre(id="log", style={"flex": "1", "fontSize": "12px", "height": "26vh", "overflowY": "auto",
@@ -426,6 +477,8 @@ def build_app(ctl, A):
             dcc.Store(id="frame"),
             dcc.Store(id="frame-seq", data=-1),
             dcc.Store(id="meas-seq", data=-1),
+            dcc.Store(id="bode"),
+            dcc.Store(id="bode-seq", data=-1),
             dcc.Store(id="diag"),
             dcc.Store(id="diag-key", data=""),
             dcc.Store(id="diag-ack"),
@@ -449,7 +502,12 @@ def build_app(ctl, A):
         return time.time()
 
     btn_cmd = {"btn-phase": "autophase", "btn-save": "save", "btn-load": "load", "btn-tallest": "tallest",
-               "btn-noise": "noise", "btn-loop": "loop"}
+               "btn-noise": "noise", "btn-loop": "loop", "btn-bode": "bode"}
+
+    @app.callback(Output("ack", "data", allow_duplicate=True), Input("btn-stop", "n_clicks"), prevent_initial_call=True)
+    def on_stop(_):
+        ctl.stop_measurement()                        # a flag, not a queued command: the sweep is running
+        return time.time()
 
     @app.callback(Output("ack", "data", allow_duplicate=True), [Input(b, "n_clicks") for b in btn_cmd],
                   prevent_initial_call=True)
@@ -501,6 +559,7 @@ def build_app(ctl, A):
                             State({"type": "pop", "b": ALL}, "style"), prevent_initial_call=True)
     app.clientside_callback(SCOPE_JS, [Output("scope", "figure"), Output("history", "figure")], Input("frame", "data"))
     app.clientside_callback(DIAG_JS, Output("diag-ack", "data"), Input("diag", "data"), State("geom", "data"))
+    app.clientside_callback(BODE_JS, Output("bodefig", "figure"), Input("bode", "data"))
 
     # ---- the tick: compact data only ----
     def r5(a, scale=1.0):
@@ -559,11 +618,12 @@ def build_app(ctl, A):
          Output("target-text", "children"), Output("analysis", "children"), Output("log", "children"),
          Output("noise", "style"), Output("loopfig", "style"),
          Output("history", "style"), Output("meas-seq", "data"), Output("tick", "interval"),
-         Output("diag", "data"), Output("diag-key", "data")]
+         Output("diag", "data"), Output("diag-key", "data"), Output("bode", "data"), Output("bode-seq", "data"),
+         Output("bodefig", "style")]
         + [Output(f"s-{k}", "value") for k in KEYS] + [Output("synced", "data")],
         Input("tick", "n_intervals"), State("synced", "data"), State("frame-seq", "data"), State("meas-seq", "data"),
-        State("diag-key", "data"))
-    def on_tick(_, synced, frame_seq, meas_seq, diag_key):
+        State("diag-key", "data"), State("bode-seq", "data"))
+    def on_tick(_, synced, frame_seq, meas_seq, diag_key, bode_seq):
         snap = ctl.snapshot()
         s, mode, an, li = snap["settings"], snap["mode"], snap["analysis"] or {}, snap["lock"]
         new_frame = snap["seq"] != frame_seq or snap["version"] != synced
@@ -584,7 +644,9 @@ def build_app(ctl, A):
             extra = f"   setpoint held at {snap['history'][-1][4]*1e3:+.3f} mV" if snap["history"] else ""
         else:
             extra = ""
-        extra += f"   {snap['fps']:.1f} traces/s" if snap["fps"] else ""
+        if mode == "measuring" and snap["meas_progress"]:
+            extra = "   " + snap["meas_progress"]
+        extra += f"   {snap['fps']:.1f} traces/s" if snap["fps"] and mode != "measuring" else ""
         status = html.Span([html.Span(label, style={"color": color}), html.Span(extra, style={"fontSize": "13px"})])
         if an.get("target") is not None and mode in ("acquire", "busy"):
             p = an["peaks"][an["target"]]
@@ -637,7 +699,10 @@ def build_app(ctl, A):
             interval = no_update
         return [frame, snap["seq"], status, ttxt, "\n".join(lines), "\n".join(reversed(snap["logs"][-80:])),
                 {} if show_noise else {"display": "none"}, {} if show_loop else {"display": "none"},
-                hist_style, snap["meas_seq"] if meas_new else no_update, interval, diag_out, key_out] + vals
+                hist_style, snap["meas_seq"] if meas_new else no_update, interval, diag_out, key_out,
+                A.bode_json(snap["bode"]) if snap["bode_seq"] != bode_seq else no_update,
+                snap["bode_seq"] if snap["bode_seq"] != bode_seq else no_update,
+                {} if "Bode (swept)" in s["panels"] else {"display": "none"}] + vals
 
     # The measurement plots get their own callbacks: sending both figures inside the 10 Hz tick response made
     # the browser drop the whole update (seen with Dash 4.5), freezing the page.

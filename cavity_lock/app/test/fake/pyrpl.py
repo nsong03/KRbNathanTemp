@@ -62,9 +62,18 @@ class ASG:
         self.t0 = time.time()
 
     def value(self, t):
+        """What this ASG adds to OUT1 (zero unless routed there)."""
         if self.output_direct == "off" or self.amplitude == 0:
             return np.zeros_like(np.asarray(t, dtype=float))
+        return self.raw(t)
+
+    def raw(self, t):
+        """The ASG's internal signal (what the scope sees as 'asg0' / 'asg1'), routed or not."""
+        if self.amplitude == 0:
+            return np.zeros_like(np.asarray(t, dtype=float)) + self.offset
         ph = ((np.asarray(t) - self.t0) * self.frequency) % 1.0
+        if self.waveform in ("sin", "cos"):
+            return self.offset + self.amplitude * np.sin(2 * np.pi * ph + (np.pi / 2 if self.waveform == "cos" else 0))
         if self.waveform == "halframp":
             return self.offset + self.amplitude * (2 * ph - 1)                 # sawtooth from -1
         return self.offset + self.amplitude * (1 - 4 * np.abs(ph - 0.5))      # triangle from -1
@@ -124,7 +133,7 @@ class Engine:
     def step(self, t):
         self.vc += 0.0002 * DT + 0.0002 * math.sqrt(DT) * self.rng.standard_normal()
         p0 = self.rp.pid0
-        asg = float(self.rp.asg0.value(t))
+        asg = float(self.rp.asg0.value(t)) + float(self.rp.asg1.value(t))
         pid_out = float(np.clip(p0.ival, p0.min_voltage, p0.max_voltage)) if p0.output_direct != "off" else 0.0
         v = asg + pid_out
         y = float(self.err_raw(v)[0])
@@ -139,8 +148,34 @@ class Engine:
         if len(self.hist) > 40000:
             del self.hist[:20000]
 
+    def copies(self, ts):
+        """The spare iq1 -> pid2 chain driven by an ASG (circuit-only Bode). iq1 with its oscillator at 0 Hz is
+        input x cos(phase) through its low-pass stages and integer gain; pid2 is P + I of its input."""
+        rp = self.rp
+        iq, p2 = rp.iq1, rp.pid2
+        n, dt = len(ts), float(ts[-1] - ts[0]) / (len(ts) - 1)   # not ts[1]-ts[0]: epoch times lose precision
+        bws = [b for b in np.atleast_1d(iq.bandwidth) if b > 0]
+        npre = int(min(8 / (2 * math.pi * min(bws)) if bws else 0.0, 0.5) / dt) + 1
+        tf = np.concatenate([ts[0] - np.arange(npre, 0, -1) * dt, ts])
+        src = {"asg0": rp.asg0.raw(tf), "asg1": rp.asg1.raw(tf)}
+        x = src.get(iq.input, np.zeros(len(tf)))
+        if iq.acbandwidth > 0:
+            a = math.exp(-2 * math.pi * iq.acbandwidth * dt)
+            x = lfilter([a, -a], [1, -a], x)
+        y = x * (math.cos(math.radians(iq.phase)) if iq.frequency == 0 else 0.0)
+        for b in bws:
+            a = 1 - math.exp(-2 * math.pi * b * dt)
+            y = lfilter([a], [1, -(1 - a)], y)
+        y = y * iq.quadrature_factor
+        u = y if p2.input == "iq1" else src.get(p2.input, np.zeros(len(tf)))
+        u = u - p2.setpoint
+        out = np.clip(p2.p * u + p2.ival + 2 * math.pi * p2.i * np.cumsum(u) * dt, p2.min_voltage, p2.max_voltage)
+        return y[npre:], out[npre:]
+
     # scope traces
-    def traces(self, names, duration, trigger):
+    def traces(self, names, duration, trigger, t_start=None):
+        """Scope data. Triggered on asg0: computed analytically. Untriggered: the recorded window
+        [t_start, t_start + duration] of the simulation (the real scope records after it is armed)."""
         n = 2 ** 14
         with self.lock:
             asg = self.rp.asg0
@@ -168,15 +203,18 @@ class Engine:
                        "out1": v + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)}
                 ready_at = t0 + duration
             else:
-                h = np.array(self.hist[-int(duration / DT) - 2:])
+                h = np.array(self.hist[-int((self.t - (t_start or self.t) + duration) / DT) - 4:])
                 tt = h[:, 0]
-                ts = np.linspace(tt[-1] - duration, tt[-1], n)
+                t_end = min(tt[-1], (t_start or tt[-1] - duration) + duration)
+                ts = np.linspace(t_end - duration, t_end, n)
                 d = self.dither_pp() / 2
                 drive = np.interp(ts, tt, h[:, 1])
                 sig = {"in1": np.interp(ts, tt, h[:, 2]), "iq0": np.interp(ts, tt, h[:, 3]),
                        "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.value(ts),
                        "out1": drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)}
                 ready_at = now + duration          # an untriggered trace still takes its duration to record
+        sig["asg1"] = self.rp.asg1.raw(ts)
+        sig["iq1"], sig["pid2"] = self.copies(ts)
         p1 = self.rp.pid1                                # OUT2 monitor: pid1 pass-through (P only, clamped)
         src = sig.get(p1.input, np.zeros(n)) if p1.output_direct == "out2" else np.zeros(n)
         sig["out2"] = np.clip(p1.p * (src - p1.setpoint), p1.min_voltage, p1.max_voltage)
@@ -190,7 +228,8 @@ class Scope:
     def __init__(self, eng):
         object.__setattr__(self, "eng", eng)
         for k, v in dict(input1="in1", input2="in2", duration=self.durations[10], trigger_source="immediately",
-                         trigger_delay=0.0, average=True, rolling_mode=False, _data=None, _ready_at=0.0).items():
+                         trigger_delay=0.0, average=True, rolling_mode=False, _data=None, _ready_at=0.0,
+                         _arm=None).items():
             object.__setattr__(self, k, v)
 
     def __setattr__(self, k, v):
@@ -206,6 +245,11 @@ class Scope:
     def _start_acquisition(self):
         lan()
         object.__setattr__(self, "_data", None)
+        if self.trigger_source == "immediately":       # record from now on; read out when complete
+            object.__setattr__(self, "_arm", (self.eng.t, [self.input1, self.input2], self.duration))
+            object.__setattr__(self, "_ready_at", time.time() + self.duration)
+            return
+        object.__setattr__(self, "_arm", None)
         d, r = self.eng.traces([self.input1, self.input2], self.duration, self.trigger_source)
         object.__setattr__(self, "_data", d)
         object.__setattr__(self, "_ready_at", r)
@@ -215,6 +259,12 @@ class Scope:
         return time.time() >= self._ready_at
 
     def _get_curve(self):
+        if self._data is None and self._arm is not None:
+            t0, names, dur = self._arm
+            while self.eng.t < t0 + dur:                 # the simulation may run a few ms behind the clock
+                time.sleep(0.001)
+            d, _ = self.eng.traces(names, dur, "immediately", t_start=t0)
+            object.__setattr__(self, "_data", d)
         return np.array(self._data)
 
     _start_trace_acquisition = _start_acquisition         # PyRPL 0.9.9 names
