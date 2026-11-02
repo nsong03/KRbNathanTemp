@@ -21,7 +21,9 @@ CANVAS_W, CANVAS_H = 1340, 515
 def P(key, attr, live="always", inline=True, widget=None):
     """A block parameter: FIELDS key -> PyRPL attribute it writes ('module.attr'; None = display only).
     live: when the register is written: always | acquire (scan on) | lock_ctx (dither in its lock context) |
-    locked (loop closed)."""
+    locked (loop closed) | bp (band-pass on) | locked_d (locked with D on).
+    widget: ladder:<lpf|ac0|pidf|pidf0> = dropdown of the FPGA's valid corners (0: with 'off'), radio:a,b = radio
+    buttons, int = integer input, select = dropdown of FIELDS options."""
     return dict(key=key, attr=attr, live=live, inline=inline, widget=widget)
 
 
@@ -42,16 +44,25 @@ BLOCKS = [
          note="Bandwidth of driver + PZT (one pole). Used by the loop model and the predicted phase margin "
               "only; measure it with Measure loop."),
     # signal chain
-    dict(id="bandpass", label="Band-pass (AC high-pass)", kind="dsp", x=20, y=125, w=140, h=110,
-         params=[P("ac_hz", "iq0.acbandwidth")], opts=[],
-         note="iq0's input high-pass: 1 stage, 1st order, corner on a factor-2 ladder. Together with the "
-              "low-pass after the mixer it makes the chain a band-pass around the dither frequency. "
-              "(No true band-pass or notch filter is used.)"),
+    dict(id="bandpass", label="Band-pass", kind="dsp", x=20, y=125, w=140, h=110,
+         params=[P("bp_on", "iq0.input"),
+                 P("bp_hp_hz", "pid2.inputfilter", live="bp", inline=False, widget="ladder:pidf"),
+                 P("bp_hp_order", "pid2.inputfilter", live="bp", inline=False, widget="radio:0,1,2"),
+                 P("bp_lp_hz", "pid2.inputfilter", live="bp", inline=False, widget="ladder:pidf"),
+                 P("bp_lp_order", "pid2.inputfilter", live="bp", inline=False, widget="radio:0,1,2"),
+                 P("ac_hz", "iq0.acbandwidth", inline=False, widget="ladder:ac0")], opts=[],
+         note="A real band-pass on IN1: pid2 as a pass-through (P = 1, I = 0) whose 4-stage input filter holds the "
+              "high-pass and low-pass stages (1st order each, corners from the FPGA's list); iq0 then takes its "
+              "input from pid2 instead of in1. Latency (4 + 1 per high-pass + 2 per low-pass) x 8 ns. Off: iq0 "
+              "reads in1 directly. The AC high-pass is iq0's own single input stage (always there). Pick the "
+              "high-pass below and the low-pass above the dither frequency; the dither 2nd harmonic (2 f) and "
+              "DC are then rejected before the mixer."),
     dict(id="mixer", label="x", kind="node", x=196, y=153, w=40, h=40, params=[], opts=[],
          note="iq0 mixer: IN1 (high-passed) times the LO. Demodulation source = Modulation: the LO is the "
               "dither oscillator itself, delayed by the phase block. iq0.input = in1."),
     dict(id="lowpass", label="Low-pass", kind="dsp", x=268, y=125, w=150, h=110,
-         params=[P("lpf_hz", "iq0.bandwidth"), P("lpf_order", "iq0.bandwidth", widget="radio")], opts=[],
+         params=[P("lpf_hz", "iq0.bandwidth", widget="ladder:lpf"),
+                 P("lpf_order", "iq0.bandwidth", widget="radio:1,2")], opts=[],
          note="iq0 low-pass after the mixer: order 1 or 2, each stage 1st order (6 dB/oct per stage), corners "
               "on a factor-2 ladder. Keep it below dither/3 so the dither ripple is filtered out."),
     dict(id="amp", label="Amplifier", kind="dsp", x=446, y=125, w=110, h=110,
@@ -63,12 +74,24 @@ BLOCKS = [
          note="pid0 subtracts this from the error. 0 = lock on the error zero crossing; a non-zero value moves "
               "the lock point by setpoint / slope."),
     dict(id="pid", label="PID (P + I)", kind="dsp", x=800, y=125, w=140, h=110,
-         params=[P("ugf_hz", "pid0.i", live="locked"), P("p_gain", "pid0.p", live="locked", inline=False)],
+         params=[P("ugf_hz", "pid0.i", live="locked"), P("p_gain", "pid0.p", live="locked")],
          opts=["refine_phase", "gain_ramp"],
          note="pid0. I is given as the loop unity-gain frequency: i = -ugf/S with S the measured error slope "
               "per OUT1 volt, so |i*S| is the loop bandwidth whatever the sign of S. P is normalized the same "
               "way. Written only while locked (i = 0 otherwise). Lock stages: scan off, park at the zero "
-              "crossing, I at ugf/10, ugf/3, ugf."),
+              "crossing, I at ugf/10, ugf/3, ugf, then D if on. D is the box below: this FPGA build has no "
+              "derivative stage in the PID (DERIVATIVE = 0)."),
+    dict(id="dterm", label="D (pid1)", kind="dsp", x=800, y=250, w=140, h=86,
+         params=[P("d_on", "pid1.output_direct", live="locked"),
+                 P("d_ugf_hz", "pid1.p", live="locked_d"),
+                 P("d_corner_hz", "pid1.inputfilter", live="locked_d", inline=False, widget="ladder:pidf"),
+                 P("d_lp_hz", "pid1.inputfilter", live="locked_d", inline=False, widget="ladder:pidf0")],
+         opts=[],
+         note="Derivative built in hardware from pid1 (PyRPL 0.9.9.1's FPGA has no D stage): pid1 reads the error "
+              "(iq0) through a high-pass input stage at the corner, times a gain, summed into OUT1 next to pid0. "
+              "Loop term (jf/f_D)/(1 + jf/f_corner): a derivative with loop gain 1 at f_D, flat (= f_corner/f_D) "
+              "above the corner; optional extra low-pass. Live only while locked. While D is on, pid1 is not "
+              "the OUT2 monitor."),
     dict(id="limiter", label="Limiter", kind="dsp", x=968, y=125, w=118, h=110,
          params=[P("clamp_auto", "pid0.min_voltage", live="locked"),
                  P("clamp_mv", "pid0.max_voltage", live="locked", inline=False)],
@@ -175,6 +198,8 @@ WIRES = [
     dict(id="ramp_sum", kind="drv", pts=[(550, 410), (1148, 410), (1148, 193)]),
     dict(id="out2", kind="mon", pts=[(1100, 465), (1222, 465)]),
     dict(id="test_sum", kind="drv", pts=[(1110, 103), (1140, 103), (1140, 153)]),
+    dict(id="err_d", kind="sig", pts=[(780, 173), (780, 293), (800, 293)]),
+    dict(id="d_sum", kind="drv", pts=[(940, 293), (1124, 293), (1124, 189)]),
 ]
 
 SWITCHES = [
@@ -182,7 +207,7 @@ SWITCHES = [
     dict(id="output", label="Output", x=1191, y=173),
     dict(id="dither", label="Dither", x=860, y=333),
     dict(id="scan", label="Scan", x=860, y=410),
-    dict(id="relock", label="Auto-relock", x=1027, y=262),
+    dict(id="relock", label="Auto-relock", x=1027, y=258),
 ]
 
 # signal: a real DSP signal name the scope can show; None = not probe-able (why says so)
@@ -220,13 +245,57 @@ def geometry():
 # ---------------------------------------------------------------------------------------------
 def w_mixer(ctl):
     iq = ctl.r.iq0
-    iq.input = "in1"
     iq.gain = 0
     iq.output_signal = "quadrature"
 
 
 def w_bandpass(ctl):
-    ctl.r.iq0.acbandwidth = ctl.s["ac_hz"]
+    """iq0's own AC high-pass, and the optional real band-pass: in1 -> pid2 (input filter) -> iq0."""
+    s, r = ctl.s, ctl.r
+    r.iq0.acbandwidth = s["ac_hz"]
+    if s["bp_on"]:
+        p2 = r.pid2
+        p2.output_direct = "off"
+        p2.input = "in1"
+        p2.setpoint = 0
+        p2.p, p2.i, p2.ival = 1.0, 0, 0
+        p2.min_voltage, p2.max_voltage = -1.0, 1.0
+        p2.inputfilter = bp_stages(s)
+        r.iq0.input = "pid2"
+    else:
+        r.iq0.input = "in1"
+
+
+def bp_stages(s):
+    st = [-abs(s["bp_hp_hz"])] * int(s["bp_hp_order"] if s["bp_hp_hz"] > 0 else 0) + \
+         [abs(s["bp_lp_hz"])] * int(s["bp_lp_order"] if s["bp_lp_hz"] > 0 else 0)
+    return (st + [0, 0, 0, 0])[:4]
+
+
+def d_stages(s):
+    return [-abs(s["d_corner_hz"]) if s["d_corner_hz"] > 0 else 0, abs(s["d_lp_hz"]), 0, 0]
+
+
+def w_d(ctl):
+    """D path on pid1: error (iq0) -> high-pass at the corner [-> low-pass] -> gain -> OUT1, while locked.
+    Gain from the measured slope S: p = -(corner/f_D)/S, so the loop term is (jf/f_D)/(1 + jf/corner)."""
+    s, r, li = ctl.s, ctl.r, ctl.lock_info
+    if not s["d_on"]:
+        return
+    p1 = r.pid1
+    S = li.get("slope")
+    live = ctl.mode in ("locked", "measuring") and bool(S)
+    if not live:
+        p1.output_direct = "off"
+    p1.input = "iq0"
+    p1.setpoint = 0
+    p1.i, p1.ival = 0, 0
+    p1.inputfilter = d_stages(s)
+    fc = s["d_corner_hz"] if s["d_corner_hz"] > 0 else 1.0
+    p1.p = -(fc / s["d_ugf_hz"]) / S if S else 0
+    half = (li["clamp"][1] - li["clamp"][0]) / 2 if li.get("clamp") else 0.1
+    p1.min_voltage, p1.max_voltage = -half, half
+    p1.output_direct = "out1" if live else "off"
 
 
 def w_lowpass(ctl):
@@ -258,6 +327,8 @@ def w_setpoint(ctl):
 
 def w_out2(ctl):
     s, p1 = ctl.s, ctl.r.pid1
+    if s.get("d_on"):
+        return                                      # pid1 is the D path
     p1.i, p1.ival, p1.setpoint = 0, 0, 0
     p1.p = s["out2_gain"]
     p1.min_voltage, p1.max_voltage = -1.0, 1.0
@@ -292,8 +363,8 @@ def w_limiter(ctl):
 
 OUT2_SOURCE = {"error": "iq0", "setpoint": "pid0", "ramp": "asg0", "photodiode": "in1"}
 WRITERS = dict(mixer=w_mixer, bandpass=w_bandpass, lowpass=w_lowpass, amp=w_amp, phase=w_phase, dither=w_dither,
-               setpoint=w_setpoint, out2=w_out2, ramp=w_ramp, pid=w_pid, limiter=w_limiter)
-STATIC = ["mixer", "dither", "phase", "bandpass", "lowpass", "amp", "setpoint", "out2"]   # configure() order
+               setpoint=w_setpoint, out2=w_out2, ramp=w_ramp, pid=w_pid, limiter=w_limiter, d=w_d, dterm=w_d)
+STATIC = ["mixer", "dither", "phase", "bandpass", "lowpass", "amp", "setpoint", "out2", "dterm"]   # configure() order
 LIVE = ["ramp", "pid", "limiter"]
 
 
@@ -307,8 +378,12 @@ def apply_changed(ctl, changed):
     owners = {OWNER.get(k) for k in changed}
     if "dither" in owners:
         owners.add("ramp")                          # the ramp limits leave room for the dither
+    if "dterm" in owners:
+        owners.add("out2")                          # D off gives pid1 back to the OUT2 monitor
+    if "limiter" in owners:
+        owners.add("dterm")                         # the D output clamp follows the lock clamp
     done = []
-    for b in STATIC + LIVE:
+    for b in [x for x in STATIC if x != "dterm"] + LIVE + ["dterm"]:
         if b in owners:
             WRITERS[b](ctl)
             done.append(b)
@@ -323,7 +398,8 @@ READBACK = {
             "input"],
     "pid0": ["i", "p", "setpoint", "min_voltage", "max_voltage", "output_direct", "input"],
     "asg0": ["waveform", "frequency", "amplitude", "offset", "output_direct"],
-    "pid1": ["input", "p", "output_direct"],
+    "pid1": ["input", "p", "output_direct", "inputfilter"],
+    "pid2": ["input", "p", "inputfilter"],
     "asg1": ["waveform", "frequency", "amplitude", "output_direct"],
 }
 
@@ -335,7 +411,7 @@ def read_hw(r):
         for a in attrs:
             try:
                 v = getattr(m, a)
-                if a == "bandwidth":
+                if a in ("bandwidth", "inputfilter"):
                     v = [float(x) for x in (v if hasattr(v, "__len__") else [v])]
                 elif isinstance(v, (int, float)) and not isinstance(v, bool):
                     v = float(v)
@@ -360,6 +436,20 @@ def switch_states(mode, hw, s):
                 lock=mode in ("locking", "locked", "measuring"),
                 output=mode != "off",
                 relock=bool(s.get("auto_relock")))
+
+
+def _hz(x):
+    return f"{x/1e6:.3g} MHz" if x >= 1e6 else f"{x/1e3:.3g} kHz" if x >= 1e3 else f"{x:.3g} Hz"
+
+
+def _stages_resp(stages, f):
+    H = complex(1)
+    for fc in stages:
+        if fc > 0:
+            H /= 1 + 1j * f / fc
+        elif fc < 0:
+            H *= (1j * f / -fc) / (1 + 1j * f / -fc)
+    return H
 
 
 def _f(x, fmt="{:g}"):
@@ -390,8 +480,20 @@ def diagram_state(snap, pm=None):
     B["cavity"] = [(f"κ {s['kappa_mhz']:g} MHz" + (f" = {kap*1e3:.2f} mV" if kap else ""), "")]
     B["driver"] = [(f"pole {s['driver_bw_hz']:g} Hz (assumed)", "")]
     # chain
-    B["bandpass"] = [("HP " + _req(snap, "ac_hz", hw.get("iq0.acbandwidth"), "{:.1f}", " Hz"), ""),
-                     ("1 stage, 1st order", "dim")]
+    bpl = []
+    if s.get("bp_on") and hw.get("iq0.input") == "pid2":
+        st = [x for x in (hw.get("pid2.inputfilter") or []) if x]
+        hp = [-x for x in st if x < 0]
+        lp = [x for x in st if x > 0]
+        bpl.append((f"{_hz(hp[0]) if hp else 'DC'}–{_hz(lp[0]) if lp else '∞'}  ({len(hp)}+{len(lp)} st)", ""))
+        H = _stages_resp(st, f_d)
+        bpl.append((f"at f_d: {20*math.log10(max(abs(H), 1e-12)):+.1f} dB {math.degrees(math.atan2(H.imag, H.real)):+.0f}°",
+                    "dim"))
+        bpl.append((f"latency {(4 + len(hp) + 2*len(lp))*8} ns (pid2)", "dim"))
+    else:
+        bpl.append(("off: IN1 direct", "dim"))
+    bpl.append(("AC HP " + _req(snap, "ac_hz", hw.get("iq0.acbandwidth"), "{:.1f}", " Hz"), "dim"))
+    B["bandpass"] = bpl
     B["mixer"] = []
     lp = [("LP " + _req(snap, "lpf_hz", bw[0] if bw else None, "{:.1f}", " Hz") + f" ×{len(bw)}", ""),
           (f"{len(bw)}×1st order, {6*len(bw)} dB/oct", "dim")]
@@ -437,10 +539,21 @@ def diagram_state(snap, pm=None):
         if iv is not None:
             lim.append((f"out {iv*1e3:+.2f} mV", "dim"))
     B["limiter"] = lim
+    if s.get("d_on"):
+        live_d = hw.get("pid1.output_direct") == "out1"
+        st = [x for x in (hw.get("pid1.inputfilter") or []) if x]
+        hp = [-x for x in st if x < 0]
+        B["dterm"] = [(f"f_D {s['d_ugf_hz']:g} Hz, sat. > {_hz(hp[0]) if hp else '?'}"
+                       + (" " if live_d else " (open)"), "" if live_d else "dim")]
+        if s["p_gain"] < math.sqrt(s["ugf_hz"] / s["d_ugf_hz"]):
+            B["dterm"].append((f"I/D null @{math.sqrt(s['ugf_hz']*s['d_ugf_hz']):.3g} Hz: add P", "warn"))
+    else:
+        B["dterm"] = [("off (pid1 = OUT2 monitor)", "dim")]
     parts = [n for n, on in (("ramp", hw.get("asg0.output_direct") == "out1"),
                              ("test sine", hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0),
                              ("dither", hw.get("iq0.output_direct") == "out1"),
-                             ("PID", hw.get("pid0.output_direct") == "out1")) if on]
+                             ("PID", hw.get("pid0.output_direct") == "out1"),
+                             ("D", s.get("d_on") and hw.get("pid1.output_direct") == "out1")) if on]
     B["sum"] = []
     B["out1"] = [("limit ±0.95 V", "") if mode != "off" else ("0 V (Output off)", W),
                  ("= " + " + ".join(parts) if parts else "nothing", "dim")]
@@ -466,7 +579,9 @@ def diagram_state(snap, pm=None):
                      (f"{(o-a)*1e3:+.0f}..{(o+a)*1e3:+.0f} mV", "dim")]
     else:
         B["ramp"] = [("off", "dim")]
-    if hw.get("pid1.output_direct") == "out2":
+    if s.get("d_on"):
+        B["out2"] = [("off: pid1 is the D path", "warn")]
+    elif hw.get("pid1.output_direct") == "out2":
         B["out2"] = [(f"{s['out2_signal']} ({hw.get('pid1.input')}) ×{_f(hw.get('pid1.p'), '{:g}')}", "")]
     else:
         B["out2"] = [("off", "dim")]
@@ -482,7 +597,9 @@ def diagram_state(snap, pm=None):
         sp_pid=hw.get("pid0.input") == "iq0" and bool(hw.get("pid0.i")),
         pid_lim=hw.get("pid0.output_direct") == "out1", lim_sum=hw.get("pid0.output_direct") == "out1",
         sum_out=mode != "off", out_plant=mode != "off", drv_cav=True, cav_pd=True,
-        dith_sum=sw["dither"], ramp_sum=sw["scan"], out2=hw.get("pid1.output_direct") == "out2",
+        dith_sum=sw["dither"], ramp_sum=sw["scan"],
+        out2=hw.get("pid1.output_direct") == "out2" and not s.get("d_on"),
+        err_d=bool(s.get("d_on")), d_sum=bool(s.get("d_on")) and hw.get("pid1.output_direct") == "out1",
         test_sum=hw.get("asg1.output_direct") == "out1" and (hw.get("asg1.amplitude") or 0) > 0)
     busy = mode in BUSY
     swd = {}

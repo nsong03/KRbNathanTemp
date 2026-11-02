@@ -71,12 +71,21 @@ FIELDS = [
     ("err_gain", "Error gain (integer, 1 = lowest)", 1, "Demodulation", "num", {"min": 1}),
     ("prominence", "Peak threshold [x tallest]", 0.1, "Demodulation", "num", {"min": 0.01, "max": 1}),
     ("setpoint_mv", "Setpoint (error offset) [mV]", 0.0, "Demodulation", "num", {}),
+    ("bp_on", "Band-pass on IN1 (pid2 input filter)", False, "Demodulation", "check", {}),
+    ("bp_hp_hz", "Band-pass: high-pass corner [Hz]", 250.0, "Demodulation", "num", {"min": 0}),
+    ("bp_hp_order", "Band-pass: high-pass stages", 1, "Demodulation", "num", {"min": 0, "max": 2}),
+    ("bp_lp_hz", "Band-pass: low-pass corner [Hz]", 4000.0, "Demodulation", "num", {"min": 0}),
+    ("bp_lp_order", "Band-pass: low-pass stages", 1, "Demodulation", "num", {"min": 0, "max": 2}),
     ("lock_same_dither", "Lock dither = acquisition dither", True, "Lock", "check", {}),
     ("lock_dither_hz", "Lock dither frequency [Hz]", 1000.0, "Lock", "num", {"min": 1}),
     ("lock_dither_mvpp", "Lock dither amplitude [mVpp]", 30.0, "Lock", "num", {"min": 0}),
     ("refine_phase", "Re-fit the phase before locking", True, "Lock", "check", {}),
     ("ugf_hz", "Loop bandwidth [Hz]", 10.0, "Lock", "num", {"min": 0.1}),
     ("p_gain", "Proportional loop gain", 0.0, "Lock", "num", {"min": 0}),
+    ("d_on", "D (derivative, pid1; takes the OUT2 monitor)", False, "Lock", "check", {}),
+    ("d_ugf_hz", "D: frequency where the derivative's loop gain is 1 [Hz]", 200.0, "Lock", "num", {"min": 0.01}),
+    ("d_corner_hz", "D: corner above which the derivative saturates [Hz]", 1000.0, "Lock", "num", {"min": 0}),
+    ("d_lp_hz", "D: extra low-pass roll-off [Hz] (0 = off)", 0.0, "Lock", "num", {"min": 0}),
     ("gain_ramp", "Ramp the gain up when locking", True, "Lock", "check", {}),
     ("clamp_auto", "Clamp from the mode spacing", True, "Lock", "check", {}),
     ("clamp_mv", "Clamp half-width [mV]", 20.0, "Lock", "num", {"min": 0.1}),
@@ -114,7 +123,47 @@ KEYS = [f[0] for f in FIELDS]
 DEFAULTS = {f[0]: f[2] for f in FIELDS}
 DEFAULTS["target_mv"] = None           # lock target (drive voltage of the chosen peak); None = tallest
 OUT2_SOURCE = SCH.OUT2_SOURCE
-SNAP_KEYS = ("lpf_hz", "lpf_order", "ac_hz", "err_gain")   # the FPGA rounds these: show requested -> used
+SNAP_KEYS = ("lpf_hz", "lpf_order", "ac_hz", "err_gain", "bp_hp_hz", "bp_lp_hz", "d_corner_hz", "d_lp_hz")
+# ^ the FPGA rounds these: show requested -> used
+
+
+def sig6(x):
+    return float(f"{float(x):.6g}")
+
+
+def fallback_ladder(minbw):
+    """PyRPL's valid filter corners (attributes.FilterRegister.valid_frequencies), for PyRPL versions without
+    the *_options helpers."""
+    maxshift = int(math.floor(math.log2(125e6 / minbw))) + 1
+    corr = {0.5: 0.7, 0.25: 1.65, 0.125: 1.17, 0.0625: 1.08, 0.03125: 1.04, 0.015625: 1.02, 0.0078125: 1.01}
+    return [-math.log(1 - 2.0 ** k / 2 ** maxshift) / 2 / math.pi * 125e6 * corr.get(2.0 ** k / 2 ** maxshift, 1.0)
+            for k in range(0, maxshift - 2)]
+
+
+def filter_stages(hp_hz, n_hp, lp_hz, n_lp):
+    """PyRPL input-filter list: high-pass stages are negative corners, low-pass positive (at most 4)."""
+    st = [-abs(hp_hz)] * int(n_hp if hp_hz > 0 else 0) + [abs(lp_hz)] * int(n_lp if lp_hz > 0 else 0)
+    return (st + [0, 0, 0, 0])[:4]
+
+
+def stages_response(stages, f):
+    f = np.asarray(f, dtype=float)
+    H = np.ones_like(f, dtype=complex)
+    for fc in stages:
+        if fc > 0:
+            H = H / (1 + 1j * f / fc)
+        elif fc < 0:
+            H = H * (1j * f / -fc) / (1 + 1j * f / -fc)
+    return H
+
+
+def bandpass_equivalent(stages, f_d, f):
+    """What a band-pass in front of the lock-in does to the error signal at baseband frequency f: the sidebands at
+    f_d +/- f pass with BP(f_d + f) and BP(f_d - f); the lock's phase fit absorbs the phase of BP(f_d), and the
+    measured slope its magnitude. H(f) = [BP(f_d + f) / BP(f_d) + conj(BP(f_d - f) / BP(f_d))] / 2."""
+    f = np.asarray(f, dtype=float)
+    b0 = stages_response(stages, f_d)
+    return 0.5 * (stages_response(stages, f_d + f) / b0 + np.conj(stages_response(stages, f_d - f) / b0))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -349,12 +398,22 @@ def sine_pp(t, y, f):
     return float(4 * abs(z))
 
 
-def loop_model(f, ugf, p_gain, lp_list, driver_bw, delay):
+def loop_model(f, ugf, p_gain, lp_list, driver_bw, delay, d=None, bp=None):
     """Open-loop gain G(f) of the lock as the app sets it up (integrator unity gain at ugf, normalized P gain),
     with the error low-pass stages, a one-pole PZT driver and a pure delay. G > 0 means negative feedback.
+    d = (d_ugf, corner, lp): band-limited derivative (jf/d_ugf)/(1 + jf/corner) [/(1 + jf/lp)] in parallel.
+    bp = (stages, f_dither): band-pass in front of the lock-in, through its baseband equivalent.
     f may be a number or an array."""
     f = np.asarray(f, dtype=float)
     g = ugf / (1j * f) + p_gain
+    if d:
+        d_ugf, fc, flp = d
+        dd = (1j * f / d_ugf) / (1 + 1j * f / fc) if fc > 0 else 1j * f / d_ugf
+        if flp > 0:
+            dd = dd / (1 + 1j * f / flp)
+        g = g + dd
+    if bp:
+        g = g * bandpass_equivalent(bp[0], bp[1], f)
     for fc in lp_list:
         if fc > 0:
             g = g / (1 + 1j * f / fc)
@@ -375,17 +434,45 @@ def margins(fs, G):
     fu = math.exp(x0 - y0 * (x1 - x0) / (y1 - y0))
     ph = np.unwrap(np.angle(G))
     phu = float(np.interp(math.log(fu), np.log(fs), ph))
-    return fu, 180.0 + math.degrees(phu)
+    pm = (180.0 + math.degrees(phu) + 180.0) % 360.0 - 180.0     # wrapped into (-180, 180]
+    return fu, pm
 
 
 _PM_CACHE = {}
 
 
+def pid_null_warning(s):
+    """With D on, the integrator (-90 deg) and the derivative (+90 deg) cancel where they are equal, at
+    sqrt(UGF f_D), unless P fills the gap. Returns a warning or None."""
+    if not s.get("d_on"):
+        return None
+    fx = math.sqrt(s["ugf_hz"] * s["d_ugf_hz"])
+    need = math.sqrt(s["ugf_hz"] / s["d_ugf_hz"])
+    if s["p_gain"] < need:
+        return (f"I and D cancel near {fx:.3g} Hz (loop-gain null): set P >= {need:.2g} to fill it, "
+                f"or move f_D up")
+    return None
+
+
+def lock_dither_hz(s):
+    return float(s["acq_dither_hz"] if s["lock_same_dither"] else s["lock_dither_hz"])
+
+
+def loop_extras(s):
+    """(d, bp) arguments of loop_model from the settings."""
+    d = (s["d_ugf_hz"], s["d_corner_hz"], s["d_lp_hz"]) if s.get("d_on") else None
+    bp = (filter_stages(s["bp_hp_hz"], s["bp_hp_order"], s["bp_lp_hz"], s["bp_lp_order"]), lock_dither_hz(s)) \
+        if s.get("bp_on") else None
+    return d, bp
+
+
 def predicted_margin(s, lp_list):
-    key = (s["ugf_hz"], s["p_gain"], tuple(lp_list), s["driver_bw_hz"])
+    d, bp = loop_extras(s)
+    key = (s["ugf_hz"], s["p_gain"], tuple(lp_list), s["driver_bw_hz"], d, None if bp is None else (tuple(bp[0]), bp[1]))
     if key not in _PM_CACHE:
         fs = np.logspace(-1, 6, 3000)
-        _PM_CACHE[key] = margins(fs, loop_model(fs, s["ugf_hz"], s["p_gain"], lp_list, s["driver_bw_hz"], RP_LATENCY))
+        _PM_CACHE[key] = margins(fs, loop_model(fs, s["ugf_hz"], s["p_gain"], lp_list, s["driver_bw_hz"], RP_LATENCY,
+                                                d=d, bp=bp))
     return _PM_CACHE[key]
 
 
@@ -449,9 +536,29 @@ class Controller:
             except Exception:
                 pass
         self.r.pid0.i = 0
+        self.options = self._filter_options()
         self.log("connected")
         self._start_acquire()
         self._readback()
+
+    def _filter_options(self):
+        """The corner frequencies the FPGA can realize, read from PyRPL (what the dropdowns offer)."""
+        r = self.r
+
+        def pos(get, minbw):
+            try:
+                v = [float(x) for x in get() if x > 0]
+                if v:
+                    return [sig6(x) for x in v]
+            except Exception as e:
+                self.log(f"filter options from PyRPL unavailable ({e!r}); using PyRPL's formula")
+            return [sig6(x) for x in fallback_ladder(minbw)]
+        return dict(lpf=pos(lambda: r.iq0.bandwidths, 10), ac=pos(lambda: r.iq0.inputfilter_options, 50),
+                    pidf=pos(lambda: r.pid2.inputfilter_options, 10))
+
+    def _d_update(self):
+        """D path on pid1: live only while locked (written with the measured slope)."""
+        SCH.WRITERS["d"](self)
 
     # ---- small utilities ----
     def log(self, msg):
@@ -510,12 +617,11 @@ class Controller:
     # ---- hardware configuration ----
     def configure(self):
         """Write every static block of the schematic (iq0: dither, phase, filters, gain; pid0 setpoint; pid1)."""
+        try:
+            self.r.pid0.inputfilter = [0, 0, 0, 0]       # the lock PID filters nothing; pid1 / pid2 filters belong
+        except Exception:                                # to their blocks (D, band-pass), written below
+            pass
         SCH.write_static(self)
-        for p in (self.r.pid0, self.r.pid1):
-            try:
-                p.inputfilter = [0, 0, 0, 0]
-            except Exception:
-                pass
         self._snap_to_hardware()
 
     def _snap_to_hardware(self):
@@ -523,13 +629,25 @@ class Controller:
         really uses and show that in the UI, so the numbers on screen are the numbers in the hardware."""
         s, iq, snapped = self.s, self.r.iq0, {}
         bw = [float(b) for b in np.atleast_1d(iq.bandwidth) if b > 0]
-        if bw and abs(bw[0] - s["lpf_hz"]) > 0.01 * s["lpf_hz"]:
-            snapped["lpf_hz"] = round(bw[0], 1)
+        if bw and abs(bw[0] - s["lpf_hz"]) > 1e-5 * s["lpf_hz"]:
+            snapped["lpf_hz"] = sig6(bw[0])
         if bw and len(bw) != int(s["lpf_order"]):
             snapped["lpf_order"] = len(bw)
         ac = float(iq.acbandwidth)
-        if abs(ac - s["ac_hz"]) > 0.01 * max(s["ac_hz"], 1.0):
-            snapped["ac_hz"] = round(ac, 1)
+        if abs(ac - s["ac_hz"]) > 1e-5 * max(s["ac_hz"], 1.0):
+            snapped["ac_hz"] = sig6(ac)
+        for on, mod, keys in (("bp_on", "pid2", (("bp_hp_hz", -1), ("bp_lp_hz", 1))),
+                              ("d_on", "pid1", (("d_corner_hz", -1), ("d_lp_hz", 1)))):
+            if not s.get(on):
+                continue
+            try:
+                st = [float(x) for x in getattr(self.r, mod).inputfilter]
+            except Exception:
+                continue
+            for k, sign in keys:
+                used = next((abs(x) for x in st if x * sign > 0), None)
+                if used is not None and abs(used - s[k]) > 1e-5 * max(s[k], 1.0):
+                    snapped[k] = sig6(used)
         qf = float(iq.quadrature_factor)
         if abs(qf - s["err_gain"]) > 1e-9:
             snapped["err_gain"] = int(round(qf)) if abs(qf - round(qf)) < 1e-9 else qf
@@ -562,6 +680,7 @@ class Controller:
                           trigger_source="immediately", output_direct="out1")
         self.ramp = dict(lo=lo, hi=hi, hz=hz, shape=shape)
         self._ramp_cache = None
+        self._d_update()                                  # no D while sweeping
         self._readback()
 
     def _ramp_off(self):
@@ -731,13 +850,16 @@ class Controller:
             f_before = self._dither()[0]
             s.update(arg)
             written = SCH.apply_changed(self, changed)      # the writers of the blocks that own these keys
-            if set(written) & {"lowpass", "bandpass", "amp"}:
+            if set(written) & {"lowpass", "bandpass", "amp", "dterm"}:
                 self._snap_to_hardware()
             if changed & {"probe_a", "probe_b"}:
                 self._show_panel("drive")
             if self.ctx == "lock" and self.mode in ("locked", "held") and self._dither()[0] != f_before:
                 self.log("note: a new dither frequency can shift the demodulation phase; press LOCK! to re-fit")
-            if changed & {"ugf_hz", "p_gain", "lpf_hz", "lpf_order", "driver_bw_hz"}:
+            if changed & {"d_on", "d_ugf_hz", "ugf_hz", "p_gain"} and pid_null_warning(s):
+                self.log("WARN " + pid_null_warning(s))
+            if changed & {"ugf_hz", "p_gain", "lpf_hz", "lpf_order", "driver_bw_hz", "d_on", "d_ugf_hz",
+                          "d_corner_hz", "d_lp_hz", "bp_on", "bp_hp_hz", "bp_lp_hz", "bp_hp_order", "bp_lp_order"}:
                 fu, pm = predicted_margin(s, self._lp_list())
                 if pm is not None and pm < 45:
                     self.log(f"WARN predicted phase margin {pm:.0f} deg at {fu:.0f} Hz: the loop may oscillate")
@@ -843,6 +965,7 @@ class Controller:
         self.r.pid0.i = 0
         if self.mode in ("locked", "locking", "busy", "measuring"):
             self.mode = "held"
+        self._d_update()
         self.log(f"{why}: unlocked; setpoint held at {float(self.r.pid0.ival)*1e3:+.2f} mV")
 
     def _output_off(self):
@@ -853,6 +976,7 @@ class Controller:
         r.pid0.output_direct = "off"
         self.mode = "off"
         self.ctx = "acq"
+        self._d_update()
         self.log("Output OFF: OUT1 = 0 V (ramp, dither and PID disconnected from OUT1)")
 
     def _switch(self, name, on):
@@ -1098,6 +1222,7 @@ class Controller:
         p0.ival = v
         p0.output_direct = "out1"
         self.mode = "held"
+        self._d_update()
         self._readback()
 
     def _engage(self, v0, S, ref):
@@ -1129,8 +1254,21 @@ class Controller:
                 self.log("  ran to the clamp while engaging: wrong peak or phase. Holding.")
                 self.mode = "held"
                 return False
-        self.log(f"  loop bandwidth {self.lock_info['ugf_actual']:.2f} Hz; LOCKED")
         self.mode = "locked"
+        if s.get("d_on"):
+            self._d_update()                              # D (pid1) joins once P + I hold the lock
+            time.sleep(0.4)
+            ival = float(p0.ival)
+            if ival <= lo + 0.03 * (hi - lo) or ival >= hi - 0.03 * (hi - lo):
+                p0.i = 0
+                self.mode = "held"
+                self._d_update()
+                self.log("  ran to the clamp when D was added: lower the D gain (D frequency). Holding.")
+                self._readback()
+                return False
+            self.log(f"  D on (pid1): unity loop gain at {s['d_ugf_hz']:g} Hz, saturates above "
+                     f"{s['d_corner_hz']:g} Hz")
+        self.log(f"  loop bandwidth {self.lock_info['ugf_actual']:.2f} Hz; LOCKED")
         self._readback()
         self._bad_since = None
         self._good_ival.clear()
@@ -1175,6 +1313,7 @@ class Controller:
         self.history.append((now, T, em, erms, ival, "unlock"))
         self.r.pid0.i = 0
         self.mode = "held"
+        self._d_update()
         if s["auto_relock"]:
             self._relock()
         self._readback()
@@ -1331,8 +1470,9 @@ class Controller:
             P = res["iq0"] / (1 + T) if "iq0" in res else None
             f = res["f"]
             fu, pm = margins(f, G)
+            d_, bp_ = loop_extras(s)
             Gm = loop_model(f, self.lock_info.get("ugf_actual", s["ugf_hz"]), s["p_gain"], self._lp_list(),
-                            s["driver_bw_hz"], RP_LATENCY)
+                            s["driver_bw_hz"], RP_LATENCY, d=d_, bp=bp_)
             self.loop = dict(f=f.tolist(), G_mag=np.abs(G).tolist(), G_ph=np.degrees(np.unwrap(np.angle(G))).tolist(),
                              P_mag=None if P is None else np.abs(P).tolist(),
                              P_ph=None if P is None else np.degrees(np.unwrap(np.angle(P))).tolist(),
@@ -1361,8 +1501,8 @@ class Controller:
 
     def _measure_bode(self):
         """Swept-sine Bode plot, filled in point by point.
-        closed loop (locked): asg1 adds a small sine at the OUT1 sum; the scope records it with the PID output
-            (pid0) and with the error (iq0). c/x gives the open-loop gain G = -T/(1+T), the sensitivity
+        closed loop (locked): asg1 adds a small sine at the OUT1 sum; the scope records it with the feedback c (the
+            PID output pid0, or OUT1 - x when D adds pid1 to the feedback) and with the error (iq0). c/x gives the open-loop gain G = -T/(1+T), the sensitivity
             S = 1/(1+G) = 1 + c/x and the closed-loop response G/(1+G); the plant is (e/x)/S.
         circuit only (any mode, OUT1 untouched): spare copies of the blocks (iq1 = lock-in chain with the same
             low-pass and gain, its oscillator at 0 Hz so the chain is seen at baseband; pid2 = the PID with the
@@ -1387,6 +1527,7 @@ class Controller:
         prev = self.mode
         self.mode = "measuring"
         self._stop_meas.clear()
+        seq0 = self.bode_seq
         self._show_panel("Bode (swept)")
         try:
             if closed:
@@ -1396,23 +1537,33 @@ class Controller:
         finally:
             a1 = self.r.asg1
             a1.output_direct, a1.amplitude = "off", 0
-            for m, attrs in (("iq1", {"output_direct": "off", "amplitude": 0}),
-                             ("pid2", {"output_direct": "off", "i": 0, "p": 0, "ival": 0})):
-                for k, v in attrs.items():
-                    try:
-                        setattr(getattr(self.r, m), k, v)
-                    except Exception:
-                        pass
+            try:
+                self.r.iq1.output_direct, self.r.iq1.amplitude = "off", 0
+            except Exception:
+                pass
             self.meas_progress = ""
-            if self.mode == "measuring":
+            if self.bode and self.bode_seq != seq0:      # only a sweep this call started
+                B = dict(self.bode, done=True)
+                try:
+                    B["analysis"] = analyze_bode(B, self.s, self._dither()[0], self.lock_info)
+                    for lvl, line in B["analysis"]:
+                        self.log(f"  Bode {lvl}: {line}")
+                except Exception as e:
+                    B["analysis"] = [("WARN", f"analysis failed: {e!r}")]
+                self._bode_publish(B)
+            if self.mode == "measuring":                  # the result is complete before the mode returns
                 self.mode = prev
-            if self.bode:
-                self._bode_publish(dict(self.bode, done=True))
+            self.configure()                              # borrowed pid1 / pid2 back to OUT2 monitor, band-pass, D
+                                                          # (after the mode: D is live only if locked)
 
-    def _bode_capture(self, sig, f, cycles):
-        """Two-channel capture (asg1, sig) long enough for `cycles` periods; complex amplitudes at f."""
+    def _bode_capture(self, sig, f, cycles, with_err=False, extra_f=()):
+        """Two-channel capture (asg1, sig) long enough for `cycles` periods; complex amplitudes at f
+        (and, with_err, the 1-sigma uncertainty of the response's amplitude)."""
         dur = float(np.clip(cycles / f, 1.3e-4, 2.1))    # 2.1 s: the scope then picks 2.15 s, not 4.3 s
         t, x, y = self.capture("asg1", sig, dur)
+        if with_err:
+            Y, err = fit_sine(t, y, f, with_err=True, extra_f=extra_f)
+            return fit_sine(t, x, f), Y, err
         return fit_sine(t, x, f), fit_sine(t, y, f)
 
     def _bode_point_live(self, f, amp, out):
@@ -1428,7 +1579,8 @@ class Controller:
         kap, _ = self._kappa_drive()
         amp = float(np.clip(s["na_amp_frac"] * (kap or 0.005), 1e-4, 0.05))
         ugf = li.get("ugf_actual", s["ugf_hz"])
-        Gm = loop_model(fs, ugf, s["p_gain"], self._lp_list(), s["driver_bw_hz"], RP_LATENCY)
+        d_, bp_ = loop_extras(s)
+        Gm = loop_model(fs, ugf, s["p_gain"], self._lp_list(), s["driver_bw_hz"], RP_LATENCY, d=d_, bp=bp_)
         B = bode_init("closed loop", fs, [
             ("G open loop", "#1f5fa8", Gm), ("S = 1/(1+G): disturbance suppression", "#c0392b", 1 / (1 + Gm)),
             ("T = G/(1+G): closed loop", "#1e8e3e", Gm / (1 + Gm))],
@@ -1447,7 +1599,13 @@ class Controller:
             self.meas_progress = f"Bode {k+1}/{len(fs)} at {f:.3g} Hz"
             self._bode_point_live(f, amp, "out1")
             time.sleep(min(max(3 / f, settle_loop, self._filter_settle()), 1.5))
-            X, C = self._bode_capture("pid0", f, s["bode_cycles"])
+            if s["d_on"]:                                 # feedback = pid0 + pid1 (D): read their sum on OUT1
+                f_d = self._dither()[0]                   # the dither on OUT1 is fitted out, not counted as noise
+                X, O, sC = self._bode_capture("out1", f, s["bode_cycles"], with_err=True,
+                                              extra_f=(f_d, 2 * f_d))
+                C = O - X                                 # OUT1 = x + c (+ dither, rejected by the fit at f)
+            else:
+                X, C, sC = self._bode_capture("pid0", f, s["bode_cycles"], with_err=True)
             X2, E = self._bode_capture("iq0", f, s["bode_cycles"])
             ival = float(r.pid0.ival)
             if ival <= lo + 0.03 * (hi - lo) or ival >= hi - 0.03 * (hi - lo):
@@ -1459,12 +1617,17 @@ class Controller:
             Tc, Ex = C / X, E / X2                       # c/x and e/x
             G, S = -Tc / (1 + Tc), 1 + Tc
             P = Ex / S
+            # uncertainty of G from the fit residual of c: dG = dT / |1 + T|^2 (noise-limited points are flagged)
+            rel = (sC / max(abs(X), 1e-15)) / max(abs(1 + Tc) ** 2, 1e-15) / max(abs(G), 1e-15)
+            low = bool(rel > 0.25)
             p0 = p0 or dc_norm(P)                        # normalize to the first point: magnitude and sign only
             for cv, val in zip(B["curves"], (G, S, -Tc, P / p0)):
                 cv["f"].append(float(f))
                 cv["c"].append(val)
-            fu, pm = margins(np.array(B["curves"][0]["f"]), np.array(B["curves"][0]["c"])) \
-                if len(B["curves"][0]["f"]) > 1 else (None, None)
+                cv.setdefault("low", []).append(low)
+            g0 = B["curves"][0]
+            ok = ~np.array(g0["low"])
+            fu, pm = margins(np.array(g0["f"])[ok], np.array(g0["c"])[ok]) if ok.sum() > 1 else (None, None)
             B.update(ugf=fu, pm=pm, n=k + 1)
             self._bode_publish(dict(B))
         fu, pm = B.get("ugf"), B.get("pm")
@@ -1472,16 +1635,24 @@ class Controller:
                                          "no unity-gain crossing in the measured range"))
 
     def _bode_circuit(self, fs, prev):
-        """Each block measured on its own spare copy, driven straight from asg1 (the response of the chain is the
-        product: the blocks are linear). Per point, the test amplitude and the copy's gain (integer gain x K for the
-        lock-in, i and p x K for the PID) are chosen so the copy's output is ~0.3 V: the response then stays far
-        above the scope's 14-bit step even where the block attenuates by 100 dB. The gain actually used is read back
-        and divided out. Points whose response is still under 5 steps are flagged (hollow markers)."""
+        """Each block measured on its own spare copy, driven straight from asg1 (the chain's response is the product:
+        the blocks are linear): the lock-in (iq1 at 0 Hz), the P + I part, the D path and the band-pass (a spare PID,
+        reconfigured per point). Per point, the test amplitude and the copy's gain (integer gain x K for the lock-in,
+        the PID gains x K) keep the copy's output near 0.3 V, far above the scope's 14-bit step even where a block
+        attenuates by 100 dB; the gain actually used is read back and divided out. Points whose response is still
+        under 5 steps are flagged (hollow markers)."""
         s, r = self.s, self.r
+        spare = "pid2" if not s["bp_on"] else ("pid1" if not (s["d_on"] and prev == "locked") else None)
+        if spare is None:
+            self.log("Bode circuit only: no free PID for the copies (pid2 = band-pass, pid1 = live D): unlock, or "
+                     "turn the band-pass or D off")
+            return
         S = self.lock_info.get("slope")
         Sn = abs(S) if S else 1.0
-        iq, p2 = r.iq1, r.pid2
+        iq, pc = r.iq1, getattr(r, spare)
         qf0 = int(round(s["err_gain"]))
+        if spare == "pid1":
+            pc.output_direct = "off"                      # the OUT2 monitor pauses during the sweep
         # copy of the lock-in chain at baseband (oscillator at 0 Hz: the mixer multiplies by cos(0) = 1)
         iq.output_direct = "off"
         iq.amplitude = 0
@@ -1493,42 +1664,61 @@ class Controller:
         iq.bandwidth = [s["lpf_hz"]] * int(s["lpf_order"])
         iq.quadrature_factor = qf0
         iq.output_signal = "quadrature"
-        # copy of the PID with the loop gains per unit slope (i = UGF, p = P gain; the lock divides them by |S|)
-        p2.output_direct = "off"
-        p2.input = "asg1"
-        p2.setpoint = 0
-        p2.min_voltage, p2.max_voltage = -1.0, 1.0
-        try:
-            p2.inputfilter = [0, 0, 0, 0]
-        except Exception:
-            pass
-        p2.p, p2.i = s["p_gain"], s["ugf_hz"]
-        p_reg, i_reg = float(p2.p), float(p2.i)
+        pc.output_direct = "off"
+        pc.input = "asg1"
+        pc.setpoint = 0
+        pc.min_voltage, pc.max_voltage = -1.0, 1.0
+        # the copies the spare PID plays in turn: (name, input filter, p, i) in loop-normalized units (|S| = 1)
+        fcD = s["d_corner_hz"] if s["d_corner_hz"] > 0 else 1.0
+        roles = [("pi", [0, 0, 0, 0], s["p_gain"], s["ugf_hz"])]
+        if s["d_on"]:
+            roles.append(("d", SCH.d_stages(s), fcD / s["d_ugf_hz"], 0.0))
+        if s["bp_on"]:
+            roles.append(("bp", SCH.bp_stages(s), 1.0, 0.0))
+        real = {}                                         # what the FPGA really uses for each role
+        for name, st, p_, i_ in roles:
+            pc.inputfilter = st
+            pc.p, pc.i = p_, i_
+            real[name] = ([float(x) for x in pc.inputfilter], float(pc.p), float(pc.i))
+
+        def pid_model(name):
+            st, p_, i_ = real[name]
+            tau = (4 + sum(1 for x in st if x < 0) + 2 * sum(1 for x in st if x > 0)) * 8e-9
+            return (p_ + i_ / (1j * fs)) * stages_response(st, fs) * np.exp(-2j * np.pi * fs * tau)
         bw = [float(b) for b in np.atleast_1d(iq.bandwidth) if b > 0]
         tau_L = (3 + 2 * len(bw)) * 8e-9                 # FPGA pipeline (Verilog count, docs): IQ 3 + 2 per stage
-        tau_C = 4 * 8e-9                                 # PID: 4 clocks
         L_m = np.exp(-2j * np.pi * fs * tau_L)
         for b in bw:
             L_m = L_m / (1 + 1j * fs / b)
-        C_m = (i_reg / (1j * fs) + p_reg) * np.exp(-2j * np.pi * fs * tau_C)
         f_d = self._dither()[0]
+        models = {name: pid_model(name) for name, *_ in roles}
+        H_bp = bandpass_equivalent(real["bp"][0], f_d, fs) if "bp" in real else np.ones(len(fs))
+        Cm = models["pi"] + (models["d"] if "d" in models else 0)
+        _, p_pi, i_pi = real["pi"]
+        curves = [("lock-in chain (normalized)", "#1f5fa8", L_m),
+                  (f"P + I x slope (i = {i_pi:.3g} Hz, p = {p_pi:.3g})", "#7d3c98", models["pi"])]
+        if "d" in models:
+            curves.append((f"D x slope (f_D = {s['d_ugf_hz']:g} Hz)", "#b9770e", models["d"]))
+        if "bp" in models:
+            curves.append(("band-pass at IN1 (carrier frequency)", "#16a085", models["bp"]))
+        curves.append(("electronics open loop", "#1e8e3e", L_m * Cm * H_bp))
         hp = float(r.iq0.acbandwidth)
         hp_fd = abs(1 / (1 + hp / (1j * f_d))) if hp > 0 else 1.0
-        B = bode_init("circuit only", fs, [
-            ("lock-in chain (normalized)", "#1f5fa8", L_m),
-            (f"PID x slope (i = {i_reg:.3g} Hz, p = {p_reg:.3g})", "#7d3c98", C_m),
-            ("electronics open loop", "#1e8e3e", L_m * C_m)],
-            title="Circuit-only Bode (spare copies iq1, pid2 driven by asg1; OUT1 untouched)",
-            note=(f"lock-in at baseband: low-pass {' + '.join(f'{b:.1f}' for b in bw)} Hz, gain x{qf0}; input "
-                  f"high-pass at the dither: x{hp_fd:.3f} (not in the copy). PID with i = UGF, p = P gain: the lock "
-                  f"uses i/|S|" + (f" (|S| = {Sn:.1f}/V)" if S else " (slope not measured yet)") +
-                  ". Driver and cavity not included. Each block auto-ranged; hollow = under 5 scope steps. "
-                  "Shaded: above dither/2, where the real lock-in folds the sidebands."))
+        B = bode_init("circuit only", fs, curves,
+                      title=f"Circuit-only Bode (copies on iq1 and {spare}, driven by asg1; OUT1 untouched)",
+                      note=(f"lock-in at baseband: low-pass {' + '.join(f'{b:.1f}' for b in bw)} Hz, gain x{qf0}; "
+                            f"AC high-pass at the dither x{hp_fd:.3f} (not in the copy). PID gains per unit slope: the "
+                            f"lock divides by |S|" + (f" (|S| = {Sn:.1f}/V)" if S else " (slope not measured yet)") +
+                            (". Open loop includes the band-pass through its baseband equivalent (model)"
+                             if "bp" in models else "") +
+                            ". Driver and cavity not included. Hollow = under 5 scope steps. Shaded: above dither/2."))
         B["f_dither"] = f_d
+        B["roles"] = [name for name, *_ in roles]
         for cv in B["curves"]:
             cv["low"] = []
         self._bode_publish(B)
-        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.4g} Hz on iq1 and pid2 (OUT1 untouched)")
+        self.log(f"Bode circuit only: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.4g} Hz on iq1 and {spare} "
+                 f"({', '.join(B['roles'])}; OUT1 untouched)")
         A_max = s["bode_amp_mv"] * 1e-3
         TARGET, KMAX, FLOOR = 0.3, 1024, 5 * SCOPE_LSB
         L0 = None
@@ -1548,29 +1738,41 @@ class Controller:
             time.sleep(settle)
             X, Y = self._bode_capture("iq1", f, s["bode_cycles"])
             L, low_L = Y / X / K_L, abs(Y) < FLOOR
-            # PID copy, the same way (i and p scaled together)
-            gC = abs(C_m[k])
-            A = float(np.clip(TARGET / max(gC, 1e-12), 1e-3, A_max))
-            K = float(np.clip(TARGET / max(A * gC, 1e-12), 1, KMAX))
-            p2.p, p2.i = p_reg * K, i_reg * K
-            K_C = float(p2.i) / i_reg if i_reg else (float(p2.p) / p_reg if p_reg else 1.0)
-            self._bode_point_live(f, A, "off")
-            time.sleep(min(3 / f, 0.5))
-            p2.ival = 0
-            X2, Z = self._bode_capture("pid2", f, s["bode_cycles"])
-            C, low_C = Z / X2 / K_C, abs(Z) < FLOOR
+            meas = {}
+            for name, st, p_, i_ in roles:                # the spare PID as each copy in turn, auto-ranged
+                g = abs(models[name][k])
+                A = float(np.clip(TARGET / max(g, 1e-12), 1e-3, A_max))
+                K = float(np.clip(TARGET / max(A * g, 1e-12), 1, KMAX))
+                pc.inputfilter = st
+                pc.p, pc.i = p_ * K, i_ * K
+                K_used = float(pc.p) / p_ if p_ else float(pc.i) / i_
+                corners = [abs(x) for x in st if x]
+                self._bode_point_live(f, A, "off")
+                time.sleep(min(max(3 / f, 6 / (2 * np.pi * min(corners)) if corners else 0), 1.0))
+                pc.ival = 0
+                X2, Z = self._bode_capture(spare, f, s["bode_cycles"])
+                meas[name] = (Z / X2 / K_used, abs(Z) < FLOOR)
             L0 = L0 or dc_norm(L)                        # magnitude and sign only: keep the real phase lag
-            for cv, val, low in zip(B["curves"], (L / L0, C, C * L / L0), (low_L, low_C, low_L or low_C)):
+            C = meas["pi"][0] + (meas["d"][0] if "d" in meas else 0)
+            lowC = meas["pi"][1] or ("d" in meas and meas["d"][1])
+            vals = [(L / L0, low_L), meas["pi"]]
+            if "d" in meas:
+                vals.append(meas["d"])
+            if "bp" in meas:
+                vals.append(meas["bp"])
+            vals.append((L / L0 * C * H_bp[k], low_L or lowC))
+            for cv, (val, low) in zip(B["curves"], vals):
                 cv["f"].append(float(f))
                 cv["c"].append(val)
                 cv["low"].append(bool(low))
-            ok = ~np.array(B["curves"][2]["low"])
-            f_ok = np.array(B["curves"][2]["f"])[ok]
-            fu, pm = margins(f_ok, np.array(B["curves"][2]["c"])[ok]) if len(f_ok) > 1 else (None, None)
+            ol = B["curves"][-1]
+            ok = ~np.array(ol["low"])
+            f_ok = np.array(ol["f"])[ok]
+            fu, pm = margins(f_ok, np.array(ol["c"])[ok]) if len(f_ok) > 1 else (None, None)
             B.update(ugf=fu, pm=pm, n=k + 1, dc_gain=abs(L0))
             self._bode_publish(dict(B))
         iq.quadrature_factor = qf0
-        n_low = sum(B["curves"][2]["low"])
+        n_low = sum(B["curves"][-1]["low"])
         self.log(f"Bode circuit only: lock-in DC gain {abs(L0 or 0):.3f} V/V" +
                  (f"; electronics alone: unity gain {B['ugf']:.1f} Hz, phase margin {B['pm']:.0f} deg"
                   if B.get("ugf") else "") +
@@ -1585,19 +1787,29 @@ def dc_norm(z):
     return abs(z) * (1.0 if z.real >= 0 else -1.0)
 
 
-def fit_sine(t, y, f):
+def fit_sine(t, y, f, with_err=False, extra_f=()):
     """Complex amplitude Z of the component of y at f (y ~ Re(Z exp(2 pi i f t)) + offset + drift),
     by least squares; the offset and linear drift terms absorb integrator offsets and slow drifts.
-    The fit uses <= 4096 samples, but never fewer than 16 per period of f."""
+    The fit uses <= 4096 samples, but never fewer than 16 per period of f.
+    with_err: also return the 1-sigma uncertainty of |Z| from the fit residual (white-noise estimate).
+    extra_f: other tones fitted alongside (e.g. the dither on OUT1), so they neither leak in nor count as noise."""
     t = np.asarray(t, dtype=float)
     y = np.asarray(y, dtype=float)
     per_cycle = 1.0 / (f * (t[1] - t[0])) if len(t) > 1 else 1.0
     k = int(max(1, min(len(t) // 4096, per_cycle // 16)))
     t, y = t[::k], y[::k]
     w = 2 * np.pi * f * t
-    M = np.column_stack([np.cos(w), np.sin(w), np.ones_like(t), t - t.mean()])
+    cols = [np.cos(w), np.sin(w), np.ones_like(t), t - t.mean()]
+    for fe in extra_f:
+        if fe > 0 and abs(fe - f) > 2.0 / max(t[-1] - t[0], 1e-12):     # resolvable from f in this record
+            cols += [np.cos(2 * np.pi * fe * t), np.sin(2 * np.pi * fe * t)]
+    M = np.column_stack(cols)
     c = np.linalg.lstsq(M, y, rcond=None)[0]
-    return complex(c[0], -c[1])
+    Z = complex(c[0], -c[1])
+    if not with_err:
+        return Z
+    res = y - M @ c
+    return Z, float(np.std(res) * math.sqrt(2.0 / max(len(y) - 4, 1)))
 
 
 def bode_init(mode, fs, models, title, note):
@@ -1612,7 +1824,7 @@ def bode_json(B):
     if not B:
         return None
     out = dict(mode=B["mode"], title=B["title"], note=B["note"], n=B["n"], n_total=B["n_total"], done=B["done"],
-               f_dither=B.get("f_dither"),
+               f_dither=B.get("f_dither"), analysis=B.get("analysis"),
                ugf=B.get("ugf"), pm=B.get("pm"), fp=[round(x, 5) for x in B["f_plan"]], curves=[])
     for cv in B["curves"]:
         d = dict(name=cv["name"], color=cv["color"], f=[round(x, 5) for x in cv["f"]], low=cv.get("low"))
@@ -1627,6 +1839,167 @@ def bode_json(B):
         out["curves"].append(d)
     return out
 
+
+
+def _cross(f, y, level):
+    """First frequency where y (sampled at log-spaced f) crosses level, log-interpolated; None if it never does."""
+    f, y = np.asarray(f, dtype=float), np.asarray(y, dtype=float)
+    idx = np.flatnonzero(np.diff(np.sign(y - level)) != 0)
+    if not len(idx):
+        return None
+    i = idx[0]
+    x0, x1 = math.log(f[i]), math.log(f[i + 1])
+    return math.exp(x0 + (level - y[i]) * (x1 - x0) / (y[i + 1] - y[i]))
+
+
+def analyze_bode(B, s, f_d, lock_info):
+    """Automatic reading of a finished Bode measurement: [(level, text)], level OK / INFO / WARN."""
+    out = []
+    cur = {cv["name"]: cv for cv in B["curves"]}
+
+    def arrays(cv, resolved=True):
+        f = np.array(cv["f"], dtype=float)
+        c = np.array(cv["c"], dtype=complex)
+        if resolved and cv.get("low"):
+            ok = ~np.array(cv["low"], dtype=bool)
+            f, c = f[ok], c[ok]
+        return f, c
+
+    def model_dev(cv):
+        f, c = arrays(cv)
+        if not len(f) or not cv.get("model"):
+            return None
+        m = np.array(cv["model"], dtype=complex)[np.isin(np.array(cv["f"]), f)][:len(c)]
+        keep = np.abs(m) > 0.3 * np.median(np.abs(m))    # relative error is meaningless at a null of the model
+        if not keep.any():
+            return None
+        q = c[keep] / m[keep]
+        return float(np.max(np.abs(np.abs(q) - 1))), float(np.max(np.abs(np.degrees(np.angle(q)))))
+    if not B.get("n"):
+        return [("WARN", "no points measured")]
+    ol = B["curves"][-1] if B["mode"] == "circuit only" else cur.get("G open loop")
+    f, G = arrays(ol)
+    ph = np.degrees(np.unwrap(np.angle(G)))
+    mag_db = 20 * np.log10(np.maximum(np.abs(G), 1e-15))
+    fu, pm = margins(f, G) if len(f) > 1 else (None, None)
+    what = "electronics alone" if B["mode"] == "circuit only" else "measured loop"
+    if fu:
+        lvl = "OK" if pm >= 45 else "WARN"
+        out.append((lvl, f"{what}: unity gain {fu:.3g} Hz, phase margin {pm:.0f}°" +
+                    ("" if pm >= 45 else " (under 45°: expect ringing / oscillation)")))
+    else:
+        out.append(("WARN", f"{what}: no unity-gain crossing between {f[0]:.3g} and {f[-1]:.3g} Hz"))
+    f180 = _cross(f, ph, -180)
+    if f180:
+        gm = -float(np.interp(math.log(f180), np.log(f), mag_db))
+        out.append(("OK" if gm >= 6 else "WARN", f"phase reaches -180° at {f180:.3g} Hz: gain margin {gm:.1f} dB"))
+    else:
+        out.append(("INFO", f"phase stays above -180° up to {f[-1]:.3g} Hz (no gain-margin limit in range)"))
+    f135 = _cross(f, ph, -135)
+    if B["mode"] == "circuit only":
+        if f135:
+            out.append(("INFO", f"phase reaches -135° at {f135:.3g} Hz: the electronics allow a loop bandwidth up to "
+                                f"~{f135:.3g} Hz at 45° margin (set 'Loop bandwidth' up to that, before the driver)"))
+        drv = s["driver_bw_hz"]
+        if drv > 0:
+            ph_d = ph - np.degrees(np.arctan(f / drv))
+            f135d = _cross(f, ph_d, -135)
+            if f135d:
+                out.append(("INFO", f"with the assumed {drv:g} Hz driver pole: ~{f135d:.3g} Hz at 45° margin"))
+        fl, L = arrays(cur["lock-in chain (normalized)"])
+        f3 = _cross(fl, 20 * np.log10(np.maximum(np.abs(L), 1e-15)), -3.01)
+        if f3:
+            lag = float(np.interp(math.log(fu), np.log(fl), np.degrees(np.unwrap(np.angle(L))))) if fu else None
+            out.append(("INFO", f"lock-in chain: -3 dB at {f3:.3g} Hz" +
+                        (f"; {lag:+.0f}° at the unity-gain frequency" if lag is not None else "") +
+                        f"; DC gain {B.get('dc_gain', 0):.3g} V/V"))
+        if f3 and f3 > f_d / 3:
+            out.append(("WARN", f"lock-in -3 dB ({f3:.3g} Hz) above dither/3: dither ripple reaches the error signal"))
+        # pipeline delay from the phase residual against the delay-free model, at high frequency
+        cvL = cur["lock-in chain (normalized)"]
+        fl_all = np.array(cvL["f"])
+        if len(fl) >= 3:
+            bw = [x for x in ([s["lpf_hz"]] * int(s["lpf_order"]))]
+            ideal = np.ones(len(fl), dtype=complex)
+            for b in bw:
+                ideal = ideal / (1 + 1j * fl / b)
+            res = np.unwrap(np.angle(L / ideal))
+            hi = fl > 1e4
+            if hi.sum() >= 2:
+                tau = -np.polyfit(2 * np.pi * fl[hi], res[hi], 1)[0]
+                out.append(("INFO", f"lock-in pipeline delay from the phase: {tau*1e9:.0f} ns "
+                                    f"(Verilog count {(3 + 2 * len(bw)) * 8} ns)"))
+        fp, Cp = arrays(next(cv for n, cv in cur.items() if n.startswith("P + I")))
+        sl = np.polyfit(np.log10(fp[:3]), 20 * np.log10(np.abs(Cp[:3])), 1)[0] if len(fp) >= 3 else None
+        if sl is not None:
+            out.append(("OK" if abs(sl + 20) < 3 else "WARN",
+                        f"P + I: low-frequency slope {sl:.1f} dB/decade (an integrator is -20)"))
+        if s["p_gain"] > 0:
+            out.append(("INFO", f"P + I corner (P = I) at {s['ugf_hz'] / s['p_gain']:.3g} Hz"))
+        if pid_null_warning(s):
+            out.append(("WARN", pid_null_warning(s)))
+        dname = next((n for n in cur if n.startswith("D x")), None)
+        if dname:
+            fD, Dm = arrays(cur[dname])
+            fC, Cc = arrays(next(cv for n, cv in cur.items() if n.startswith("P + I")))
+            common = np.intersect1d(fD, fC)
+            if len(common):
+                lead = np.degrees(np.angle((Cc[np.isin(fC, common)] + Dm[np.isin(fD, common)]) / Cc[np.isin(fC, common)]))
+                k = int(np.argmax(lead))
+                out.append(("INFO", f"D adds up to {lead[k]:.0f}° of phase lead (at {common[k]:.3g} Hz)"))
+        if "band-pass at IN1 (carrier frequency)" in cur:
+            st = SCH.bp_stages(s)
+            H = complex(stages_response(st, f_d))
+            df = f_d * 1e-3
+            ph_hi = np.angle(stages_response(st, f_d + df))
+            ph_lo = np.angle(stages_response(st, f_d - df))
+            tg = -(ph_hi - ph_lo) / (2 * np.pi * 2 * df)
+            h2 = abs(complex(stages_response(st, 2 * f_d))) / max(abs(H), 1e-15)
+            out.append(("INFO", f"band-pass at the dither {f_d:g} Hz: {20*math.log10(abs(H)):+.1f} dB, "
+                                f"{math.degrees(np.angle(H)):+.0f}° (absorbed by the phase fit), group delay "
+                                f"{tg*1e6:.0f} us" + (f" = {360*fu*tg:.1f}° extra lag at the unity-gain frequency"
+                                                      if fu else "")))
+            out.append(("INFO", f"band-pass rejects the dither 2nd harmonic ({2*f_d:g} Hz) by "
+                                f"{-20*math.log10(max(h2, 1e-15)):.1f} dB relative to the dither"))
+            fb, Hb = arrays(cur["band-pass at IN1 (carrier frequency)"])
+            if len(fb):
+                pk = int(np.argmax(np.abs(Hb)))
+                out.append(("INFO", f"band-pass measured peak {20*math.log10(abs(Hb[pk])):+.1f} dB at {fb[pk]:.3g} Hz"))
+        for cv in B["curves"]:
+            dv = model_dev(cv)
+            if dv:
+                lvl = "OK" if dv[0] < 0.1 and dv[1] < 5 else "WARN"
+                out.append((lvl, f"{cv['name'].split(' (')[0]}: within {dv[0]*100:.1f} % and {dv[1]:.1f}° of the model"))
+        n_low = sum(B["curves"][-1].get("low") or [])
+        if n_low:
+            out.append(("INFO", f"{n_low} point(s) under the scope resolution even auto-ranged (hollow): the response "
+                                "there is below ~1e-6 of the input"))
+    else:
+        if f135:
+            out.append(("INFO", f"measured phase reaches -135° at {f135:.3g} Hz: loop bandwidth can go up to ~that "
+                                "at 45° margin"))
+        n_low = sum(cur["G open loop"].get("low") or [])
+        if n_low:
+            out.append(("WARN", f"{n_low} point(s) noise-limited (G uncertain by > 25 %, hollow, left out of the "
+                                "margins): raise 'Loop: excitation' or 'cycles per point'" +
+                                (" (D amplifies the error noise)" if s.get("d_on") else "")))
+        fs_, S_ = arrays(cur["S = 1/(1+G): disturbance suppression"])
+        if len(fs_):
+            sdb = 20 * np.log10(np.abs(S_))
+            out.append(("INFO", f"disturbance suppression {sdb[0]:+.1f} dB at {fs_[0]:.3g} Hz"))
+            pk = int(np.argmax(sdb))
+            out.append(("OK" if sdb[pk] < 6 else "WARN", f"sensitivity peak {sdb[pk]:+.1f} dB at {fs_[pk]:.3g} Hz "
+                        "(disturbances amplified there; < 6 dB is robust)"))
+        ft, T_ = arrays(cur["T = G/(1+G): closed loop"])
+        f3 = _cross(ft, 20 * np.log10(np.abs(T_)), -3.01) if len(ft) else None
+        if f3:
+            out.append(("INFO", f"closed-loop -3 dB bandwidth {f3:.3g} Hz"))
+        dv = model_dev(cur["G open loop"])
+        if dv:
+            out.append(("OK" if dv[0] < 0.2 else "WARN",
+                        f"open loop within {dv[0]*100:.0f} % and {dv[1]:.0f}° of the model"
+                        + ("" if dv[0] < 0.2 else ": check the slope, the driver bandwidth or the excitation")))
+    return out
 
 # ---------------------------------------------------------------------------------------------
 # Browser UI: the schematic and the embedded scope live in ui.py

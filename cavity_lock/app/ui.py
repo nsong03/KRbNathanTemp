@@ -18,8 +18,9 @@ import numpy as np
 import schematic as SCH
 
 PANEL_LABEL = {"drive": "probes A/B"}
-SHORT = {"ac_hz": "Hz", "lpf_hz": "Hz", "lpf_order": "order", "err_gain": "gain ×", "setpoint_mv": "mV",
-         "ugf_hz": "UGF Hz", "clamp_auto": "auto (mode spacing)", "phase_deg": "deg", "acq_dither_hz": "Hz",
+SHORT = {"ac_hz": "Hz", "lpf_hz": "", "lpf_order": "order", "err_gain": "gain ×", "setpoint_mv": "mV",
+         "ugf_hz": "I: UGF Hz", "p_gain": "P", "clamp_auto": "auto (mode spacing)", "bp_on": "on (pid2)",
+         "d_on": "on", "d_ugf_hz": "f_D Hz", "phase_deg": "deg", "acq_dither_hz": "Hz",
          "acq_dither_mvpp": "mVpp", "ramp_hz": "Hz", "ramp_mvpp": "mVpp", "out2_signal": "", "in1_scale": "×",
          "kappa_mhz": "κ MHz", "driver_bw_hz": "Hz"}
 COLORS = {"A": "#e67e22", "B": "#8e44ad"}
@@ -298,6 +299,22 @@ function(hdr, px, styles) {
 """
 
 
+def bode_analysis(B):
+    """The automatic reading of a finished Bode measurement, colour-coded."""
+    from dash import html
+    if not B or not B.get("analysis"):
+        return [] if not B or B.get("done") else [html.Div("analysis follows when the sweep ends", style={"color": "#888"})]
+    col = {"OK": "#1e8e3e", "WARN": "#c0392b", "INFO": "#444"}
+    return [html.B(f"Analysis ({B['mode']})")] + [
+        html.Div([html.Span(f"{lvl:<4} ", style={"color": col.get(lvl, "#444"), "fontWeight": "bold",
+                                                 "fontFamily": "monospace"}), html.Span(txt)])
+        for lvl, txt in B["analysis"]]
+
+
+def hz_label(x):
+    return f"{x/1e6:.4g} MHz" if x >= 1e6 else f"{x/1e3:.4g} kHz" if x >= 1e3 else f"{x:.4g} Hz"
+
+
 def build_app(ctl, A):
     """A: the cavity_lock_app module (FIELDS, analysis helpers)."""
     from dash import Dash, dcc, html, Input, Output, State, ctx, no_update, ALL
@@ -331,9 +348,18 @@ def build_app(ctl, A):
         val = to_ui(key, ctl.s.get(key, default))
         widget = WIDGET.get(key)
         cid = f"s-{key}"
-        if kind == "num" and widget == "radio":
-            comp = dcc.RadioItems(id=cid, options=[{"label": f" {o}", "value": o} for o in (1, 2)], value=val,
+        if kind == "num" and widget and widget.startswith("radio"):
+            opts_ = [int(x) for x in widget.split(":")[1].split(",")]
+            comp = dcc.RadioItems(id=cid, options=[{"label": f" {o}", "value": o} for o in opts_], value=val,
                                   inline=True, inputStyle={"marginLeft": "4px"})
+        elif kind == "num" and widget and widget.startswith("ladder"):
+            lk = widget.split(":")[1]
+            off = lk.endswith("0")
+            ladder = ctl.options[lk.rstrip("0")]
+            items = ([{"label": "off", "value": 0.0}] if off else []) + \
+                [{"label": hz_label(x), "value": x} for x in ladder]
+            comp = dcc.Dropdown(id=cid, options=items, value=val, clearable=False, searchable=False,
+                                style={"width": "104px" if short is not None else "120px", "fontSize": "12px"})
         elif kind == "num":
             comp = dcc.Input(id=cid, type="number", value=val, debounce=True,
                              step=1 if widget == "int" else "any", **opt)
@@ -382,6 +408,9 @@ def build_app(ctl, A):
     def block_pop(b):
         rest = [p["key"] for p in b["params"] if not p["inline"]]
         body = [control(k) for k in rest]
+        if b["id"] == "bandpass":
+            body.insert(0, html.Div("Band-pass (pid2 input filter)", className="sub"))
+            body.insert(5, html.Div("AC coupling (iq0 input high-pass)", className="sub"))
         if b["opts"]:
             body.append(html.Div({"pid": "Lock stages (sequence, no register)",
                                   "limiter": "Watchdog (Auto-relock switch)"}.get(b["id"], "Options"), className="sub"))
@@ -471,6 +500,7 @@ def build_app(ctl, A):
             dcc.Graph(id="noise", config={"displaylogo": False}, style={"display": "none"}),
             dcc.Graph(id="loopfig", config={"displaylogo": False}, style={"display": "none"}),
             dcc.Graph(id="bodefig", config={"displaylogo": False}, style={"display": "none"}),
+            html.Div(id="bode-analysis", style={"fontSize": "13px", "margin": "0 0 10px 60px"}),
             html.Div([
                 html.Div(id="analysis", style={"flex": "1", "fontSize": "13px", "whiteSpace": "pre-wrap"}),
                 html.Pre(id="log", style={"flex": "1", "fontSize": "12px", "height": "26vh", "overflowY": "auto",
@@ -626,7 +656,7 @@ def build_app(ctl, A):
          Output("noise", "style"), Output("loopfig", "style"),
          Output("history", "style"), Output("meas-seq", "data"), Output("tick", "interval"),
          Output("diag", "data"), Output("diag-key", "data"), Output("bode", "data"), Output("bode-seq", "data"),
-         Output("bodefig", "style")]
+         Output("bodefig", "style"), Output("bode-analysis", "children")]
         + [Output(f"s-{k}", "value") for k in KEYS] + [Output("synced", "data")],
         Input("tick", "n_intervals"), State("synced", "data"), State("frame-seq", "data"), State("meas-seq", "data"),
         State("diag-key", "data"), State("bode-seq", "data"))
@@ -709,7 +739,8 @@ def build_app(ctl, A):
                 hist_style, snap["meas_seq"] if meas_new else no_update, interval, diag_out, key_out,
                 A.bode_json(snap["bode"]) if snap["bode_seq"] != bode_seq else no_update,
                 snap["bode_seq"] if snap["bode_seq"] != bode_seq else no_update,
-                {} if "Bode (swept)" in s["panels"] else {"display": "none"}] + vals
+                {} if "Bode (swept)" in s["panels"] else {"display": "none"},
+                bode_analysis(snap["bode"]) if snap["bode_seq"] != bode_seq else no_update] + vals
 
     # The measurement plots get their own callbacks: sending both figures inside the 10 Hz tick response made
     # the browser drop the whole update (seen with Dash 4.5), freezing the page.
