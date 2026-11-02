@@ -194,7 +194,13 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   routed to an output during it, that the closed-loop G equals the fake's true loop gain below 100 Hz (< 5 %), and Stop.
   `ui_v4.py` checks that the plot fills in point by point, both modes complete, and Stop.
 - The fake scope records **after** it is armed (untriggered), like the hardware; it used to return the past window.
-- Results 2026-11-02, v5 (this container, 4 cores): see the end of this section (filled in after the runs).
+- Results 2026-11-02, v5 (Linux container, 4 cores, fake): `test_v3.py` all pass (63), `test_intensity.py` 71/71,
+  `test_isolation.py` 29/29, `ui_v4.py` 56/56, `ui_v5.py` 70/70. Redraws/s: cavity scanning 7.4–7.6, cavity locked
+  9.8–10 (intensity locked and hidden), intensity locked 10; main (v4 + Bode) on the same host: 7.5 / 10. Tick
+  4.5 ms (cavity view, incl. JSON) vs 4.0 ms on main. Intensity Bode on the fake: UGF 30.2 kHz for a 30 kHz setting,
+  PM 86°; measured G within 2 % of the fake's true loop gain. The closed-loop cavity Bode accuracy check (5 % at
+  4 Hz) is noise-limited and fails in some runs (6.2 %, 5.7 %) on this host too; it passed in the final run.
+  Screenshots: `docs/screenshots/v5_*.png`.
 - Results 2026-11-02 (Bode added, a slower container): `test_v3.py` 63/63; `ui_v4.py` 56/58 functional checks pass,
   the 2 redraw-rate checks fail on that host for the old and the new code alike (A/B: 5–6/s both; tick 7.0 ms old vs
   7.5 ms new there).
