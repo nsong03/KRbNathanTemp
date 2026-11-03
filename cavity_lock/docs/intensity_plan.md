@@ -1,6 +1,8 @@
 # AOM intensity stabilization on IN2/OUT2: plan
 
-Status: **approved with changes** (2026-11-02). Decisions: cavity Bode closed loop on asg0, circuit-only on
+Status: **approved with changes** (2026-11-02). **Update 2026-11-02 (later): the power scan is removed** (user
+decision: no scanning in the intensity servo). K is measured by an open-loop Bode plot (sine on OUT2, loop open);
+the clamps are set by hand; the lock starts from the present drive. Sections below that mention the scan are history. Decisions: cavity Bode closed loop on asg0, circuit-only on
 iq1 + pid1 borrowed (outputs off); start-up resets OUT2 to 0 V unless pid2 has non-zero gains (adopt as locked);
 a setpoint adjuster (slider + ± steps); P / I / D dropdowns on the stabilizer (D shown disabled: not in this
 bitstream); **no intensity-noise analysis** (RIN spectrum and rms history dropped): the intensity view measures a

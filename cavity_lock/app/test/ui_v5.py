@@ -19,9 +19,8 @@ LAUNCH = dict(executable_path=os.environ.get("CHROME", "/opt/pw-browsers/chromiu
     if os.path.exists(os.environ.get("CHROME", "/opt/pw-browsers/chromium")) else {}
 FIELD = {f[0]: f for f in A.FIELDS}
 NEW = dict(int_filter_hz="200000", int_filter_stages="2", int_setpoint_mv="480", int_gain_mode="manual",
-           int_ugf_khz="20", int_p="0.002", int_i_hz="1000", int_corner_khz="500", int_clamp_auto=None,
-           int_clamp_margin="0.1", int_clamp_lo_mv="-30", int_clamp_hi_mv="120", int_out2_limit_mv="250",
-           int_scan_lo_mv="-150", int_scan_hi_mv="150", int_scan_hz="80", int_scan_avg="2",
+           int_ugf_khz="20", int_p="0.002", int_i_hz="1000", int_corner_khz="500",
+           int_clamp_lo_mv="-30", int_clamp_hi_mv="120", int_out2_limit_mv="250",
            int_mw_per_v="2", int_pd_bw_mhz="10", int_aom_max_dbm="30", int_aom_delay_us="0.3",
            int_amp_gain_db="31", int_if_full_ma="20", int_rf_src_dbm="3", int_bias_v="1.5")
 FAILS = []
@@ -119,15 +118,29 @@ async def main():
         check("intensity status: OUTPUT OFF", await wait_status("Intensity: OUTPUT OFF", 5))
         await iflip("output")
         check("Output on -> HELD, Output pill on", await wait_status("HELD", 5) and "on" in await ipill("output"))
-        await iflip("scan")
-        check("Scan on -> SCANNING, Scan pill on", await wait_status("SCANNING", 5) and "on" in await ipill("scan"))
-        await pg.wait_for_timeout(2500)
-        names = await pg.evaluate(JS_ITRACES)
-        check("the power scan is drawn (light vs OUT2)", "photodiode (in2)" in names, str(names))
-        await pg.screenshot(path="v5_2_scan.png")
+        check("no Scan switch in the intensity view", await pg.locator(pid(type="isw", s="scan")).count() == 0)
+        await pg.locator(pid(type="hdr", b="i_measure")).click()
+        await pg.wait_for_timeout(300)
+        for k, v in (("int_bode_points", "10"), ("int_bode_start_hz", "2000"), ("int_bode_stop_hz", "300000")):
+            loc = pg.locator(f"#s-{k}")
+            await loc.fill(v); await loc.press("Enter"); await pg.wait_for_timeout(400)
+        await pg.locator(pid(type="popx", b="i_measure")).click()
+        await pg.click("#btn-ibode")                      # not locked: the open-loop plant (measures K)
+        for _ in range(240):
+            st = await pg.evaluate(JS_IBODE)
+            if st["n"] > 0 and "measuring" not in st["title"] and "K =" in st["title"]:
+                break
+            await pg.wait_for_timeout(250)
+        check("open-loop Bode (loop not locked) measures the plant and K", "open loop" in st["title"]
+              and "K = -" in st["title"] and st["n"] == 10, st["title"][-80:])
+        await pg.wait_for_timeout(800)
+        rb = await pg.locator("#i-rb-i_pid").inner_text()
+        check("PI box shows the measured K", "K -" in rb, rb.replace("\n", " | "))
+        await pg.locator("#ibodefig").scroll_into_view_if_needed()
+        await pg.locator("#ibodefig").screenshot(path="v5_2_plant_bode.png")
         await iflip("lock")
-        check("Lock (from scanning) -> LOCKED", await wait_status("Intensity: LOCKED", 10)
-              and "on" in await ipill("lock") and "on" not in await ipill("scan"))
+        check("Lock (from held, with the Bode K) -> LOCKED", await wait_status("Intensity: LOCKED", 10)
+              and "on" in await ipill("lock"))
         await pg.wait_for_timeout(1500)
         check("dots: both green", "ok" in await dot("cav") and "ok" in await dot("int"),
               f"{await dot('cav')} / {await dot('int')}")
@@ -227,14 +240,14 @@ async def main():
 
         # ---- setpoint adjuster ----
         print("--- setpoint adjuster")
-        n_btn = await pg.locator(".spadj button").count()
+        n_btn = await pg.locator(".b-i_setpoint .spadj button").count()
         print("setpoint buttons:", n_btn, await pg.evaluate("() => Array.from(document.querySelectorAll("
                                                             "'.spadj button')).map(e => e.id)"))
-        await pg.locator(".spadj button", has_text=re.compile(r"^\+10$")).click()
+        await pg.locator(".b-i_setpoint .spadj button", has_text=re.compile(r"^\+10$")).click()
         await pg.wait_for_timeout(1200)
         check("+10 mV button -> setpoint 510 mV (status and input follow)", "setpoint 510 mV" in await status()
               and (await pg.locator("#s-int_setpoint_mv").input_value()) == "510", await status())
-        await pg.locator(".spadj button", has_text=re.compile("^\u22120\\.1$")).click()
+        await pg.locator(".b-i_setpoint .spadj button", has_text=re.compile("^\u22120\\.1$")).click()
         await pg.wait_for_timeout(1000)
         check("−0.1 mV button", "setpoint 509.9 mV" in await status(), await status())
         sl = pg.locator(".spslider .dash-slider-root").first
@@ -274,18 +287,11 @@ async def main():
         off = "on" not in await ipill("reengage")
         await iflip("reengage")
         check("Re-engage switch toggles", off and "on" in await ipill("reengage"))
-        await iflip("scan")
-        await pg.wait_for_timeout(500)
-        check("Scan on while locked asks first; OK -> SCANNING", any("intensity servo is locked" in d for d in dialogs)
-              and await wait_status("SCANNING", 10), dialogs[-1][:50] if dialogs else "no dialog")
-        await pg.wait_for_timeout(1500)
-        await iflip("scan")
-        check("Scan off -> HELD", await wait_status("HELD", 5))
         await iflip("output")
         check("Output off -> OUTPUT OFF, OUT2 wire dead", await wait_status("OUTPUT OFF", 5)
               and "off" in (await pg.locator("#i-wire-lim_sum").get_attribute("class")))
         await iflip("lock")
-        check("Lock from off -> LOCKED (with the last scan)", await wait_status("Intensity: LOCKED", 10))
+        check("Lock from off -> LOCKED (with the Bode K)", await wait_status("Intensity: LOCKED", 10))
         await iflip("lock")
         check("Lock off -> HELD", await wait_status("HELD", 5))
         await iflip("lock")
@@ -306,13 +312,17 @@ async def main():
         async def bode_wait_done(timeout=120):
             for _ in range(timeout * 2):
                 st = await pg.evaluate(JS_IBODE)
-                if "measuring" not in st["title"] and st["n"] > 0:
+                if "closed" in st["title"] and "measuring" not in st["title"] and st["n"] > 0:
                     return st
                 await pg.wait_for_timeout(500)
             return await pg.evaluate(JS_IBODE)
 
         await pg.click("#btn-ibode")
         seen, stat = [], ""
+        for _ in range(80):                                # wait until the new (closed-loop) plot replaces the old one
+            if "closed" in (await pg.evaluate(JS_IBODE))["title"]:
+                break
+            await pg.wait_for_timeout(100)
         for _ in range(240):
             st = await pg.evaluate(JS_IBODE)
             if st["n"] >= 0 and (not seen or st["n"] != seen[-1]):

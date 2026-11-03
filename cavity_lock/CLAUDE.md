@@ -38,7 +38,7 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 | --- | --- | --- |
 | iq0, asg0, pid0, OUT1 | cavity | dither + demodulation, ramp (and the cavity Bode test sine), lock |
 | iq1, pid1 | cavity, measurement only | copies for the circuit-only Bode, **outputs off**, restored to off after |
-| pid2, asg1 | intensity | servo (input in2, output_direct out2), power scan / Bode test sine on out2 |
+| pid2, asg1 | intensity | servo (input in2, output_direct out2), Bode test sine on out2 |
 | pid1 (otherwise) | nobody | off. Keep it free: it is pid0's only partner in PyRPL's differential mode |
 | iq2 | network analyzer | free (the cavity "Measure loop" NA takes it) |
 | scope | shared | scheduled (see "Scope schedule") |
@@ -50,7 +50,7 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 ## Architecture (keep it)
 - Files: `app/cavity_lock_app.py` (analysis, `Controller`, `main`), `app/schematic.py` (the cavity diagram as data:
   blocks, parameters → FIELDS key → PyRPL attribute, block writers, wires, switches, probes, readback text),
-  `app/intensity.py` (`I_FIELDS`, power-scan analysis, `Intensity` servo controller, run by the Controller),
+  `app/intensity.py` (`I_FIELDS`, `plant_gain`, loop model, `Intensity` servo controller, run by the Controller),
   `app/intensity_schematic.py` (the intensity diagram, same structure, element ids prefixed `i-`),
   `app/ui.py` (Dash layout and callbacks for both views, `build_app(ctl, A)`; `cavity_lock_app.build_app(ctl)` wraps it).
 - **One model, two consumers.** `configure()` = `SCH.write_static(ctl)` (+ snapping); an apply runs only the writers of
@@ -96,24 +96,27 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   `ramp_center`, clipped to ±0.95 V). Scanning: moves asg0.offset. After Scan off (`ctl._parked_at_ramp`): moves the
   parked OUT1 level (pid0.ival). Never while locked or held after an unlock. Test: `test/test_ramp_setpoint.py`.
 - **Intensity servo** (`intensity.py`, same architecture: main thread, version-checked settings `int_*`, snapped values):
-  - Modes `off` → `scanning` → `locking` → `locked`, plus `held`, `measuring`, faults `railed` and `nolight`.
-  - Power scan (Scan switch): pid2 p = i = ival = 0, asg1 triangle on out2 within the scan limits (clipped to
-    `int_out2_limit_mv`), scope (in2, asg1) triggered on asg1. `analyze_scan`: efficiency peak, bright direction,
-    auto clamp (bright side where light = (1 − margin) × peak, dark side = scan limit), K = dV_IN2/dV_OUT2 at the
-    setpoint, OUT2 for the setpoint, max lockable light. Saved to `intensity_scan.json` (runtime, gitignored).
-  - Lock: asg1 off → setpoint → clamp → ival = OUT2 for the setpoint → gains in steps (f_u/10, f_u/3, f_u, 30 ms).
-    Bandwidth mode: i = −f_u/K, p = i/f_corner. Manual mode: P and I dropdowns (1-2-5 ladders, magnitudes), sign
-    −sign(K). D is shown as a disabled dropdown (not in this bitstream). i ≤ 38.9 kHz → cap 38.9 kHz × |K| (warned).
-  - Setpoint adjuster: slider (0 .. scan peak) + ±0.1/1/10 mV buttons + number box (`int_setpoint`, `int_nudge`
-    commands); written live; while locked the gains are re-derived from the scan's K at the new setpoint.
+  - **No scan** (user decision 2026-11-02): the only intensity measurement is the swept-sine Bode plot.
+  - Modes `off` → `locking` → `locked`, plus `held` (Output on, loop open), `measuring`, faults `railed`, `nolight`.
+  - Measure Bode plot: asg1 sine on OUT2 (summed with pid2), point by point, Stop. **Not locked** (off / held): open-loop
+    plant P = in2/x around the present drive (amplitude `int_bode_amp_mv`); `plant_gain()` takes its low-frequency
+    value as K = dV_IN2/dV_OUT2 (sign from the phase), saved to `intensity_plant.json` (runtime, gitignored).
+    **Locked**: captures (asg1, pid2) and (asg1, in2), T = c/x, G = −T/(1+T), S = 1+T, plant = (in2/x)/S, amplitude
+    `int_bode_amp_frac` × setpoint/|K| inside the clamp; it also re-measures K at the lock point and updates the shown
+    |i·K| (gains unchanged; re-lock or touch a gain setting to apply). Stops and holds if the output reaches a clamp.
+  - Lock: asg1 off → setpoint → clamp (`int_clamp_lo_mv` / `int_clamp_hi_mv`; low = bright side, keep it short of the
+    efficiency peak) → start from the present drive (0 V = bias after Output on) → gains in steps (f_u/10, f_u/3, f_u).
+    Bandwidth mode needs a measured K (refused otherwise): i = −f_u/K, p = i/f_corner. Manual mode: P and I dropdowns
+    (1-2-5 ladders, magnitudes), sign −sign(K), or from `int_plant_sign` (default negative) while K is unmeasured.
+    D is shown as a disabled dropdown (not in this bitstream). i ≤ 38.9 kHz → cap 38.9 kHz × |K| (warned).
+  - Setpoint adjuster: slider (0..1000 mV) + ±0.1/1/10 mV buttons + number box (`int_setpoint`, `int_nudge`
+    commands); written live. K is not re-derived for a new setpoint (re-measure with a locked Bode plot).
   - Watchdog: light < `int_light_frac` × setpoint twice → `nolight` (hold at the median of the last good drives; with
     Re-engage on, lock again after 0.2 s of light). Output within 2 % of a clamp for > `int_rail_s` → `railed`
     (hold, log; no auto re-engage).
   - Start-up: pid2 on out2 with non-zero gains → adopted as `locked`, registers untouched (setpoint/filter read
     back). Otherwise pid2 p = i = ival = 0, output off, asg1 off → OUT2 = 0 V, mode `off`.
-  - Measure Bode plot (locked): asg1 sine on OUT2 (summed with pid2), captures (asg1, pid2) and (asg1, in2),
-    T = c/x, G = −T/(1+T), S = 1+T, plant = (in2/x)/S; amplitude = `int_bode_amp_frac` × setpoint/|K| inside the
-    clamp; stops and holds if the output reaches a clamp. No intensity-noise analysis in the app (user decision).
+  - No intensity-noise analysis in the app (user decision).
 - **Scope schedule** (`Controller.run` / `_pick`): one frame per pass for one loop. The visible view's loop gets the
   frames; the hidden loop gets 1 frame/s. Its watchdog is the register-only check (`_bg_service`: pid ival + sampler
   photodiode value, every 0.1 s) that runs inside the visible loop's captures and inside every `_wait()` of a
@@ -136,9 +139,8 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
     exists exactly once (inline in a box or in a hidden popover), so the version-checked apply callback is unchanged.
     `DIAG_JS` (clientside) draws the SVG wires once and updates readback text, switch pills and probe badges from
     `dcc.Store("diag")`, which the tick sends only when it changes. `POP_JS` opens/closes popovers.
-  - Intensity view: `iframe` / `idiag` / `ibode` / `iscan-seq` stores, `ISCOPE_JS` (live probes A/B or the scan),
-    `scan_fig` (last scan, server-side, keyed on `iscan-seq`); main capture in2 + pid2, other probe pairs every
-    `drive_every` frames.
+  - Intensity view: `iframe` / `idiag` / `ibode` stores, `ISCOPE_JS` (live probes A/B, history); main capture
+    in2 + pid2, other probe pairs every `drive_every` frames.
   - Probes: the main capture stays in1 + iq0. Probe pairs inside {in1, iq0} reuse it; others take a second capture
     every `drive_every` traces (the old "drive" capture; the `panels` key "drive" is shown as "probes A/B").
 
@@ -183,21 +185,28 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
     edits every block parameter through its own input, flips every switch (incl. the Scan-while-locked confirm),
     places probes, clicks a crosshair, locks with the switch, runs both measurements, redraws/s, screenshots.
   - `tick_timing.py`, `render_timing.py`, `prof_tick.py` and `bench_v2style.py` are performance probes.
-- `python test_intensity.py`: scan (peak, clamp below it, K sign and value), lock (gains, |i·K|, setpoint), 120 Hz line
+- `python test_intensity.py`: no scan functionality; bandwidth lock refused without K; manual lock with the sign
+  setting; open-loop Bode → K (sign, within 5 % of the fake) and the plant incl. delay; lock (gains, |i·K|), 120 Hz line
   ×200 and 0.1–3 kHz ×28 suppression, step recovery, beam block → hold → re-engage, Re-engage off, railed fault,
   setpoint adjuster, manual P/I, cap warning, every intensity block parameter → its register, probes, switches,
-  Bode vs the fake's true loop gain (< 10 %), Stop, old settings file, restart adoption / reset.
-- `python test_isolation.py`: both loops locked; hidden-loop checks ≥ 5/s in both views (with and without a
+  closed-loop Bode vs the fake's true loop gain (< 10 %), UGF = |i·K_true|, K updated at the lock point, Stop,
+  open-loop Bode when unlocked, old settings file (out2_*, int_scan_*), restart adoption / reset.
+- `python test_isolation.py`: open-loop intensity Bode while the cavity scans; both loops locked; hidden-loop checks ≥ 5/s in both views (with and without a
   sampler); a cavity unlock while hidden is caught and relocked; intensity watchdog while hidden; measurements in
   one loop with the other locked; view switching writes nothing; the write log in both directions.
 - `ui_v5.py` (Playwright, after `serve_v3.py`): icons/dots, both loops locked through the UI, view switching writes
   nothing (fake counter), view remembered after reload, every intensity block parameter through its own input,
-  setpoint buttons/slider, probes, switches incl. the Scan-while-locked confirm, intensity Bode + Stop, redraws/s
+  setpoint buttons/slider, probes, switches, open-loop plant Bode (K) then lock, closed-loop Bode + Stop, redraws/s
   per view, screenshots `v5_*.png`.
 - Bode tests: `test_v3.py` checks that the circuit-only sweep matches its model (< 5 %, < 5°), that asg1 is never
   routed to an output during it, that the closed-loop G equals the fake's true loop gain below 100 Hz (< 5 %), and Stop.
   `ui_v4.py` checks that the plot fills in point by point, both modes complete, and Stop.
 - The fake scope records **after** it is armed (untriggered), like the hardware; it used to return the past window.
+- Results 2026-11-02, after removing the intensity scan: `test_intensity.py` 69/69, `test_isolation.py` 30/30,
+  `ui_v5.py` 63/63, `ui_v4.py` 56/56, `test_ramp_setpoint.py` 8/8, `test_v3.py` 62/63 (only the noise-limited
+  closed-loop cavity Bode check, 7.2 % at 4 Hz vs 5 %; cavity code unchanged). Open-loop plant Bode on the fake:
+  K −8.04 V/V at the bias level (true −8.06); a lock set from it gives |i·K_true| ≈ 35–37 kHz for a 30 kHz setting,
+  because K is −9.6 at the lock point; the closed-loop Bode measures and shows that.
 - Results 2026-11-02, v5 (Linux container, 4 cores, fake): `test_v3.py` all pass (63), `test_intensity.py` 71/71,
   `test_isolation.py` 29/29, `ui_v4.py` 56/56, `ui_v5.py` 70/70. Redraws/s: cavity scanning 7.4–7.6, cavity locked
   9.8–10 (intensity locked and hidden), intensity locked 10; main (v4 + Bode) on the same host: 7.5 / 10. Tick

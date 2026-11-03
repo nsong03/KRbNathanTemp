@@ -18,7 +18,7 @@ Every statement here was read from that source or from PyRPL's Python modules, o
  Σ (red_pitaya_dsp.v, 5-clock adder tree of every module with output_direct out1) ─▶ saturate ±1 V ─▶ DAC (AD9767) ─▶ OUT1
  IN2 ─ ADC ─▶ pid2 (intensity servo): error = in2 − setpoint ─▶ [inputfilter, ≤4 stages] ─▶ P·e + ∫ I·e
           ─▶ clamp [min_voltage, max_voltage] ─▶ output_direct = out2
- asg1 (power-scan triangle / Bode test sine) ─▶ output_direct = out2
+ asg1 (Bode test sine) ─▶ output_direct = out2
  Σ (out2: pid2 + asg1) ─▶ saturate ±1 V ─▶ DAC ─▶ OUT2 ─▶ bias driver ─▶ mixer IF ─▶ RF amp ─▶ AOM
  pid1: off (kept free; the only differential-mode partner of pid0). The v4 OUT2 monitor is removed.
 ```
@@ -50,7 +50,7 @@ Latency, from the Verilog simulation and datasheets:
 | | `output_direct` | `"out1"` / `"off"` |
 | pid1 | as above | off; borrowed (output off) as the PID copy of the cavity circuit-only Bode |
 | pid2 | as above | intensity servo: `input = "in2"`, `output_direct = "out2"`, gains from the measured plant gain K (i·K < 0) |
-| asg1 | `setup(...)` | intensity power scan (`"ramp"` = triangle on out2, scope trigger `asg1`) and Bode test sine (`"sin"`) |
+| asg1 | `setup(...)` | intensity Bode test sine (`"sin"` on out2): open-loop plant or closed loop |
 | asg0 | `setup(waveform, frequency, amplitude, offset, trigger_source, output_direct)` | `"ramp"` = **triangle**, `"halframp"` = sawtooth. The ramp is the scope trigger (`trigger_source="asg0"` on the scope) |
 | scope | `input1`, `input2`, `duration`, `average`, `rolling_mode`, `trigger_source`, `trigger_delay`, `durations` | 2 channels, 16384 points per trace. Sources are any DSP signal name: `in1`, `in2`, `out1`, `out2`, `iq0`–`iq2`, `iq2_2`, `pid0`–`pid2`, `asg0`, `asg1`, `iir`, `trig` **(verify with `r.scope.inputs`)** |
 | scope (0.9.9.1) | `_start_trace_acquisition()`, `curve_ready()`, `_get_trace()` | 0.9.3 uses `_start_acquisition()` / `_get_curve()`. `single()` is the slow fallback |

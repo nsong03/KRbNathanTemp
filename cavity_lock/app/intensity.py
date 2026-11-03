@@ -6,14 +6,16 @@ Same architecture as the cavity lock: the Controller (cavity_lock_app.py) owns P
 thread; settings live in ctl.s (keys int_*), are version-checked, and show what the hardware uses; the diagram
 model and the register writers are in intensity_schematic.py.
 
-Modules: pid2 (servo, input in2, output_direct out2) and asg1 (power scan / Bode test sine on out2) only.
-This file never touches iq0, asg0, pid0 or OUT1.
+Modules: pid2 (servo, input in2, output_direct out2) and asg1 (Bode test sine on out2) only.
+This file never touches iq0, asg0, pid0 or OUT1. There is no scan: the only measurement is the swept-sine Bode plot.
 
-Modes: off -> scanning -> locking -> locked, plus held, measuring and the faults railed / nolight.
+Modes: off -> locking -> locked, plus held, measuring and the faults railed / nolight.
   off       pid2 p = i = ival = 0, output off, asg1 off: OUT2 = 0 V = bias level (the safe default)
-  scanning  loop open, asg1 triangle on OUT2: light vs OUT2 -> efficiency peak, clamp, K at the setpoint
-  locked    PI closed; watchdog: output at a clamp too long -> railed (hold); light low -> nolight (hold,
-            re-engage when the light is back)
+  held      pid2 drives OUT2 with the loop open (output = ival, 0 V = bias level after Output on)
+  locked    PI closed from the present drive; watchdog: output at a clamp too long -> railed (hold); light low ->
+            nolight (hold, re-engage when the light is back)
+Measure Bode plot: locked -> closed-loop G, S, T and plant; not locked -> open-loop plant dV_IN2/dV_OUT2 around the
+present drive, whose low-frequency value is the plant gain K used for the gain sign and the bandwidth mode.
 """
 import collections
 import json
@@ -26,18 +28,15 @@ import numpy as np
 import intensity_schematic as ISCH
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCAN_FILE = os.path.join(HERE, "intensity_scan.json")
-I_PANELS = ["traces", "history", "power scan", "Bode (swept)"]
+PLANT_FILE = os.path.join(HERE, "intensity_plant.json")
+I_PANELS = ["traces", "history", "Bode (swept)"]
+SIGNS = ["negative (inverting driver)", "positive"]
 PANEL_LABEL = {}
 
 # (key, label, default, group, kind, options) -- UI units
 I_FIELDS = [
-    ("int_out2_limit_mv", "OUT2 absolute limit [mV] (scan and clamps)", 300.0, "Intensity", "num",
+    ("int_out2_limit_mv", "OUT2 absolute limit [mV] (clamps, test sine)", 300.0, "Intensity", "num",
      {"min": 10, "max": 950}),
-    ("int_scan_lo_mv", "Scan from [mV of OUT2]", -200.0, "Intensity", "num", {}),
-    ("int_scan_hi_mv", "Scan to [mV of OUT2]", 200.0, "Intensity", "num", {}),
-    ("int_scan_hz", "Scan frequency [Hz]", 50.0, "Intensity", "num", {"min": 0.5, "max": 5000}),
-    ("int_scan_avg", "Scan traces averaged", 4, "Intensity", "num", {"min": 1, "max": 50}),
     ("int_setpoint_mv", "Setpoint [mV of IN2]", 500.0, "Intensity", "num", {"min": 0, "max": 1000}),
     ("int_filter_hz", "Input filter corner [Hz] (<0 high-pass, 0 off)", 0.0, "Intensity", "num", {}),
     ("int_filter_stages", "Input filter stages", 1, "Intensity", "select", {"options": [1, 2, 3, 4]}),
@@ -47,11 +46,9 @@ I_FIELDS = [
     ("int_p", "P (manual, magnitude)", 0.001, "Intensity", "select", {"options": ISCH.P_LADDER}),
     ("int_i_hz", "I [Hz] (manual, magnitude)", 1000.0, "Intensity", "select", {"options": ISCH.I_LADDER}),
     ("int_gain_ramp", "Ramp the gains up when locking", True, "Intensity", "check", {}),
-    ("int_clamp_auto", "Clamp from the power scan", True, "Intensity", "check", {}),
-    ("int_clamp_margin", "Clamp margin below the efficiency peak [x peak light]", 0.05, "Intensity", "num",
-     {"min": 0, "max": 0.5}),
-    ("int_clamp_lo_mv", "Clamp low [mV] (auto off)", -150.0, "Intensity", "num", {}),
-    ("int_clamp_hi_mv", "Clamp high [mV] (auto off)", 150.0, "Intensity", "num", {}),
+    ("int_plant_sign", "Plant sign while K is not measured", SIGNS[0], "Intensity", "select", {"options": SIGNS}),
+    ("int_clamp_lo_mv", "Clamp low [mV of OUT2]", -100.0, "Intensity", "num", {}),
+    ("int_clamp_hi_mv", "Clamp high [mV of OUT2]", 150.0, "Intensity", "num", {}),
     ("int_rail_s", "Railed after [s] at a clamp", 0.2, "Intensity", "num", {"min": 0.01}),
     ("int_light_frac", "No light below [x setpoint]", 0.3, "Intensity", "num", {"min": 0, "max": 1}),
     ("int_auto_reengage", "Re-engage when the light is back", True, "Intensity", "check", {}),
@@ -61,11 +58,13 @@ I_FIELDS = [
     ("int_bode_stop_hz", "Bode: stop frequency [Hz]", 1e6, "Intensity", "num", {"min": 100, "max": 2e7}),
     ("int_bode_points", "Bode: points", 30, "Intensity", "num", {"min": 3, "max": 200}),
     ("int_bode_cycles", "Bode: sine cycles per point", 20, "Intensity", "num", {"min": 2, "max": 500}),
-    ("int_bode_amp_frac", "Bode: test sine [x setpoint of light]", 0.02, "Intensity", "num",
+    ("int_bode_amp_frac", "Bode locked: test sine [x setpoint of light]", 0.02, "Intensity", "num",
      {"min": 0.001, "max": 0.3}),
+    ("int_bode_amp_mv", "Bode open loop: test sine amplitude [mV of OUT2]", 2.0, "Intensity", "num",
+     {"min": 0.1, "max": 50}),
     ("int_probe_a", "Probe A", "in2", "Intensity", "select", {"options": ISCH.PROBE_SIGNALS + ["off"]}),
     ("int_probe_b", "Probe B", "pid2", "Intensity", "select", {"options": ISCH.PROBE_SIGNALS + ["off"]}),
-    ("int_panels", "Show", ["traces", "history", "power scan"], "Intensity", "multi", {"options": I_PANELS}),
+    ("int_panels", "Show", ["traces", "history"], "Intensity", "multi", {"options": I_PANELS}),
     # external hardware (display only / loop model)
     ("int_bias_v", "Bias |V_bias| [V] (display)", 1.2, "Intensity", "num", {"min": 0, "max": 5}),
     ("int_if_full_ma", "Driver current limit [mA]", 25.0, "Intensity", "num", {"min": 1, "max": 40}),
@@ -86,79 +85,15 @@ def nearest(ladder, v):
     return min(pos, key=lambda x: abs(math.log(x / v)))
 
 
-# ---------------------------------------------------------------------------------------------
-# Power scan analysis (pure numpy)
-# ---------------------------------------------------------------------------------------------
-def analyze_scan(u, pd, s, binned):
-    """Light vs OUT2 from one (averaged) scan. Returns the binned curve, the efficiency peak, the auto clamp
-    (bright side where light = (1 - margin) x peak, dark side at the scan limit), K = dV_IN2/dV_OUT2 at the
-    setpoint, the OUT2 value for the setpoint and the most light the clamp allows."""
-    ub, (pb,) = binned(np.asarray(u), [np.asarray(pd)], nbins=300)
-    if len(ub) < 20:
-        return dict(ok=False, notes=["scan too short"])
-    k = max(3, len(pb) // 60)
-    ps = np.convolve(np.pad(pb, k, mode="edge"), np.ones(k) / k, mode="same")[k:-k]
-    lim = s["int_out2_limit_mv"] * 1e-3
-    i_pk, i_dk = int(np.argmax(ps)), int(np.argmin(ps))
-    pk, dk = float(ps[i_pk]), float(ps[i_dk])
-    res = dict(ok=True, u=np.round(ub, 6).tolist(), pd=np.round(pb, 5).tolist(), peak=pk, dark=dk, notes=[],
-               u_lo=float(ub[0]), u_hi=float(ub[-1]), t=time.time())
-    if pk - dk < 0.02:
-        res.update(ok=False, notes=["no light change in the scan: check the AOM, RF and photodiode"])
-        return res
-    bright = 1 if ub[i_pk] > ub[i_dk] else -1          # direction of more light along OUT2
-    res["bright_dir"] = bright
-    edge = 0.03 * (ub[-1] - ub[0])
-    at_edge = (ub[i_pk] > ub[-1] - edge) if bright > 0 else (ub[i_pk] < ub[0] + edge)
-    if at_edge:
-        res["u_peak"] = None
-        u_bright = float(ub[-1] if bright > 0 else ub[0])
-        res["notes"].append("no efficiency peak inside the scan range: the bright clamp is the scan limit")
-    else:
-        res["u_peak"] = float(ub[i_pk])
-        level = (1 - s["int_clamp_margin"]) * pk
-        idx = range(i_dk, i_pk + 1) if i_pk > i_dk else range(i_dk, i_pk - 1, -1)
-        u_bright = float(ub[i_pk])
-        for j in idx:                                   # first crossing walking from dark towards the peak
-            if ps[j] >= level:
-                j0 = j - (1 if i_pk > i_dk else -1)
-                if 0 <= j0 < len(ps) and ps[j] != ps[j0]:
-                    u_bright = float(ub[j0] + (level - ps[j0]) * (ub[j] - ub[j0]) / (ps[j] - ps[j0]))
-                else:
-                    u_bright = float(ub[j])
-                break
-    u_dark = float(ub[0] if bright > 0 else ub[-1])
-    lo, hi = sorted((u_bright, u_dark))
-    lo, hi = max(lo, -lim), min(hi, lim)
-    res.update(clamp=(lo, hi), u_bright=u_bright, u_dark=u_dark)
-    res["max_lock"] = float(np.interp(u_bright, ub, ps))
-    res.update(setpoint_info(res, s["int_setpoint_mv"] * 1e-3, ub, ps))
-    return res
-
-
-def setpoint_info(sc, sp, ub=None, ps=None):
-    """OUT2 value and plant gain K for the setpoint, on the monotonic branch between the dark limit and the
-    bright clamp."""
-    if ub is None:
-        ub, ps = np.asarray(sc["u"]), np.asarray(sc["pd"])
-        k = max(3, len(ps) // 60)
-        ps = np.convolve(np.pad(ps, k, mode="edge"), np.ones(k) / k, mode="same")[k:-k]
-    a, b = sorted((sc["u_dark"], sc["u_bright"]))
-    m = (ub >= a) & (ub <= b)
-    uu, pp = ub[m], ps[m]
-    if len(uu) < 5:
-        return dict(u_sp=None, K=None)
-    if sc["bright_dir"] < 0:
-        uu, pp = uu[::-1], pp[::-1]                     # dark -> bright
-    above = np.flatnonzero(pp >= sp)
-    if len(above) == 0 or above[0] == 0:
-        return dict(u_sp=None, K=None, sp_note="setpoint above the most light the clamp allows" if len(above) == 0
-                    else "setpoint below the darkest point of the scan")
-    j = int(above[0])
-    u_sp = float(uu[j - 1] + (sp - pp[j - 1]) * (uu[j] - uu[j - 1]) / (pp[j] - pp[j - 1]))
-    w = np.abs(uu - u_sp) <= max(0.06 * abs(uu[-1] - uu[0]), 3 * abs(uu[1] - uu[0]))
-    K = float(np.polyfit(uu[w], pp[w], 1)[0]) if w.sum() >= 3 else float((pp[j] - pp[j - 1]) / (uu[j] - uu[j - 1]))
-    return dict(u_sp=u_sp, K=K)
+def plant_gain(f, P, max_delay=1e-6):
+    """Plant gain K = dV_IN2/dV_OUT2 at low frequency from a measured plant response P(f): the mean of the points
+    where a 1 us delay turns the phase by less than 10 deg, signed by the phase (near 0 or near 180 deg)."""
+    f, P = np.asarray(f, dtype=float), np.asarray(P, dtype=complex)
+    m = f < 10 / 360 / max_delay
+    if not m.any():
+        m = f <= f.min()
+    z = np.mean(P[m])
+    return float(abs(z) * (1 if np.real(z) >= 0 else -1))
 
 
 def loop_model(f, K, p, i, filt, delay, pd_bw):
@@ -182,9 +117,7 @@ class Intensity:
         self.ctl, self.A, self.r = ctl, ctl.A, ctl.r
         self.mode = "off"
         self.hw, self.req = {}, {}
-        self.scan = None                 # last completed power scan (analysis)
-        self.scan_live = None            # analysis of the running scan
-        self.scan_seq = 0
+        self.plant = None                # last open-loop plant measurement: K, at drive u0, light pd0, time t
         self.lock_info = {}
         self.traces = None
         self.probe = None
@@ -237,8 +170,8 @@ class Intensity:
     def snapshot(self):
         with self.ctl._pub_lock:
             return dict(mode=self.mode, hw=dict(self.hw), req=dict(self.req), settings=dict(self.s),
-                        lock=dict(self.lock_info), scan=self.scan_live if self.mode == "scanning" else self.scan,
-                        scan_done=self.scan, scan_seq=self.scan_seq, traces=self.traces, probe=self.probe,
+                        lock=dict(self.lock_info), plant=dict(self.plant) if self.plant else None,
+                        traces=self.traces, probe=self.probe,
                         history=list(self.history), seq=self.seq, fps=self.fps, pd=self.pd, drive=self.drive,
                         bode=self.bode, bode_seq=self.bode_seq, meas_progress=self.meas_progress,
                         pm=self.predicted_margin())
@@ -248,7 +181,7 @@ class Intensity:
         m = self.mode
         if m == "locked":
             return "LOCKED", "#1e8e3e", "ok"
-        if m in ("scanning", "locking", "measuring", "busy"):
+        if m in ("locking", "measuring", "busy"):
             return m.upper(), "#2471a3", "busy"
         if m in ("railed", "nolight"):
             return {"railed": "RAILED (fault)", "nolight": "NO LIGHT (held)"}[m], "#c0392b", "fault"
@@ -257,7 +190,15 @@ class Intensity:
         return "OUTPUT OFF", "#777777", "off"
 
     def K(self):
-        return self.lock_info.get("K") or (self.scan or {}).get("K")
+        li = self.lock_info
+        return (li.get("K") if li.get("K_measured") else None) or (self.plant or {}).get("K")
+
+    def sign_K(self):
+        """Measured K, or a unit gain with the sign setting while K is not measured (manual gains only)."""
+        K = self.K()
+        if K:
+            return K, True
+        return (-1.0 if self.s["int_plant_sign"].startswith("negative") else 1.0), False
 
     def filt_list(self):
         return [b for b in (self.hw.get("pid2.inputfilter") or []) if b]
@@ -288,7 +229,7 @@ class Intensity:
         except Exception:
             self.has_sampler = False
             self.log("note: no sampler module: background light checks use the scope frames only")
-        saved = self._load_scan()
+        self.plant = self._load_plant()
         p2 = r.pid2
         od, p, i = p2.output_direct, float(p2.p), float(p2.i)
         if od == "out2" and (p != 0 or i != 0):
@@ -299,15 +240,14 @@ class Intensity:
             self.s["int_filter_hz"] = round(float(filt[0]), 1) if filt else 0.0
             self.s["int_filter_stages"] = max(len(filt), 1)
             self.bump()
-            if saved:
-                self.scan = saved
-                self.scan.update(setpoint_info(saved, float(p2.setpoint)))
-            K = (self.scan or {}).get("K")
-            self.lock_info = dict(K=K, clamp=(float(p2.min_voltage), float(p2.max_voltage)), t0=time.time(),
-                                  adopted=True, i_hw=i, p_hw=p)
+            K = (self.plant or {}).get("K")
+            Kl = K if K else (-1.0 if self.s["int_plant_sign"].startswith("negative") else 1.0)
+            self.lock_info = dict(K=Kl, K_measured=bool(K), clamp=(float(p2.min_voltage), float(p2.max_voltage)),
+                                  t0=time.time(), adopted=True, i_hw=i, p_hw=p)
             self.log(f"adopted a running servo on OUT2 (p {p:+.4g}, i {i:+.4g} Hz, setpoint "
                      f"{float(p2.setpoint)*1e3:.1f} mV); "
-                     + (f"K {K:+.2f} V/V from the saved scan" if K else "K unknown: gain changes need a power scan"))
+                     + (f"K {K:+.2f} V/V from the saved plant Bode" if K else
+                        "K unknown: run Measure Bode plot for bandwidth-mode gains"))
         else:
             if od == "both":
                 self.log("WARN pid2 was routed to both outputs; switching it off")
@@ -318,8 +258,6 @@ class Intensity:
             p2.ival = 0
             p2.output_direct = "off"
             self.mode = "off"
-            if saved:
-                self.scan = saved
             self.log("OUT2 = 0 V (bias level); intensity servo output off")
         if self.mode == "off":
             self.configure()                     # an adopted servo keeps its registers untouched
@@ -340,21 +278,20 @@ class Intensity:
             self.log(f"hardware values: int_filter_hz {hz:g} -> {s['int_filter_hz']}")
             self.bump()
 
-    def _load_scan(self):
+    def _load_plant(self):
         try:
-            with open(SCAN_FILE) as f:
+            with open(PLANT_FILE) as f:
                 d = json.load(f)
-            d["clamp"] = tuple(d["clamp"])
-            return d
+            return d if d.get("K") else None
         except Exception:
             return None
 
-    def _save_scan(self):
+    def _save_plant(self):
         try:
-            with open(SCAN_FILE, "w") as f:
-                json.dump(self.scan, f)
+            with open(PLANT_FILE, "w") as f:
+                json.dump(self.plant, f)
         except Exception as e:
-            self.log(f"could not save the scan: {e!r}")
+            self.log(f"could not save the plant measurement: {e!r}")
 
     def apply(self, changed):
         s = self.s
@@ -364,8 +301,6 @@ class Intensity:
             self.bump()
             self.log(f"manual gains start at the ladder values nearest the present ones: P {s['int_p']:g}, "
                      f"I {s['int_i_hz']:g} Hz")
-        if "int_setpoint_mv" in changed:
-            self._setpoint_changed()
         written = ISCH.apply_changed(self, changed)
         if "i_filter" in written:
             self._snap()
@@ -374,18 +309,6 @@ class Intensity:
             if pm is not None and pm < 45:
                 self.log(f"WARN model phase margin {pm:.0f} deg at {fu/1e3:.0f} kHz: the loop may oscillate")
             self._cap_warning()
-
-    def _setpoint_changed(self):
-        sc = self.scan
-        if sc and sc.get("ok"):
-            sc.update(setpoint_info(sc, self.s["int_setpoint_mv"] * 1e-3))
-            if sc.get("K") and self.mode in ("locked", "measuring"):
-                self.lock_info["K"] = sc["K"]
-                if self.mode == "locked":
-                    self.set_gains(1.0)           # same bandwidth with K at the new setpoint
-            if sc.get("max_lock") is not None and self.s["int_setpoint_mv"] * 1e-3 > sc["max_lock"]:
-                self.log(f"WARN setpoint above the most light the clamp allows ({sc['max_lock']*1e3:.0f} mV): "
-                         f"it will rail")
 
     def _cap_warning(self):
         K = self.K()
@@ -428,18 +351,10 @@ class Intensity:
                 p2.p, p2.i = 0, 0
                 p2.ival = 0
                 p2.output_direct = "out2"
-                if self.mode != "scanning":
-                    self.mode = "held"
+                self.mode = "held"
                 self.log("Output on: pid2 -> OUT2 (output 0 V = bias level, loop open)")
             elif not on:
                 self.output_off()
-        elif name == "scan":
-            if on:
-                if self.mode in ("locked", "railed", "nolight", "held"):
-                    self.unlock("Scan on")
-                self.scan_on()
-            elif self.mode == "scanning":
-                self.scan_off()
         elif name == "lock":
             if on:
                 if self.mode != "locked":
@@ -471,7 +386,7 @@ class Intensity:
         self.bump()
         self.log(f"probes: A = {a}, B = {b}")
 
-    # ---- output, scan ----
+    # ---- output ----
     def output_off(self):
         r = self.r
         a1 = r.asg1
@@ -481,79 +396,15 @@ class Intensity:
         p2.p, p2.i = 0, 0
         p2.ival = 0
         p2.output_direct = "off"
-        if self.mode == "scanning":
-            self._finish_scan()
         self.mode = "off"
         self.log("Output OFF: OUT2 = 0 V (bias level)")
 
-    def _scan_limits(self):
-        s = self.s
-        lim = s["int_out2_limit_mv"] * 1e-3
-        lo, hi = sorted((s["int_scan_lo_mv"] * 1e-3, s["int_scan_hi_mv"] * 1e-3))
-        return max(lo, -lim), min(hi, lim)
-
-    def scan_on(self, quiet=False):
-        s, p2, a1 = self.s, self.r.pid2, self.r.asg1
-        p2.p, p2.i = 0, 0
-        p2.ival = 0
-        lo, hi = self._scan_limits()
-        a1.setup(waveform="ramp", frequency=float(s["int_scan_hz"]), amplitude=(hi - lo) / 2, offset=(hi + lo) / 2,
-                 trigger_source="immediately", output_direct="out2")
-        self.mode = "scanning"
-        if not quiet:
-            self.log(f"power scan: OUT2 {lo*1e3:+.0f}..{hi*1e3:+.0f} mV, triangle {s['int_scan_hz']:g} Hz, loop open")
-
-    def scan_off(self):
-        a1 = self.r.asg1
-        a1.output_direct = "off"
-        a1.amplitude = 0
-        self._finish_scan()
-        self.mode = "held" if self.r.pid2.output_direct == "out2" else "off"
-        self.log("Scan off: OUT2 = " + ("pid2 output (0 V, loop open)" if self.mode == "held" else "0 V (bias level)"))
-
-    def _finish_scan(self):
-        sc = self.scan_live
-        if sc and sc.get("ok"):
-            self.scan = sc
-            self.scan_live = None
-            self._save_scan()
-            with self.ctl._pub_lock:
-                self.scan_seq += 1
-            msg = (f"scan: peak {sc['peak']*1e3:.0f} mV" + (f" at {sc['u_peak']*1e3:+.0f} mV" if sc.get("u_peak")
-                                                             is not None else " (at the scan edge)")
-                   + f", clamp {sc['clamp'][0]*1e3:+.0f}..{sc['clamp'][1]*1e3:+.0f} mV, max lockable "
-                   f"{sc['max_lock']*1e3:.0f} mV")
-            if sc.get("K"):
-                msg += f", K {sc['K']:+.2f} V/V at the setpoint (OUT2 {sc['u_sp']*1e3:+.1f} mV)"
-            else:
-                msg += f"; {sc.get('sp_note', 'no K at the setpoint')}"
-            self.log(msg)
-
     # ---- frames (the Controller's scheduler calls frame()) ----
     def frame(self):
-        if self.mode == "scanning":
-            self._scan_frame()
-        elif self.mode in ISCH.BUSY:
+        if self.mode in ISCH.BUSY:
             self.ctl._wait(0.05)
         else:
             self._live_frame()
-
-    def _scan_frame(self):
-        s = self.s
-        f = float(self.r.asg1.frequency) or s["int_scan_hz"]
-        dur = 1.02 / f
-        pd = uu = None
-        n = int(s["int_scan_avg"])
-        for _ in range(n):
-            t, p, u = self.ctl.capture("in2", "asg1", dur, trigger="asg1")
-            pd = p if pd is None else pd + p
-            uu = u if uu is None else uu + u
-        pd, uu = pd / n, uu / n
-        m = min(len(t), int(np.searchsorted(t, 1.0 / f)))
-        t, pd, uu = t[:m], pd[:m], uu[:m]
-        sc = analyze_scan(uu, pd, s, self.A.binned)
-        self.pd = float(np.mean(pd))
-        self._publish(traces=dict(kind="scan", t=t, u=uu, pd=pd), scan_live=sc)
 
     def _probe_due(self):
         return self._tick % max(int(self.s.get("drive_every", 3)), 1) == 0
@@ -612,7 +463,7 @@ class Intensity:
         return i / (s["int_corner_khz"] * 1e3), i
 
     def set_gains(self, frac):
-        K = self.lock_info["K"]
+        K = self.lock_info["K"]                     # a unit gain with the set sign while K is not measured
         p, i = self.gains_for(frac, K)
         p = max(min(p, ISCH.P_MAX), -ISCH.P_MAX)
         i = max(min(i, ISCH.I_MAX), -ISCH.I_MAX)
@@ -620,17 +471,14 @@ class Intensity:
         p2.i = i
         p2.p = p
         i_hw, p_hw = float(p2.i), float(p2.p)
-        self.lock_info.update(i_hw=i_hw, p_hw=p_hw, ugf_actual=abs(i_hw * K), p_req=p, i_req=i)
+        self.lock_info.update(i_hw=i_hw, p_hw=p_hw, p_req=p, i_req=i,
+                              ugf_actual=abs(i_hw * K) if self.lock_info.get("K_measured") else None)
         return i_hw, p_hw
 
     def clamp(self):
         s = self.s
         lim = s["int_out2_limit_mv"] * 1e-3
-        sc = self.scan
-        if s["int_clamp_auto"] and sc and sc.get("ok"):
-            lo, hi = sc["clamp"]
-        else:
-            lo, hi = sorted((s["int_clamp_lo_mv"] * 1e-3, s["int_clamp_hi_mv"] * 1e-3))
+        lo, hi = sorted((s["int_clamp_lo_mv"] * 1e-3, s["int_clamp_hi_mv"] * 1e-3))
         return max(lo, -lim), min(hi, lim)
 
     def apply_clamp(self):
@@ -640,27 +488,19 @@ class Intensity:
         self.lock_info["clamp"] = (lo, hi)
 
     def engage(self, u0=None, why="LOCK"):
-        """asg1 off -> setpoint -> clamp -> park at the scan's OUT2 for the setpoint -> gains in steps."""
+        """asg1 off -> setpoint -> clamp -> start from the present drive -> gains in steps. The integrator then
+        brings the light to the setpoint. Needs K from a Bode plot for bandwidth-mode gains; manual gains work with
+        the sign setting alone."""
         s, r = self.s, self.r
-        sc = self.scan_live if (self.mode == "scanning" and self.scan_live and self.scan_live.get("ok")) else self.scan
-        if self.mode == "scanning":
-            self.scan_off()
-            sc = self.scan
-        if not sc or not sc.get("ok"):
-            self.log(f"{why} refused: run a power scan first (Scan on, then off)")
-            return False
-        if sc.get("t") and time.time() - sc["t"] > 3600 and u0 is None:
-            self.log(f"note: the power scan is {(time.time()-sc['t'])/3600:.1f} h old")
-        sc.update(setpoint_info(sc, s["int_setpoint_mv"] * 1e-3))
-        K = sc.get("K") if u0 is None else (self.lock_info.get("K") or sc.get("K"))
-        if not K:
-            self.log(f"{why} refused: {sc.get('sp_note', 'no plant gain at the setpoint')} "
-                     f"(max lockable {sc['max_lock']*1e3:.0f} mV)")
+        K, measured = self.sign_K()
+        if s["int_gain_mode"] == "bandwidth" and not measured:
+            self.log(f"{why} refused: bandwidth-mode gains need the plant gain K. Run Measure Bode plot (open loop, "
+                     f"Output on) first, or use manual P / I")
             return False
         lo, hi = self.clamp()
-        u_start = sc["u_sp"] if u0 is None else u0
-        u_start = min(max(u_start, lo), hi)
-        prev = self.mode
+        p2 = r.pid2
+        here = float(p2.ival) if p2.output_direct == "out2" else 0.0
+        u_start = min(max(here if u0 is None else u0, lo), hi)
         self.mode = "locking"
         a1, p2 = r.asg1, r.pid2
         a1.output_direct = "off"
@@ -671,10 +511,11 @@ class Intensity:
         p2.input = "in2"
         p2.ival = u_start
         p2.output_direct = "out2"
-        self.lock_info = dict(K=K, u_sp=u_start, clamp=(lo, hi), t0=time.time())
+        self.lock_info = dict(K=K, K_measured=measured, u_sp=u_start, clamp=(lo, hi), t0=time.time())
         self._good.clear()
         self._good.append(u_start)
-        self.log(f"{why}: clamp {lo*1e3:+.1f}..{hi*1e3:+.1f} mV, park at {u_start*1e3:+.2f} mV, K {K:+.2f} V/V")
+        self.log(f"{why}: clamp {lo*1e3:+.1f}..{hi*1e3:+.1f} mV, start at {u_start*1e3:+.2f} mV, "
+                 + (f"K {K:+.2f} V/V (Bode)" if measured else f"K not measured: sign {'-' if K < 0 else '+'} (setting)"))
         steps = [0.1, 1 / 3, 1.0] if s["int_gain_ramp"] else [1.0]
         for fr in steps:
             i_hw, p_hw = self.set_gains(fr)
@@ -689,22 +530,21 @@ class Intensity:
                 p2.p, p2.i = 0, 0
                 p2.ival = u_start
                 self.mode = "railed"
-                self.log(f"  ran to the clamp while engaging ({iv*1e3:+.1f} mV): setpoint unreachable or wrong K "
-                         f"sign. Holding at {u_start*1e3:+.2f} mV")
+                self.log(f"  ran to the clamp while engaging ({iv*1e3:+.1f} mV): setpoint unreachable inside the "
+                         f"clamp, or wrong plant sign. Holding at {u_start*1e3:+.2f} mV")
                 return False
         li = self.lock_info
-        self.log(f"  p {li['p_hw']:+.4g}, i {li['i_hw']:+.4g} Hz -> |i·K| = {li['ugf_actual']/1e3:.2f} kHz; LOCKED")
+        self.log(f"  p {li['p_hw']:+.4g}, i {li['i_hw']:+.4g} Hz" + (f" -> |i·K| = {li['ugf_actual']/1e3:.2f} kHz"
+                                                                     if li.get("ugf_actual") else "") + "; LOCKED")
         self._cap_warning()
         self.mode = "locked"
         self._rail_since, self._dark_n, self._light_since = None, 0, None
-        del prev
         return True
 
     def unlock(self, why):
         p2 = self.r.pid2
         p2.p, p2.i = 0, 0
-        if self.mode != "scanning":
-            self.mode = "held" if p2.output_direct == "out2" else "off"
+        self.mode = "held" if p2.output_direct == "out2" else "off"
         self.log(f"{why}: loop open, drive held at {float(p2.ival)*1e3:+.2f} mV")
 
     def _hold_good(self, mode, why):
@@ -759,43 +599,67 @@ class Intensity:
             self.bode_seq += 1
 
     def measure_bode(self):
-        """Closed loop (locked): asg1 adds a small sine on OUT2; the scope records it with the servo output
-        (pid2) and with the photodiode (in2). c/x = T gives G = -T/(1+T), S = 1+T, closed loop -T and the plant
-        (in2/x)/S."""
+        """Swept sine from asg1 on OUT2 (summed with pid2), recorded with the scope, point by point.
+        Locked: closed loop, captures (asg1, pid2) and (asg1, in2): T = c/x, G = -T/(1+T), S = 1+T, closed loop -T,
+            plant (in2/x)/S.
+        Not locked (off / held): open loop around the present drive, captures (asg1, in2): plant P = in2/x; its
+            low-frequency value is the plant gain K (sign and size) used by the lock."""
+        if self.mode == "locked":
+            self._bode_run(closed=True)
+        elif self.mode in ("off", "held"):
+            self._bode_run(closed=False)
+        else:
+            self.log(f"Bode: not while {self.mode} (lock, or unlock to measure the open-loop plant)")
+
+    def _bode_run(self, closed):
         s, r, A = self.s, self.r, self.A
-        if self.mode != "locked":
-            self.log("Bode works while locked")
-            return
-        li = self.lock_info
-        K = li["K"]
-        lo, hi = li["clamp"]
-        iv = float(r.pid2.ival)
-        sp = s["int_setpoint_mv"] * 1e-3
-        amp = float(np.clip(s["int_bode_amp_frac"] * sp / abs(K), 2e-4, 0.4 * min(iv - lo, hi - iv)))
-        if amp <= 2e-4 * 1.01 and 0.4 * min(iv - lo, hi - iv) < 2e-4:
-            self.log("Bode refused: the drive sits at the clamp")
-            return
+        p2, a1 = r.pid2, r.asg1
+        lim = s["int_out2_limit_mv"] * 1e-3
+        out_on = p2.output_direct == "out2"
+        iv = float(p2.ival) if out_on else 0.0
+        K, measured = self.sign_K()
+        delay = ISCH.RP_DELAY + s["int_aom_delay_us"] * 1e-6
         fs = np.geomspace(s["int_bode_start_hz"], max(s["int_bode_stop_hz"], 2 * s["int_bode_start_hz"]),
                           int(s["int_bode_points"]))
-        p_hw, i_hw = float(r.pid2.p), float(r.pid2.i)
-        filt = self.filt_list()
-        delay = ISCH.RP_DELAY + s["int_aom_delay_us"] * 1e-6
-        Gm = loop_model(fs, K, p_hw, i_hw, filt, delay, s["int_pd_bw_mhz"] * 1e6)
         Hm = np.exp(-2j * math.pi * fs * delay) / (1 + 1j * fs / (s["int_pd_bw_mhz"] * 1e6))
-        B = A.bode_init("closed loop", fs, [
-            ("G open loop", "#1f5fa8", Gm), ("S = 1/(1+G): disturbance suppression", "#c0392b", 1 / (1 + Gm)),
-            ("T = G/(1+G): closed loop", "#1e8e3e", Gm / (1 + Gm)), ("plant P / K", "#d35400", Hm)],
-            title=f"Intensity loop Bode (sine {amp*1e3:.2f} mV on OUT2, |i·K| {abs(i_hw*K)/1e3:.1f} kHz)",
-            note=f"measured: solid with markers; model (K {K:+.2f} V/V, p {p_hw:+.3g}, i {i_hw:+.4g} Hz, delay "
-                 f"{delay*1e6:.2f} us, photodiode pole {s['int_pd_bw_mhz']:g} MHz): dotted")
+        if closed:
+            lo, hi = self.lock_info["clamp"]
+            room = 0.4 * min(iv - lo, hi - iv)
+            want = s["int_bode_amp_frac"] * s["int_setpoint_mv"] * 1e-3 / abs(K) if measured \
+                else s["int_bode_amp_mv"] * 1e-3
+            amp = float(min(max(want, 1e-4), room))
+            if room < 1e-4:
+                self.log("Bode refused: the drive sits at the clamp")
+                return
+            p_hw, i_hw = float(p2.p), float(p2.i)
+            Gm = loop_model(fs, K, p_hw, i_hw, self.filt_list(), delay, s["int_pd_bw_mhz"] * 1e6) if measured else []
+            models = [("G open loop", "#1f5fa8", Gm),
+                      ("S = 1/(1+G): disturbance suppression", "#c0392b", 1 / (1 + Gm) if measured else []),
+                      ("T = G/(1+G): closed loop", "#1e8e3e", Gm / (1 + Gm) if measured else []),
+                      ("plant P = dV_IN2/dV_OUT2", "#d35400", K * Hm if measured else [])]
+            title = (f"Intensity loop Bode, closed (sine {amp*1e3:.2f} mV on OUT2"
+                     + (f", |i·K| {abs(i_hw*K)/1e3:.1f} kHz)" if measured else ")"))
+            note = ("measured: solid with markers; model " + (f"(K {K:+.2f} V/V, p {p_hw:+.3g}, i {i_hw:+.4g} Hz, "
+                    f"delay {delay*1e6:.2f} us, photodiode {s['int_pd_bw_mhz']:g} MHz): dotted" if measured
+                    else "not drawn: K not measured yet (it is measured by this sweep)"))
+        else:
+            amp = float(min(max(s["int_bode_amp_mv"] * 1e-3, 1e-4), max(lim - abs(iv), 1e-4)))
+            models = [("plant P = dV_IN2/dV_OUT2", "#d35400", K * Hm if measured else [])]
+            title = f"Intensity plant Bode, open loop (sine {amp*1e3:.2f} mV on OUT2 at {iv*1e3:+.1f} mV)"
+            note = ("measured: solid with markers; " + (f"dotted: previous K {K:+.2f} V/V x delay {delay*1e6:.2f} us "
+                    f"x photodiode {s['int_pd_bw_mhz']:g} MHz" if measured else "the low-frequency value is K"))
+        B = A.bode_init("closed loop" if closed else "open loop", fs, models, title=title, note=note)
         self._bode_publish(B)
         self.ctl._stop_meas.clear()
         if "Bode (swept)" not in s["int_panels"]:
             s["int_panels"] = [p for p in I_PANELS if p in s["int_panels"] or p == "Bode (swept)"]
             self.bump()
-        self.log(f"Bode: {len(fs)} points {fs[0]:.3g}-{fs[-1]:.3g} Hz, sine {amp*1e3:.2f} mV on OUT2")
+        self.log(f"Bode ({'closed loop' if closed else 'open loop, plant'}): {len(fs)} points "
+                 f"{fs[0]:.3g}-{fs[-1]:.3g} Hz, sine {amp*1e3:.2f} mV on OUT2")
+        prev = self.mode
         self.mode = "measuring"
-        a1 = r.asg1
+        pd0 = None
+        P_meas = []
         try:
             for k, f in enumerate(fs):
                 if self.ctl._stop_meas.is_set():
@@ -809,24 +673,34 @@ class Intensity:
                                     "asg1.waveform": "sin"})
                 self.ctl._wait(min(max(5 / f, 2e-4), 0.05))
                 dur = float(np.clip(s["int_bode_cycles"] / f, 1e-4, 0.5))
-                t, x, c = self.ctl.capture("asg1", "pid2", dur)
-                X, C = A.fit_sine(t, x, f), A.fit_sine(t, c, f)
                 t, x2, e = self.ctl.capture("asg1", "in2", dur)
                 X2, E = A.fit_sine(t, x2, f), A.fit_sine(t, e, f)
-                iv = float(r.pid2.ival)
-                if iv <= lo + 0.02 * (hi - lo) or iv >= hi - 0.02 * (hi - lo):
-                    a1.output_direct = "off"
-                    self.mode = "locked"
-                    self._hold_good("railed", f"Bode: the output reached the clamp at {f:.3g} Hz; stopped")
-                    break
-                T = C / X
-                G, S = -T / (1 + T), 1 + T
-                P = (E / X2) / S
-                for cv, val in zip(B["curves"], (G, S, -T, P / K)):
+                if pd0 is None:
+                    pd0 = float(np.mean(e))
+                    if not closed and pd0 < 0.02:
+                        self.log(f"WARN photodiode {pd0*1e3:.1f} mV at this drive: hardly any light, K will be ~0")
+                if closed:
+                    t, x, c = self.ctl.capture("asg1", "pid2", dur)
+                    X, C = A.fit_sine(t, x, f), A.fit_sine(t, c, f)
+                    v = float(p2.ival)
+                    if v <= lo + 0.02 * (hi - lo) or v >= hi - 0.02 * (hi - lo):
+                        a1.output_direct = "off"
+                        self.mode = "locked"
+                        self._hold_good("railed", f"Bode: the output reached the clamp at {f:.3g} Hz; stopped")
+                        break
+                    T = C / X
+                    S = 1 + T
+                    P = (E / X2) / S
+                    vals = (-T / S, S, -T, P)
+                else:
+                    P = E / X2
+                    vals = (P,)
+                P_meas.append(P)
+                for cv, val in zip(B["curves"], vals):
                     cv["f"].append(float(f))
                     cv["c"].append(val)
                 fu, pm = A.margins(np.array(B["curves"][0]["f"]), np.array(B["curves"][0]["c"])) \
-                    if len(B["curves"][0]["f"]) > 1 else (None, None)
+                    if closed and len(B["curves"][0]["f"]) > 1 else (None, None)
                 B.update(ugf=fu, pm=pm, n=k + 1)
                 self._bode_publish(dict(B))
         finally:
@@ -834,8 +708,24 @@ class Intensity:
             a1.amplitude = 0
             self.meas_progress = ""
             if self.mode == "measuring":
-                self.mode = "locked"
-            self._bode_publish(dict(B, done=True))
+                self.mode = prev
+        if P_meas:
+            Kn = plant_gain(fs[:len(P_meas)], P_meas)
+            self.plant = dict(K=Kn, u0=iv, pd0=pd0, t=time.time(), closed=closed)
+            self._save_plant()
+            li = self.lock_info
+            if closed and self.mode in ("locked", "railed", "nolight"):
+                # measured at the lock point: show what the gains really give (the gains are not changed)
+                old = li.get("ugf_actual")
+                li.update(K=Kn, K_measured=True, ugf_actual=abs(li.get("i_hw", 0.0) * Kn))
+                if old and abs(li["ugf_actual"] / old - 1) > 0.05:
+                    self.log(f"K at the lock point: |i·K| is {li['ugf_actual']/1e3:.1f} kHz, not {old/1e3:.1f} kHz; "
+                             f"re-lock (or change a gain setting) to set the bandwidth with this K")
+            B["title"] += f";  K = {Kn:+.2f} V/V"
+            self.log(f"plant gain K = dV_IN2/dV_OUT2 = {Kn:+.3f} V/V at OUT2 {iv*1e3:+.1f} mV (photodiode "
+                     f"{(pd0 or 0)*1e3:.0f} mV)" + ("" if Kn < 0 else "  NOTE: positive (not the inverting driver?)"))
+        self._bode_publish(dict(B, done=True))
         fu, pm = B.get("ugf"), B.get("pm")
-        self.log("Bode: " + (f"unity gain {fu/1e3:.1f} kHz, phase margin {pm:.0f} deg" if fu else
-                             "no unity-gain crossing in the measured range"))
+        if closed:
+            self.log("Bode: " + (f"unity gain {fu/1e3:.1f} kHz, phase margin {pm:.0f} deg" if fu else
+                                 "no unity-gain crossing in the measured range"))
