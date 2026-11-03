@@ -29,7 +29,7 @@ SHORT = {"ac_hz": "Hz", "lpf_hz": "Hz", "lpf_order": "order", "err_gain": "gain 
          "acq_dither_mvpp": "mVpp", "ramp_hz": "Hz", "ramp_mvpp": "mVpp", "in1_scale": "×",
          "kappa_mhz": "κ MHz", "driver_bw_hz": "Hz",
          "ramp_center_mv": "setpoint mV", "int_filter_hz": "Hz", "int_filter_stages": "stages", "int_setpoint_mv": "mV", "int_gain_mode": "",
-         "int_ugf_khz": "kHz", "int_p": "P", "int_i_hz": "I Hz", "int_clamp_lo_mv": "low mV",
+         "int_ugf_khz": "kHz", "int_p": "P", "int_i_hz": "I Hz", "int_clamp_lo_mv": "low mV", "int_dc_mv": "level mV",
          "int_clamp_hi_mv": "high mV", "int_mw_per_v": "mW/V", "int_pd_bw_mhz": "MHz",
          "int_aom_max_dbm": "max dBm", "int_aom_delay_us": "µs", "int_amp_gain_db": "dB", "int_if_full_ma": "mA",
          "int_rf_src_dbm": "dBm", "int_bias_v": "|V_bias| V"}
@@ -368,6 +368,14 @@ function(v) {
 # Setpoint box: Dash 4's debounced number input does not re-send a value it sent itself before, even after a callback
 # changed the box (type 500, nudge to 510, type 500 again: nothing). On Enter / blur, read the typed number from the
 # DOM and send it as a direct setpoint command.
+DC_TYPED_JS = """
+function(ns, nb) {
+  var el = document.getElementById('s-int_dc_mv');
+  if (!el) { return window.dash_clientside.no_update; }
+  var v = parseFloat(el.value);
+  return isNaN(v) ? window.dash_clientside.no_update : {v: v, t: Date.now()};
+}
+"""
 RAMP_TYPED_JS = """
 function(ns, nb) {
   var el = document.getElementById('s-ramp_center_mv');
@@ -509,6 +517,11 @@ def build_app(ctl, A):
             kids.append(html.Div([html.Button(lab, id={"type": "rnudge", "d": d}, title=f"ramp setpoint {d:+g} mV")
                                   for lab, d in (("−10", -10.0), ("−1", -1.0), ("+1", 1.0), ("+10", 10.0))],
                                  className="spadj", title="ramp setpoint (centre) steps"))
+        if b["id"] == "i_dc":
+            kids.append(html.Div([html.Button(lab, id={"type": "dcnudge", "d": d}, title=f"DC level {d:+g} mV")
+                                  for lab, d in (("−10", -10.0), ("−1", -1.0), ("−0.1", -0.1), ("+0.1", 0.1),
+                                                 ("+1", 1.0), ("+10", 10.0))],
+                                 className="spadj", title="DC output level steps"))
         if b["id"] == "i_setpoint":
             kids.append(html.Div(dcc.Slider(id="int-sp-slider", min=0, max=1000, step=0.5,
                                             value=ctl.s["int_setpoint_mv"], updatemode="mouseup", marks=None,
@@ -681,6 +694,7 @@ def build_app(ctl, A):
             dcc.Store(id="push-version"),
             dcc.Store(id="sp-typed"),
             dcc.Store(id="ramp-typed"),
+            dcc.Store(id="dc-typed"),
             dcc.Store(id="frame"),
             dcc.Store(id="frame-seq", data=-1),
             dcc.Store(id="meas-seq", data=-1),
@@ -759,7 +773,7 @@ def build_app(ctl, A):
         if not t or not ctx.triggered or not ctx.triggered[0].get("value"):
             return no_update
         name = t["s"]
-        on = not ISCH.switch_states(it.mode, it.hw, ctl.s)[name]
+        on = not ISCH.switch_states(it.mode, it.hw, ctl.s, it.dc_on)[name]
         ctl.submit("int_switch", (name, on))
         return time.time()
 
@@ -809,6 +823,23 @@ def build_app(ctl, A):
 
     app.clientside_callback(RAMP_TYPED_JS, Output("ramp-typed", "data"), Input("s-ramp_center_mv", "n_submit"),
                             Input("s-ramp_center_mv", "n_blur"), prevent_initial_call=True)
+
+    app.clientside_callback(DC_TYPED_JS, Output("dc-typed", "data"), Input("s-int_dc_mv", "n_submit"),
+                            Input("s-int_dc_mv", "n_blur"), prevent_initial_call=True)
+
+    @app.callback(Output("ack", "data", allow_duplicate=True), Input("dc-typed", "data"), prevent_initial_call=True)
+    def on_dc_typed(d):
+        if d and abs(float(d["v"]) - ctl.s["int_dc_mv"]) > 1e-9:
+            ctl.submit("int_dc", float(d["v"]))
+        return time.time()
+
+    @app.callback(Output("ack", "data", allow_duplicate=True), Input({"type": "dcnudge", "d": ALL}, "n_clicks"),
+                  prevent_initial_call=True)
+    def on_dcnudge(_):
+        t = ctx.triggered_id
+        if t and ctx.triggered and ctx.triggered[0].get("value"):
+            ctl.submit("int_dc_nudge", float(t["d"]))
+        return time.time()
 
     @app.callback(Output("ack", "data", allow_duplicate=True), Input("ramp-typed", "data"), prevent_initial_call=True)
     def on_ramp_typed(d):

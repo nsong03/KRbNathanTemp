@@ -15,7 +15,7 @@ import schematic as SCH
 
 P = SCH.P
 PREFIX = "i-"
-CANVAS_W, CANVAS_H = 1340, 470
+CANVAS_W, CANVAS_H = 1340, 575
 I_STEP = SCH.I_STEP                                   # pid.i resolution [Hz]
 I_MAX = (2 ** 23 - 1) * I_STEP                        # largest pid.i [Hz] (24-bit signed) ~ 38.9 kHz
 P_STEP = 2.0 ** -12
@@ -97,6 +97,12 @@ BLOCKS = [
          note="Every module with output_direct = out2 is summed digitally onto OUT2: pid2 and asg1."),
     dict(id="i_out2", label="OUT2", kind="node", x=1210, y=220, w=110, h=66, params=[], opts=[],
          note="OUT2 -> 50 ohm tee -> bias driver. Useful range only about +/-0.1-0.2 V (x10 driver gain)."),
+    dict(id="i_dc", label="DC output (bypass)", kind="dsp", x=230, y=455, w=280, h=110,
+         params=[P("int_dc_mv", "pid2.ival", live="dc")], opts=[],
+         note="Calibration bypass: with the DC switch on, the loop is open (pid2 p = i = 0) and OUT2 is a constant "
+              "level set here (pid2 integrator = the level, clamps opened to the OUT2 limit). Steps and typed values "
+              "move OUT2 at once. Measure Bode plot then measures the open-loop plant around this level; Lock starts "
+              "from it. The hand clamps do not apply, only the OUT2 limit: more OUT2 = less light (inverting driver)."),
     dict(id="i_asg1", label="Bode test sine (asg1)", kind="dsp", x=230, y=380, w=280, h=60, params=[], opts=[],
          note="asg1: the swept sine of 'Measure Bode plot', summed onto OUT2. Locked: closed-loop G, S, T and the "
               "plant. Not locked (Output off or held): the open-loop plant dV_IN2/dV_OUT2 around the present drive; "
@@ -152,13 +158,15 @@ WIRES = [
     dict(id="mix_amp", kind="plant", pts=[(800, 43), (725, 43)]),
     dict(id="amp_aom", kind="plant", pts=[(545, 43), (470, 43)]),
     dict(id="aom_pd", kind="plant", pts=[(290, 43), (200, 43)]),
-    dict(id="asg_sum", kind="drv", pts=[(510, 410), (1110, 410), (1110, 273)]),
+    dict(id="asg_sum", kind="drv", pts=[(510, 410), (1119, 410), (1119, 271)]),
+    dict(id="dc_out", kind="drv", pts=[(510, 505), (1101, 505), (1101, 271)]),
 ]
 
 SWITCHES = [
     dict(id="lock", label="Lock", x=505, y=250),
     dict(id="output", label="Output", x=1035, y=253),
     dict(id="reengage", label="Re-engage", x=895, y=372),
+    dict(id="dc", label="DC out", x=760, y=505),
 ]
 SWITCH_TITLES = {
     "lock": "Lock: set the clamp, start from the present drive, ramp the gains up (the integrator brings the light "
@@ -166,6 +174,8 @@ SWITCH_TITLES = {
             "off = hold the present drive",
     "output": "Output: pid2.output_direct (out2 / off). Off: OUT2 = 0 V = the bias level",
     "reengage": "Re-engage: after a 'no light' hold, lock again when the light is back",
+    "dc": "DC out: bypass for calibration. Loop open, OUT2 = the DC level (set on the DC output box); off = keep that "
+          "level with the loop open",
 }
 
 PROBES = [
@@ -203,14 +213,19 @@ def w_pid(it):
         it.set_gains(1.0)
 
 
+def w_dc(it):
+    if it.mode == "dc":
+        it.set_dc()
+
+
 def w_limiter(it):
     if it.mode in ("locked", "measuring") and it.lock_info.get("K"):
         it.apply_clamp()
 
 
-WRITERS = dict(i_filter=w_filter, i_setpoint=w_setpoint, i_pid=w_pid, i_limiter=w_limiter)
+WRITERS = dict(i_filter=w_filter, i_setpoint=w_setpoint, i_pid=w_pid, i_limiter=w_limiter, i_dc=w_dc)
 STATIC = ["i_filter", "i_setpoint"]
-LIVE = ["i_limiter", "i_pid"]
+LIVE = ["i_limiter", "i_pid", "i_dc"]
 
 
 def write_static(it):
@@ -221,7 +236,7 @@ def write_static(it):
 def apply_changed(it, changed):
     owners = {OWNER.get(k) for k in changed}
     if "int_out2_limit_mv" in changed:
-        owners |= {"i_limiter"}
+        owners |= {"i_limiter", "i_dc"}
     done = []
     for b in STATIC + LIVE:
         if b in owners:
@@ -231,7 +246,7 @@ def apply_changed(it, changed):
 
 
 READBACK = {
-    "pid2": ["input", "setpoint", "p", "i", "min_voltage", "max_voltage", "output_direct", "inputfilter"],
+    "pid2": ["input", "setpoint", "p", "i", "ival", "min_voltage", "max_voltage", "output_direct", "inputfilter"],
     "asg1": ["waveform", "frequency", "amplitude", "offset", "output_direct"],
 }
 
@@ -246,9 +261,11 @@ def read_hw(r):
 BUSY = ("locking", "measuring", "busy")
 
 
-def switch_states(mode, hw, s):
-    return dict(lock=mode in ("locking", "locked", "measuring"),
-                output=hw.get("pid2.output_direct") in ("out2", "both"), reengage=bool(s.get("int_auto_reengage")))
+def switch_states(mode, hw, s, dc_on=False):
+    closed = bool(hw.get("pid2.i") or hw.get("pid2.p"))
+    return dict(lock=mode in ("locking", "locked") or (mode == "measuring" and closed),
+                output=hw.get("pid2.output_direct") in ("out2", "both"), reengage=bool(s.get("int_auto_reengage")),
+                dc=bool(dc_on))
 
 
 def rf_levels(s, u):
@@ -267,7 +284,7 @@ def _mw(s, v):
 
 def diagram_state(snap):
     s, hw, mode, li, pl = snap["settings"], snap["hw"], snap["mode"], snap["lock"], snap.get("plant") or {}
-    sw = switch_states(mode, hw, s)
+    sw = switch_states(mode, hw, s, snap.get("dc_on"))
     W = "warn"
     B = {}
     pd, drive = snap.get("pd"), snap.get("drive")
@@ -344,7 +361,13 @@ def diagram_state(snap):
     closed = hw.get("pid2.input") == "in2" and bool(hw.get("pid2.i") or hw.get("pid2.p"))
     wires = dict(pd_in2=True, f_sp=True, sp_pid=closed, pid_lim=sw["output"], lim_sum=sw["output"],
                  sum_out=sw["output"] or asg_on, out_drv=True, drv_mix=True, src_mix=True, mix_amp=True,
-                 amp_aom=True, aom_pd=True, asg_sum=asg_on)
+                 amp_aom=True, aom_pd=True, asg_sum=asg_on, dc_out=sw["dc"])
+    iv = hw.get("pid2.ival")
+    if sw["dc"]:
+        B["i_dc"] = [(f"ON: OUT2 = {(iv or 0)*1e3:+.2f} mV (loop open)", "")]
+    else:
+        B["i_dc"] = [(f"off · level {s['int_dc_mv']:+g} mV", "dim")]
+    B["i_dc"].append((f"limit ±{s['int_out2_limit_mv']:g} mV, more OUT2 = less light", "dim"))
     busy = mode in BUSY
     swd = {}
     for k, on in sw.items():
