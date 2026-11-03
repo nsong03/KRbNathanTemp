@@ -223,7 +223,7 @@ apply(int_ugf_khz=30.0)
 print("--- every intensity block parameter changes its register")
 NEW = dict(int_filter_hz=200e3, int_filter_stages=2, int_setpoint_mv=480.0, int_gain_mode="manual",
            int_ugf_khz=20.0, int_p=0.01, int_i_hz=1000.0, int_corner_khz=500.0,
-           int_clamp_lo_mv=-30.0, int_clamp_hi_mv=120.0)
+           int_clamp_lo_mv=-30.0, int_clamp_hi_mv=120.0, int_dc_mv=25.0)
 params = [(b["id"], p) for b in ISCH.BLOCKS for p in b["params"] if p["attr"]]
 check("the register test covers every intensity block parameter", all(p["key"] in NEW for _, p in params),
       str([p["key"] for _, p in params if p["key"] not in NEW]))
@@ -260,6 +260,11 @@ def try_param(bid, p):
 for bid, p in params:
     if p["live"] == "always":
         try_param(bid, p)
+ctl.submit("int_switch", ("dc", True)); wait_idle()
+for bid, p in params:
+    if p["live"] == "dc":
+        try_param(bid, p)
+ctl.submit("int_switch", ("dc", False)); wait_idle()
 for bid, p in params:
     if p["live"] == "locked":
         if it.mode != "locked":

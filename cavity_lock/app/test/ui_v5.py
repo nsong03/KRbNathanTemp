@@ -20,7 +20,7 @@ LAUNCH = dict(executable_path=os.environ.get("CHROME", "/opt/pw-browsers/chromiu
 FIELD = {f[0]: f for f in A.FIELDS}
 NEW = dict(int_filter_hz="200000", int_filter_stages="2", int_setpoint_mv="480", int_gain_mode="manual",
            int_ugf_khz="20", int_p="0.002", int_i_hz="1000", int_corner_khz="500",
-           int_clamp_lo_mv="-30", int_clamp_hi_mv="120", int_out2_limit_mv="250",
+           int_clamp_lo_mv="-30", int_clamp_hi_mv="120", int_out2_limit_mv="250", int_dc_mv="25",
            int_mw_per_v="2", int_pd_bw_mhz="10", int_aom_max_dbm="30", int_aom_delay_us="0.3",
            int_amp_gain_db="31", int_if_full_ma="20", int_rf_src_dbm="3", int_bias_v="1.5")
 FAILS = []
@@ -225,7 +225,8 @@ async def main():
                 await set_value(k, new)
                 lg = await log_text()
                 head = "\n".join(lg.splitlines()[:8])
-                ok = f"{k}=" in head or (k == "int_setpoint_mv" and f"setpoint {new} mV" in head)
+                ok = f"{k}=" in head or (k == "int_setpoint_mv" and f"setpoint {new} mV" in head) \
+                    or (k == "int_dc_mv" and f"DC level {float(new):+g} mV" in head)
                 rb = await pg.locator(f"#i-rb-{blk['id']}").inner_text()
                 check(f"{blk['id']}: {k} {old} -> {new if new is not None else 'toggled'}", ok,
                       rb.replace("\n", " | ")[:80])
@@ -287,6 +288,16 @@ async def main():
         off = "on" not in await ipill("reengage")
         await iflip("reengage")
         check("Re-engage switch toggles", off and "on" in await ipill("reengage"))
+        await iflip("dc")
+        check("DC out on -> DC OUTPUT, DC wire live", await wait_status("DC OUTPUT", 5) and "on" in await ipill("dc")
+              and "on" in (await pg.locator("#i-wire-dc_out").get_attribute("class")))
+        await pg.locator(".b-i_dc .spadj button", has_text=re.compile(r"^\+1$")).click()
+        await pg.wait_for_timeout(1200)
+        rb = await pg.locator("#i-rb-i_dc").inner_text()
+        check("DC +1 mV step moves OUT2", "OUT2 = +1.00 mV" in rb, rb.replace("\n", " | "))
+        await pg.screenshot(path="v5_6_dc_output.png", clip={"x": 0, "y": 60, "width": 1500, "height": 620})
+        await iflip("dc")
+        check("DC out off -> HELD at the level", await wait_status("HELD", 5) and "on" not in await ipill("dc"))
         await iflip("output")
         check("Output off -> OUTPUT OFF, OUT2 wire dead", await wait_status("OUTPUT OFF", 5)
               and "off" in (await pg.locator("#i-wire-lim_sum").get_attribute("class")))

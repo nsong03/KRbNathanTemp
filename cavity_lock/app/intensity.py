@@ -12,6 +12,7 @@ This file never touches iq0, asg0, pid0 or OUT1. There is no scan: the only meas
 Modes: off -> locking -> locked, plus held, measuring and the faults railed / nolight.
   off       pid2 p = i = ival = 0, output off, asg1 off: OUT2 = 0 V = bias level (the safe default)
   held      pid2 drives OUT2 with the loop open (output = ival, 0 V = bias level after Output on)
+  dc        DC output (bypass): loop open, OUT2 = a constant level set by hand (int_dc_mv), for calibration
   locked    PI closed from the present drive; watchdog: output at a clamp too long -> railed (hold); light low ->
             nolight (hold, re-engage when the light is back)
 Measure Bode plot: locked -> closed-loop G, S, T and plant; not locked -> open-loop plant dV_IN2/dV_OUT2 around the
@@ -40,6 +41,7 @@ I_FIELDS = [
     ("int_setpoint_mv", "Setpoint [mV of IN2]", 500.0, "Intensity", "num", {"min": 0, "max": 1000}),
     ("int_filter_hz", "Input filter corner [Hz] (<0 high-pass, 0 off)", 0.0, "Intensity", "num", {}),
     ("int_filter_stages", "Input filter stages", 1, "Intensity", "select", {"options": [1, 2, 3, 4]}),
+    ("int_dc_mv", "DC output level [mV of OUT2]", 0.0, "Intensity", "num", {}),
     ("int_gain_mode", "Gains from", "bandwidth", "Intensity", "select", {"options": ["bandwidth", "manual"]}),
     ("int_ugf_khz", "Loop bandwidth [kHz]", 30.0, "Intensity", "num", {"min": 0.001}),
     ("int_corner_khz", "PI corner f (p = i / f) [kHz]", 1000.0, "Intensity", "num", {"min": 0.1}),
@@ -117,6 +119,7 @@ class Intensity:
         self.ctl, self.A, self.r = ctl, ctl.A, ctl.r
         self.mode = "off"
         self.hw, self.req = {}, {}
+        self.dc_on = False               # DC output (bypass) switch, runtime only
         self.plant = None                # last open-loop plant measurement: K, at drive u0, light pd0, time t
         self.lock_info = {}
         self.traces = None
@@ -174,7 +177,7 @@ class Intensity:
                         traces=self.traces, probe=self.probe,
                         history=list(self.history), seq=self.seq, fps=self.fps, pd=self.pd, drive=self.drive,
                         bode=self.bode, bode_seq=self.bode_seq, meas_progress=self.meas_progress,
-                        pm=self.predicted_margin())
+                        pm=self.predicted_margin(), dc_on=self.dc_on)
 
     def status(self):
         """(label, colour, dot class) for the status bar and the view icon."""
@@ -187,6 +190,8 @@ class Intensity:
             return {"railed": "RAILED (fault)", "nolight": "NO LIGHT (held)"}[m], "#c0392b", "fault"
         if m == "held":
             return "HELD", "#b9770e", "held"
+        if m == "dc":
+            return "DC OUTPUT", "#b9770e", "held"
         return "OUTPUT OFF", "#777777", "off"
 
     def K(self):
@@ -333,6 +338,15 @@ class Intensity:
                 self.bump()
                 self.apply({"int_setpoint_mv"})
                 self.log(f"setpoint {v:g} mV")
+        elif cmd in ("int_dc", "int_dc_nudge"):
+            lim = s["int_out2_limit_mv"]
+            v = float(arg) if cmd == "int_dc" else s["int_dc_mv"] + float(arg)
+            v = round(min(max(v, -lim), lim), 3)
+            if v != s["int_dc_mv"]:
+                s["int_dc_mv"] = v
+                self.bump()
+                self.apply({"int_dc_mv"})
+                self.log(f"DC level {v:+g} mV" + (" (OUT2 now)" if self.mode == "dc" else ""))
         elif cmd == "int_bode":
             self.measure_bode()
 
@@ -355,6 +369,19 @@ class Intensity:
                 self.log("Output on: pid2 -> OUT2 (output 0 V = bias level, loop open)")
             elif not on:
                 self.output_off()
+        elif name == "dc":
+            if on and self.mode != "dc":
+                if self.mode in ("locked", "railed", "nolight"):
+                    self.unlock("DC output on")
+                self.dc_on = True
+                self.mode = "dc"
+                self.set_dc()
+                self.log(f"DC output on: loop open, OUT2 = {float(self.r.pid2.ival)*1e3:+.2f} mV (bypass)")
+            elif not on and self.dc_on:
+                self.dc_on = False
+                if self.mode == "dc":
+                    self.mode = "held"
+                self.log(f"DC output off: OUT2 held at {float(self.r.pid2.ival)*1e3:+.2f} mV (loop open)")
         elif name == "lock":
             if on:
                 if self.mode != "locked":
@@ -387,7 +414,20 @@ class Intensity:
         self.log(f"probes: A = {a}, B = {b}")
 
     # ---- output ----
+    def set_dc(self):
+        """DC output (bypass): pid2 with p = i = 0, clamps at the OUT2 limit, integrator = the level -> OUT2."""
+        s, p2, a1 = self.s, self.r.pid2, self.r.asg1
+        lim = s["int_out2_limit_mv"] * 1e-3
+        v = min(max(s["int_dc_mv"] * 1e-3, -lim), lim)
+        a1.output_direct = "off"
+        a1.amplitude = 0
+        p2.p, p2.i = 0, 0
+        p2.min_voltage, p2.max_voltage = -lim, lim
+        p2.ival = v
+        p2.output_direct = "out2"
+
     def output_off(self):
+        self.dc_on = False
         r = self.r
         a1 = r.asg1
         a1.output_direct = "off"
@@ -501,6 +541,7 @@ class Intensity:
         p2 = r.pid2
         here = float(p2.ival) if p2.output_direct == "out2" else 0.0
         u_start = min(max(here if u0 is None else u0, lo), hi)
+        self.dc_on = False
         self.mode = "locking"
         a1, p2 = r.asg1, r.pid2
         a1.output_direct = "off"
@@ -606,7 +647,7 @@ class Intensity:
             low-frequency value is the plant gain K (sign and size) used by the lock."""
         if self.mode == "locked":
             self._bode_run(closed=True)
-        elif self.mode in ("off", "held"):
+        elif self.mode in ("off", "held", "dc"):
             self._bode_run(closed=False)
         else:
             self.log(f"Bode: not while {self.mode} (lock, or unlock to measure the open-loop plant)")

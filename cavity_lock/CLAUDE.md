@@ -97,7 +97,13 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   parked OUT1 level (pid0.ival). Never while locked or held after an unlock. Test: `test/test_ramp_setpoint.py`.
 - **Intensity servo** (`intensity.py`, same architecture: main thread, version-checked settings `int_*`, snapped values):
   - **No scan** (user decision 2026-11-02): the only intensity measurement is the swept-sine Bode plot.
-  - Modes `off` → `locking` → `locked`, plus `held` (Output on, loop open), `measuring`, faults `railed`, `nolight`.
+  - Modes `off` → `locking` → `locked`, plus `held` (Output on, loop open), `dc`, `measuring`, faults `railed`, `nolight`.
+  - **DC output (bypass)** for calibration: block `i_dc` + switch "DC out" (`it.dc_on`, runtime). On: loop open
+    (pid2 p = i = 0), clamps opened to ±`int_out2_limit_mv`, pid2.ival = `int_dc_mv` → OUT2 (`set_dc`, writer `w_dc`
+    live in mode `dc`). Steps ±0.1/1/10 mV (`int_dc_nudge`), typed value via `DC_TYPED_JS` → `int_dc`, clipped to the
+    OUT2 limit (the hand clamps do not apply). Turning it on while locked unlocks first; off → `held` at the level;
+    Output off ends it. Measure Bode plot in `dc` = open-loop plant around the level (mode back to `dc` after);
+    Lock from `dc` starts at the level. No watchdog in `dc`. Test: `test/test_dc_output.py`.
   - Measure Bode plot: asg1 sine on OUT2 (summed with pid2), point by point, Stop. **Not locked** (off / held): open-loop
     plant P = in2/x around the present drive (amplitude `int_bode_amp_mv`); `plant_gain()` takes its low-frequency
     value as K = dV_IN2/dV_OUT2 (sign from the phase), saved to `intensity_plant.json` (runtime, gitignored).
@@ -135,7 +141,7 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
   - A **clientside** callback (`SCOPE_JS`) draws with `Plotly.react` using **SVG `scatter`**. `scattergl` redraws about 2× slower here.
   - The noise and loop figures have **their own callbacks keyed on `meas-seq`**, never in the tick response. Putting them in the tick response froze the page.
   - Numeric inputs use `step="any"` (the integer gain uses step 1).
-  - The diagram: blocks are absolutely positioned Dash components on a fixed 1340×500 canvas (intensity: 1340×470); every `s-{key}` input
+  - The diagram: blocks are absolutely positioned Dash components on a fixed 1340×500 canvas (intensity: 1340×575); every `s-{key}` input
     exists exactly once (inline in a box or in a hidden popover), so the version-checked apply callback is unchanged.
     `DIAG_JS` (clientside) draws the SVG wires once and updates readback text, switch pills and probe badges from
     `dcc.Store("diag")`, which the tick sends only when it changes. `POP_JS` opens/closes popovers.
