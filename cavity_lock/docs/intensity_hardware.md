@@ -40,7 +40,7 @@ as a current-controlled attenuator. OUT2 is no longer the cavity lock's monitor 
    resets OUT2 to 0 V (pid2 off, asg1 off) unless a servo is already running with non-zero gains (then it is
    adopted untouched).
 3. Because of the ×10 driver gain, the useful OUT2 range is only about ±0.1–0.2 V. The app limits the clamps and
-   the Bode test sine to `int_out2_limit_mv` (default ±300 mV).
+   the Bode test sine to `int_out2_limit_mv` (default ±1 V, the Red Pitaya's own output range).
 4. **Diffraction efficiency rises with RF power, peaks, then falls.** Past the peak K changes sign and the servo
    latches at full drive. There is no scan in the app (user decision), so set the bright-side clamp
    (`int_clamp_lo_mv`, low = bright because the driver inverts) short of the peak from your own measurement of the

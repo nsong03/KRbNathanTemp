@@ -36,8 +36,8 @@ PANEL_LABEL = {}
 
 # (key, label, default, group, kind, options) -- UI units
 I_FIELDS = [
-    ("int_out2_limit_mv", "OUT2 absolute limit [mV] (clamps, test sine)", 300.0, "Intensity", "num",
-     {"min": 10, "max": 950}),
+    ("int_out2_limit_mv", "OUT2 absolute limit [mV] (clamps, test sine)", 1000.0, "Intensity", "num",
+     {"min": 10, "max": 1000}),
     ("int_setpoint_mv", "Setpoint [mV of IN2]", 500.0, "Intensity", "num", {"min": 0, "max": 1000}),
     ("int_filter_hz", "Input filter corner [Hz] (<0 high-pass, 0 off)", 0.0, "Intensity", "num", {}),
     ("int_filter_stages", "Input filter stages", 1, "Intensity", "select", {"options": [1, 2, 3, 4]}),
