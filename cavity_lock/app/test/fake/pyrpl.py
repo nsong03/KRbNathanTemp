@@ -347,11 +347,19 @@ class Engine:
         # integrates OUT1 (the error output) into IN2: ext_v += 2 pi ext_i * OUT1 * dt, clamped to +/- ext_lim
         self.pzt_out = os.environ.get("FAKE_PZT_OUT", "out1")
         self.ext_on, self.ext_i, self.ext_v, self.ext_lim = False, 0.0, 0.0, 0.75
+        # errsig2ph_app (FAKE_LOCKIN=iq2): the lock-in is iq2 with both quadratures, X = 'iq2' = A cos(phase - lag),
+        # Y = 'iq2_2' = A sin(phase - lag) (same low-pass and gain)
+        self.li_name = os.environ.get("FAKE_LOCKIN", "iq0")
+        self.filt_y = np.zeros(4)
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
+    @property
+    def li(self):
+        return getattr(self.rp, self.li_name)
+
     def dither_pp(self):
-        iq = self.rp.iq0
+        iq = self.li
         return 2 * iq.amplitude * DITHER_SCALE if iq.output_direct in (self.pzt_out, "both") else 0.0
 
     def pd_avg(self, v):
@@ -363,17 +371,18 @@ class Engine:
             tot = tot + h * np.mean(1 / (1 + (2 * (v + d * np.sin(ph) - (self.vc + off)) / KAPPA) ** 2), axis=1)
         return V_PK * tot
 
-    def err_raw(self, v):
+    def err_raw(self, v, quad=0):
         dpp = self.dither_pp()
         if dpp <= 0:
             return np.zeros_like(np.atleast_1d(v), dtype=float)
         m = dpp / KAPPA
-        iq = self.rp.iq0
+        iq = self.li
         c1 = sum(h * h1(2 * (np.atleast_1d(v) - (self.vc + off)) / KAPPA, m) for off, h in MODES)
-        return DEMOD_SCALE * iq.quadrature_factor * V_PK * c1 * math.cos(math.radians(iq.phase - PZT_LAG_DEG))
+        trig = math.sin if quad else math.cos
+        return DEMOD_SCALE * iq.quadrature_factor * V_PK * c1 * trig(math.radians(iq.phase - PZT_LAG_DEG))
 
     def lpf_coeffs(self, dt):
-        bws = [b for b in np.atleast_1d(self.rp.iq0.bandwidth) if b > 0]
+        bws = [b for b in np.atleast_1d(self.li.bandwidth) if b > 0]
         return [(1 - math.exp(-2 * math.pi * b * dt)) for b in bws]
 
     def loop(self):
@@ -405,20 +414,29 @@ class Engine:
                 else 0.0
         v = asg + pid_out
         y = float(self.err_raw(v)[0])
-        for k, a in enumerate(self.lpf_coeffs(DT)):
+        coeffs = self.lpf_coeffs(DT)
+        for k, a in enumerate(coeffs):
             self.filt[k] += a * (y - self.filt[k])
             y = self.filt[k]
         e = y + NOISE_ERR * self.rng.standard_normal()
-        if p0.output_direct != "off" and p0.input == "iq0" and p0.i != 0:
+        ey = 0.0
+        if self.li_name == "iq2":
+            y = float(self.err_raw(v, 1)[0])
+            for k, a in enumerate(coeffs):
+                self.filt_y[k] += a * (y - self.filt_y[k])
+                y = self.filt_y[k]
+            ey = y + NOISE_ERR * self.rng.standard_normal()
+        if p0.output_direct != "off" and p0.input == self.li_name and p0.i != 0:
             p0.ival = float(np.clip(p0.ival + 2 * math.pi * p0.i * (e - p0.setpoint) * DT, p0.min_voltage, p0.max_voltage))
         pd = float(self.pd_avg(v)[0]) + NOISE_PD * self.rng.standard_normal()
         p1 = self.rp.pid1
-        err_out = float(np.clip(p1.p * (e - p1.setpoint) + p1.ival, p1.min_voltage, p1.max_voltage)) \
-            if (po == "out2" and p1.output_direct in ("out1", "both") and p1.input == "iq0" and p1.i == 0) else 0.0
+        e1 = {self.li_name: e, self.li_name + "_2": ey}.get(p1.input)
+        err_out = float(np.clip(p1.p * (e1 - p1.setpoint) + p1.ival, p1.min_voltage, p1.max_voltage)) \
+            if (po == "out2" and p1.output_direct in ("out1", "both") and e1 is not None and p1.i == 0) else 0.0
         if self.ext_on:
             self.ext_v = float(np.clip(self.ext_v + 2 * math.pi * self.ext_i * err_out * DT, -self.ext_lim,
                                        self.ext_lim))
-        self.hist.append((t, v, pd, e, pid_out, err_out, self.ext_v))
+        self.hist.append((t, v, pd, e, pid_out, err_out, self.ext_v, ey))
         if len(self.hist) > 40000:
             del self.hist[:20000]
 
@@ -453,7 +471,8 @@ class Engine:
         Intensity signals (in2, pid2, out2, asg1) come from the AOM model for the same window."""
         n = 2 ** 14
         trel = np.arange(n) * duration / n
-        cav_names = {"in1", "iq0", "asg0", "pid0", "out1", "iq1", "pid1"}
+        li = self.li_name
+        cav_names = {"in1", li, li + "_2", "asg0", "pid0", "out1", "iq1", "pid1"}
         with self.lock:
             asg = self.rp.asg0
             now = time.time()
@@ -476,7 +495,7 @@ class Engine:
                 else:
                     pid_out = p0.ival if p0.output_direct in ("out1", "both") else 0.0
                 v = asg.value(ts, po) + pid_out
-                bws = [b for b in np.atleast_1d(self.rp.iq0.bandwidth) if b > 0]
+                bws = [b for b in np.atleast_1d(self.li.bandwidth) if b > 0]
                 pre = 6 * 4 / (2 * math.pi * max(min(bws), 1)) if bws else 0.0
                 npre = int(pre / (duration / n)) + 1
                 tp = t0 - np.arange(npre, 0, -1) * duration / n
@@ -486,14 +505,20 @@ class Engine:
                 for a in self.lpf_coeffs(dt):
                     y = lfilter([a], [1, -(1 - a)], y)
                 err = y[npre:] + NOISE_ERR * self.rng.standard_normal(n)
+                if li == "iq2":
+                    y = self.err_raw(vfull, 1)
+                    for a in self.lpf_coeffs(dt):
+                        y = lfilter([a], [1, -(1 - a)], y)
+                    sig[li + "_2"] = y[npre:] + NOISE_ERR * self.rng.standard_normal(n)
                 pd = self.pd_avg(v) + NOISE_PD * self.rng.standard_normal(n)
                 d = self.dither_pp() / 2
-                sig.update({"in1": pd, "iq0": err, "asg0": asg.raw(ts), "pid0": np.full(n, pid_out),
-                            po: v + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+                sig.update({"in1": pd, li: err, "asg0": asg.raw(ts), "pid0": np.full(n, pid_out),
+                            po: v + d * np.sin(2 * np.pi * self.li.frequency * ts)})
                 if po == "out2":
                     p1 = self.rp.pid1
-                    sig["out1"] = np.clip(p1.p * err + p1.ival, p1.min_voltage, p1.max_voltage) \
-                        if p1.output_direct in ("out1", "both") else np.zeros(n)
+                    src = sig.get(p1.input) if p1.input in (li, li + "_2") else None
+                    sig["out1"] = np.clip(p1.p * src + p1.ival, p1.min_voltage, p1.max_voltage) \
+                        if (p1.output_direct in ("out1", "both") and src is not None) else np.zeros(n)
                     sig["in2"] = np.full(n, self.ext_v)
             elif cav_names & set(names) or t0 is None:
                 h = np.array(self.hist[-int((self.t - (t_start or self.t) + duration) / DT) - 4:])
@@ -504,9 +529,10 @@ class Engine:
                 ts = np.linspace(t_end - duration, t_end, n)
                 d = self.dither_pp() / 2
                 drive = np.interp(ts, tt, h[:, 1])
-                sig.update({"in1": np.interp(ts, tt, h[:, 2]), "iq0": np.interp(ts, tt, h[:, 3]),
+                sig.update({"in1": np.interp(ts, tt, h[:, 2]), li: np.interp(ts, tt, h[:, 3]),
+                            li + "_2": np.interp(ts, tt, h[:, 7]),
                             "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.raw_rel(t0, trel),
-                            self.pzt_out: drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+                            self.pzt_out: drive + d * np.sin(2 * np.pi * self.li.frequency * ts)})
                 if self.pzt_out == "out2":
                     sig["out1"] = np.interp(ts, tt, h[:, 5])
                     sig["in2"] = np.interp(ts, tt, h[:, 6])
@@ -608,15 +634,16 @@ def nearest_log(v, ladder):
 
 
 class IQ(Mod):
-    """FPGA-like rounding: factor-2 filter ladder, 2 filter stages, integer quadrature factor."""
+    """FPGA-like rounding: factor-2 filter ladder, 2 filter stages (iq2: 4), integer quadrature factor."""
     @property
     def bandwidth(self):
         return self._bw
 
     @bandwidth.setter
     def bandwidth(self, v):
-        v = [b for b in np.atleast_1d(v)][:2]
-        self._bw = [nearest_log(b, LPF_LADDER) if b > 0 else 0 for b in v] + [0] * (2 - len(v))
+        st = getattr(self, "_stages", 2)
+        v = [b for b in np.atleast_1d(v)][:st]
+        self._bw = [nearest_log(b, LPF_LADDER) if b > 0 else 0 for b in v] + [0] * (st - len(v))
 
     @property
     def acbandwidth(self):
@@ -641,6 +668,7 @@ class RP:
         self.iq0, self.iq1, self.iq2 = IQ(), IQ(), IQ()
         for nm, iq in (("iq0", self.iq0), ("iq1", self.iq1), ("iq2", self.iq2)):
             object.__setattr__(iq, "_name", nm)
+            object.__setattr__(iq, "_stages", 4 if nm == "iq2" else 2)
             iq.input, iq.frequency, iq.amplitude, iq.phase = "in1", 1000.0, 0.0, 0.0
             iq.bandwidth, iq.acbandwidth, iq.gain, iq.quadrature_factor = [250.0, 250.0], 100.0, 0.0, 1.0
             iq.output_signal, iq.output_direct = "quadrature", "off"

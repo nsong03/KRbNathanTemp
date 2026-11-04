@@ -56,6 +56,31 @@ A separate, smaller web app for an EXTERNAL servo box. No PID feedback runs on t
 - Fake: `eng.pzt_out = "out2"` (env `FAKE_PZT_OUT`) makes OUT2 drive the PZT; `eng.ext_on/ext_i/ext_v/ext_lim` model the
   servo box (integrates OUT1 into IN2). An ASG with amplitude 0 outputs its offset (like the hardware).
 
+## Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, 2026-11-04)
+A copy of the errsig app (files `errsig2ph_app.py` / `errsig2ph_schematic.py` / `errsig2ph_ui.py`, independent of
+`errsig_*`) with a dual-quadrature lock-in. Same wiring (IN1 PD, OUT1 error, IN2 correction, OUT2 summer/ramp).
+- Lock-in on **iq2**: in 0.9.9.1 only DSP module 7 (`iq_2_outputs` in red_pitaya_dsp.v, QUADRATUREFILTERSTAGES 4)
+  wires `signal2_o`, so X = `iq2` (output_signal quadrature) and Y = `iq2_2` (DSP index 14). Both share the low-pass
+  register 0x124 (1–4 stages here, `lpf_order` 1–4), the high-pass and `quadrature_factor` (g3 scales both). The
+  PyRPL network analyzer / spectrum analyzer also use iq2: they cannot run while this app owns it. iq0 output off.
+- Modules: iq2 (dither → out2, demodulation), pid1 (X or Y → out1, setting `eo_source` "X"/"Y"), pid0 (in2 → out2,
+  servo mode), asg0 (ramp / DC). iq0, iq1, asg1 outputs off; pid2 off.
+- Sweeps: two triggered captures per frame, (in1, iq2) and (iq2, iq2_2) (X and Y from the same instant). Live: the
+  same two, untriggered. `xy_theta(x, y)`: principal axis of the centred X–Y scatter (θ in −90..90°) and quality q
+  (variance ratio along/across; shown only for q ≥ 3). Sweep θ uses the target-peak window (`_half_window`).
+- Auto phase: θ from one sweep → `iq2.phase = phase ± θ`; the rotation direction is found on the first run (if the
+  residual is not < θ/2 the other sign is used) and kept in `ctl._phase_sign` (runtime). Then +180° if the X slope
+  is positive. No clear axis (q < 3) → the 4-phase fit of errsig (logged).
+- Servo mode: live θ from the residual fluctuations (meaningful only when cavity-frequency noise dominates the
+  isotropic detection noise; on the fake q ≈ 1–2, "no clear axis").
+- Run: `python app\errsig2ph_app.py --host rp-f0fa92.local` → http://127.0.0.1:8065 (settings `errsig2ph_settings.json`).
+- Fake: env `FAKE_LOCKIN=iq2` → the engine demodulates with iq2: X = A cos(phase − lag), Y = A sin(phase − lag), own
+  filter state for Y, hist tuples 8 long (`ey` last), iq2 takes 4 filter stages (`IQ._stages`). Default `iq0`
+  leaves the other apps' fake unchanged.
+- Tests: `test/test_errsig2ph.py` (37 checks: θ from one sweep within 3° of the fake at two phases, Auto → |θ| < 3°
+  with a negative slope, 4 filter stages, X/Y output source, the errsig checks), `serve_errsig2ph.py` (port 8066) +
+  `ui_errsig2ph.py` (23 checks). Screenshots `docs/screenshots/errsig2ph_*.png`.
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |
