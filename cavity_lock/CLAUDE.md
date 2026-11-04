@@ -33,6 +33,29 @@ python app\cavity_lock_app.py --host rp-f0fa92.local        # opens http://127.0
 - Settings are saved to `cavity_lock_settings.json` next to the app with the Save and Load buttons. Keep the keys backward compatible: the user has saved files.
 - Ctrl-C quits. The Red Pitaya keeps its state, so a running lock stays on.
 
+## Second app: error signal + PZT summer (`app/errsig_app.py`, 2026-11-04)
+A separate, smaller web app for an EXTERNAL servo box. No PID feedback runs on the Red Pitaya.
+- Wiring: IN1 ← photodiode; **OUT1 → servo box** (error = `eo_gain` × iq0 + `eo_offset_mv`, clamp `eo_limit_mv`);
+  **IN2 ← servo box correction** (HV jumper for its ±15 V: ±20 V range, 30 V absolute max; LV is ±1 V, 6 V absolute
+  max → limiter); **OUT2 → PZT driver** = `in2_gain` × IN2 + DC offset (`ramp_center_mv`) + dither.
+  "Ramp (align)" toggle: OUT2 = ramp + dither, the IN2 correction off.
+- Modules: iq0 (dither → out2, demodulates in1), pid1 (pass-through iq0 → out1), pid0 (pass-through in2 → out2, only
+  in servo mode), asg0 (ramp or DC offset → out2); pid0/pid1 have I = 0 always (the FPGA cannot route iq0 or in2 to a
+  DAC by itself). pid2, asg1, iq1, iq2 off. On HV the FPGA sees IN2/20: gain 1 maps ±15 V to ±0.75 V on OUT2;
+  `in2_scale` (default 20) is display only.
+- Run: `python app\errsig_app.py --host rp-f0fa92.local` → http://127.0.0.1:8060 (settings `errsig_settings.json`).
+  Only one app may own the Red Pitaya at a time.
+- Files: `errsig_app.py` (`ErrsigController`, reuses the analysis helpers of `cavity_lock_app.py`),
+  `errsig_schematic.py` (model), `errsig_ui.py` (Dash; reuses `ui.CSS`, `ui.SCOPE_JS`, `ui.DIAG_JS`, `ui.POP_JS`).
+- Modes `acquire` (Ramp on), `servo` (Ramp off: correction + DC + dither), `busy` (auto phase), `off` (Output off,
+  OUT2 = 0 V). "Park at peak" puts the DC offset on the target peak's error zero crossing and enters servo mode; the
+  error slope there is shown (V of OUT1 per V of OUT2) for the servo box gain and sign. Setpoint ±1/±10 mV steps move
+  the ramp centre / DC offset. Auto phase, Lock Assist targets, dither calibration (on OUT2 while ramping).
+- Tests: `test/test_errsig.py` (23 checks incl. an end-to-end lock through a simulated servo box: OUT1 → integrator →
+  IN2 → OUT2); `serve_errsig.py` (port 8061) + `ui_errsig.py` (Playwright, 17 checks). Both set `FAKE_PZT_OUT=out2`.
+- Fake: `eng.pzt_out = "out2"` (env `FAKE_PZT_OUT`) makes OUT2 drive the PZT; `eng.ext_on/ext_i/ext_v/ext_lim` model the
+  servo box (integrates OUT1 into IN2). An ASG with amplitude 0 outputs its offset (like the hardware).
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |

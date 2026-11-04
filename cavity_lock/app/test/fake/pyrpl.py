@@ -125,9 +125,9 @@ class ASG(Mod):
 
     def value(self, t, out="out1"):
         """What this ASG adds to output `out` (zero unless routed there)."""
-        if self.output_direct not in (out, "both") or self.amplitude == 0:
+        if self.output_direct not in (out, "both"):
             return np.zeros_like(np.asarray(t, dtype=float))
-        return self.raw(t)
+        return self.raw(t)                       # amplitude 0: the offset alone (a DC level), like the hardware
 
     def raw_rel(self, t0, trel):
         """The internal signal at times t0 + trel, without losing precision on epoch times."""
@@ -343,12 +343,16 @@ class Engine:
         self.t = time.time()
         self.aom = AOM(rp, np.random.default_rng(7))
         self._n = 0
+        # errsig_app wiring (FAKE_PZT_OUT=out2 or eng.pzt_out = "out2"): OUT2 drives the PZT; an external servo box
+        # integrates OUT1 (the error output) into IN2: ext_v += 2 pi ext_i * OUT1 * dt, clamped to +/- ext_lim
+        self.pzt_out = os.environ.get("FAKE_PZT_OUT", "out1")
+        self.ext_on, self.ext_i, self.ext_v, self.ext_lim = False, 0.0, 0.0, 0.75
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
     def dither_pp(self):
         iq = self.rp.iq0
-        return 2 * iq.amplitude * DITHER_SCALE if iq.output_direct in ("out1", "both") else 0.0
+        return 2 * iq.amplitude * DITHER_SCALE if iq.output_direct in (self.pzt_out, "both") else 0.0
 
     def pd_avg(self, v):
         d = self.dither_pp() / 2
@@ -391,9 +395,14 @@ class Engine:
         self._n += 1
         if self._n % 4 == 0:
             self.aom.update(t, 4 * DT)
-        asg = float(self.rp.asg0.value(t, "out1")) + float(self.rp.asg1.value(t, "out1"))
-        pid_out = float(np.clip(p0.ival, p0.min_voltage, p0.max_voltage)) if p0.output_direct in ("out1", "both") \
-            else 0.0
+        po = self.pzt_out
+        asg = float(self.rp.asg0.value(t, po)) + float(self.rp.asg1.value(t, po))
+        if po == "out2":                               # errsig wiring: pid0 passes IN2 (the external servo) to OUT2
+            pid_out = float(np.clip(p0.p * (self.ext_v - p0.setpoint) + p0.ival, p0.min_voltage, p0.max_voltage)) \
+                if (p0.output_direct in ("out2", "both") and p0.input == "in2") else 0.0
+        else:
+            pid_out = float(np.clip(p0.ival, p0.min_voltage, p0.max_voltage)) if p0.output_direct in ("out1", "both") \
+                else 0.0
         v = asg + pid_out
         y = float(self.err_raw(v)[0])
         for k, a in enumerate(self.lpf_coeffs(DT)):
@@ -403,7 +412,13 @@ class Engine:
         if p0.output_direct != "off" and p0.input == "iq0" and p0.i != 0:
             p0.ival = float(np.clip(p0.ival + 2 * math.pi * p0.i * (e - p0.setpoint) * DT, p0.min_voltage, p0.max_voltage))
         pd = float(self.pd_avg(v)[0]) + NOISE_PD * self.rng.standard_normal()
-        self.hist.append((t, v, pd, e, pid_out))
+        p1 = self.rp.pid1
+        err_out = float(np.clip(p1.p * (e - p1.setpoint) + p1.ival, p1.min_voltage, p1.max_voltage)) \
+            if (po == "out2" and p1.output_direct in ("out1", "both") and p1.input == "iq0" and p1.i == 0) else 0.0
+        if self.ext_on:
+            self.ext_v = float(np.clip(self.ext_v + 2 * math.pi * self.ext_i * err_out * DT, -self.ext_lim,
+                                       self.ext_lim))
+        self.hist.append((t, v, pd, e, pid_out, err_out, self.ext_v))
         if len(self.hist) > 40000:
             del self.hist[:20000]
 
@@ -454,13 +469,18 @@ class Engine:
             if trigger == "asg0" and asg.output_direct != "off":
                 ts = t0 + trel
                 p0 = self.rp.pid0
-                pid_out = p0.ival if p0.output_direct in ("out1", "both") else 0.0
-                v = asg.value(ts) + pid_out
+                po = self.pzt_out
+                if po == "out2":
+                    pid_out = float(np.clip(p0.p * self.ext_v + p0.ival, p0.min_voltage, p0.max_voltage)) \
+                        if (p0.output_direct in ("out2", "both") and p0.input == "in2") else 0.0
+                else:
+                    pid_out = p0.ival if p0.output_direct in ("out1", "both") else 0.0
+                v = asg.value(ts, po) + pid_out
                 bws = [b for b in np.atleast_1d(self.rp.iq0.bandwidth) if b > 0]
                 pre = 6 * 4 / (2 * math.pi * max(min(bws), 1)) if bws else 0.0
                 npre = int(pre / (duration / n)) + 1
                 tp = t0 - np.arange(npre, 0, -1) * duration / n
-                vfull = np.concatenate([asg.value(tp) + pid_out, v])
+                vfull = np.concatenate([asg.value(tp, po) + pid_out, v])
                 y = self.err_raw(vfull)
                 dt = duration / n
                 for a in self.lpf_coeffs(dt):
@@ -468,8 +488,13 @@ class Engine:
                 err = y[npre:] + NOISE_ERR * self.rng.standard_normal(n)
                 pd = self.pd_avg(v) + NOISE_PD * self.rng.standard_normal(n)
                 d = self.dither_pp() / 2
-                sig.update({"in1": pd, "iq0": err, "asg0": asg.value(ts), "pid0": np.full(n, pid_out),
-                            "out1": v + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+                sig.update({"in1": pd, "iq0": err, "asg0": asg.raw(ts), "pid0": np.full(n, pid_out),
+                            po: v + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+                if po == "out2":
+                    p1 = self.rp.pid1
+                    sig["out1"] = np.clip(p1.p * err + p1.ival, p1.min_voltage, p1.max_voltage) \
+                        if p1.output_direct in ("out1", "both") else np.zeros(n)
+                    sig["in2"] = np.full(n, self.ext_v)
             elif cav_names & set(names) or t0 is None:
                 h = np.array(self.hist[-int((self.t - (t_start or self.t) + duration) / DT) - 4:])
                 tt = h[:, 0]
@@ -481,10 +506,16 @@ class Engine:
                 drive = np.interp(ts, tt, h[:, 1])
                 sig.update({"in1": np.interp(ts, tt, h[:, 2]), "iq0": np.interp(ts, tt, h[:, 3]),
                             "pid0": np.interp(ts, tt, h[:, 4]), "asg0": asg.raw_rel(t0, trel),
-                            "out1": drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+                            self.pzt_out: drive + d * np.sin(2 * np.pi * self.rp.iq0.frequency * ts)})
+                if self.pzt_out == "out2":
+                    sig["out1"] = np.interp(ts, tt, h[:, 5])
+                    sig["in2"] = np.interp(ts, tt, h[:, 6])
             if "iq1" in names or "pid1" in names:
                 sig["iq1"], sig["pid1"] = self.copies(t0 + trel)
-            sig.update(self.aom.synth(t0, trel))
+            if self.pzt_out == "out2":                  # errsig wiring: no AOM on OUT2; IN2 = the external servo
+                sig.setdefault("asg1", self.rp.asg1.raw_rel(t0, trel))
+            else:
+                sig.update(self.aom.synth(t0, trel))
         return [sig.get(nm, np.zeros(n)) for nm in names], ready_at
 
 
@@ -556,6 +587,8 @@ class Sampler:
     @property
     def in2(self):
         lan()
+        if self.eng.pzt_out == "out2":
+            return self.eng.ext_v + 0.0005 * self.eng.rng.standard_normal()
         return self.eng.aom.sample_pd()
 
     @property

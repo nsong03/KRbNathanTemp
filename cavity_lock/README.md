@@ -17,6 +17,12 @@ Everything from the claude.ai project "lock a cavity PZT to the laser with a Red
 
 OUT2 is no longer a scope monitor. The intensity hardware is described in `docs/intensity_hardware.md` (not built yet).
 
+## Second app: error signal + PZT summer for an external servo box
+`app/errsig_app.py` (port 8060). IN1 ← photodiode, **OUT1 → servo box** (error signal × gain + offset),
+**IN2 ← servo box** correction (HV jumper for ±15 V), **OUT2 → PZT driver** = IN2 × gain + DC offset + dither, or the
+alignment ramp + dither (Ramp toggle). No feedback on the Red Pitaya. Ramp, Auto phase, pick a peak, "Park at peak",
+close the loop on the servo box. Run: `python app\errsig_app.py --host rp-f0fa92.local`.
+
 ## Status
 - **v5 — AOM intensity stabilization** (2026-11-02): a second feature on IN2/OUT2 (`pid2` servo, `asg1` Bode test sine).
   Two icons at the top left switch between the *Cavity lock* and *Intensity* views; each icon has a status dot, both
