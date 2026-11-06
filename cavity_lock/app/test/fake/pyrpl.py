@@ -355,7 +355,7 @@ class Engine:
         # pi_app (FAKE_PLANT=errin): IN1 is an external error signal of the cavity, e(v) dispersive with slope
         # -2 E_PK / (KAPPA/2) at resonance; pid0 (input in1) is a full PI with its input filter; OUT1 = asg0 + pid0
         self.plant = os.environ.get("FAKE_PLANT", "cavity")
-        self.pid_out, self.ifilt = 0.0, np.zeros(4)
+        self.pid_out, self.ifilt, self.p_out = 0.0, np.zeros(4), 0.0
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
@@ -446,9 +446,9 @@ class Engine:
         if po == "out2":                               # errsig wiring: pid0 passes IN2 (the external servo) to OUT2
             pid_out = float(np.clip(p0.p * (self.ext_v - p0.setpoint) + p0.ival, p0.min_voltage, p0.max_voltage)) \
                 if (p0.output_direct in ("out2", "both") and p0.input == "in2") else 0.0
-        else:
-            pid_out = float(np.clip(p0.ival, p0.min_voltage, p0.max_voltage)) if p0.output_direct in ("out1", "both") \
-                else 0.0
+        else:                                          # (lockin_pi_app, iq2: pid0 is a full P + I on X or Y)
+            pid_out = float(np.clip(p0.ival + (self.p_out if self.li_name == "iq2" else 0.0), p0.min_voltage,
+                                    p0.max_voltage)) if p0.output_direct in ("out1", "both") else 0.0
         v = asg + pid_out
         y = float(self.err_raw(v)[0])
         coeffs = self.lpf_coeffs(DT)
@@ -463,7 +463,13 @@ class Engine:
                 self.filt_y[k] += a * (y - self.filt_y[k])
                 y = self.filt_y[k]
             ey = y + NOISE_ERR * self.rng.standard_normal()
-        if p0.output_direct != "off" and p0.input == self.li_name and p0.i != 0:
+        if self.li_name == "iq2":
+            ein = {"iq2": e, "iq2_2": ey}.get(p0.input)
+            self.p_out = p0.p * (ein - p0.setpoint) if (ein is not None and p0.output_direct != "off") else 0.0
+            if ein is not None and p0.output_direct != "off" and p0.i != 0:
+                p0.ival = float(np.clip(p0.ival + 2 * math.pi * p0.i * (ein - p0.setpoint) * DT, p0.min_voltage,
+                                        p0.max_voltage))
+        elif p0.output_direct != "off" and p0.input == self.li_name and p0.i != 0:
             p0.ival = float(np.clip(p0.ival + 2 * math.pi * p0.i * (e - p0.setpoint) * DT, p0.min_voltage, p0.max_voltage))
         pd = float(self.pd_avg(v)[0]) + NOISE_PD * self.rng.standard_normal()
         p1 = self.rp.pid1

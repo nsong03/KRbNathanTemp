@@ -100,6 +100,27 @@ filters optional and off by default, a ramp toggle for acquisition, **IN1 and OU
 - Tests: `test/test_pi.py` (28: ramp acquisition shows the resonance, snapping, lock, drift, setpoint, filters,
   clamps, wrong sign → clamp, interlocks, write log, restart adoption), `serve_pi.py` (port 8076) + `ui_pi.py` (15).
 
+## Fourth app: dual-phase lock-in PI + intensity PI (`app/lockin_pi_app.py`, 2026-11-06)
+User request: IN1/OUT1 = dual-phase lock-in + PI + ramp; intensity servo on OUT2; **raw P and I only, no
+auto-calculation or auto-setting**; optional toggleable filters (off by default). The user wrote "input 1 and output
+2" for the intensity servo; the documented hardware has the AOM pickoff on IN2, so `int_input` defaults to in2 and
+in1 is selectable.
+- `LockinPIController` (+ `lockin_pi_ui.py`, reuses `pi_ui.CSS` and `pi_app` capture/envelope). Modules: iq2 (dither
+  → out1, demodulates in1: X = iq2, Y = iq2_2, LP 1–4 stages, HP, integer gain, phase by hand), pid0 (input iq2 or
+  iq2_2 = `pi_input` X/Y → out1), asg0 (ramp / offset → out1), pid2 (int_input → out2). iq0, iq1, pid1, asg1 off.
+- No phase extraction: the sweep only DISPLAYS the X–Y signal angle (`xy_theta`). R cannot be a PI input (no R
+  signal in the FPGA, and R has no sign).
+- Filters: `filt_on` / `int_filt_on` are bool toggles (switch commands `filt` / `int_filt`), stored in settings; the
+  stage values are written only while the toggle is on (else [0, 0, 0, 0]). Bool keys are not in `KEYS`.
+- Lock modes like pi_app (ramp / dc / pi / off) + Dither toggle. Intensity `int_on` (pid2 → out2, ival 0 at on) or off
+  (OUT2 = 0 V). Start-up: each PI adopted untouched if running with gains, else lock → ramp, intensity → off.
+- Scope per frame: (in1, out1) + (iq2, iq2_2) (triggered on asg0 in ramp) and (int_input, out2) untriggered.
+- Run: `python app\lockin_pi_app.py --host rp-f0fa92.local` → http://127.0.0.1:8085 (`lockin_pi_settings.json`).
+- Fake: with `FAKE_LOCKIN=iq2` and the PZT on out1, pid0 is a full P + I on X or Y (`eng.p_out`); the AOM on OUT2 as before.
+- Tests: `test/test_lockin_pi.py` (29: phase by hand, lock from the ramp data with raw gains, drift, filter
+  toggles, X/Y input, intensity lock + setpoint + filter + input, restart adoption of both, write log),
+  `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (25).
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |
