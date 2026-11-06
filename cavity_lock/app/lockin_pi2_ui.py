@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 import lockin_pi_schematic as LS
+import pyrpl_spinbox as PS
 import ui as U
 
 SHORT = {"ac_hz": "Hz", "lpf_hz": "Hz", "lpf_order": "", "lia_gain": "×", "phase_deg": "deg", "dither_hz": "Hz",
@@ -94,12 +95,19 @@ def build_app(ctl, A):
             return val
         if val is None or val == "":
             return None if key in NULLABLE else ctl.s.get(key, default)
-        return int(val) if isinstance(default, int) and not isinstance(default, bool) else float(val)
+        try:
+            if key in PS.SPIN:
+                return PS.parse(val, ctl.s.get(key, default))
+            return int(val) if isinstance(default, int) and not isinstance(default, bool) else float(val)
+        except (TypeError, ValueError):              # e.g. an unparsable P / I text: keep the present value
+            return ctl.s.get(key, default)
 
     def control(key, short=None):
         _, label, default, _, kind, opt = FIELD[key]
         val = ctl.s.get(key, default)
         cid = f"s-{key}"
+        if key in PS.SPIN:                           # P and I: PyRPL's PID widget (log-increment arrows)
+            return PS.component(key, val, short if short is not None else label, label)
         if kind == "select" and (WIDGET.get(key) == "radio" or len(opt["options"]) <= 2):
             comp = dcc.RadioItems(id=cid, options=[{"label": f" {o}", "value": o} for o in opt["options"]],
                                   value=val, inline=True, inputStyle={"marginLeft": "4px"})
@@ -126,7 +134,8 @@ def build_app(ctl, A):
         hdr_id = {"type": "hdr", "b": b["id"]}
         if b["kind"] == "node":
             return html.Div([html.Span(b["label"]), html.Div(id=f"{P}rb-{b['id']}", className="rb")], id=hdr_id,
-                            className="blk node" + (" term" if b["id"] in ("out1", "out2") else ""), style=pos)
+                            className="blk node" + (" term" if b["id"] in ("out1", "out2", "pi_out2_term") else ""),
+                            style=pos)
         kids = [html.Div(b["label"] + "  ⓘ", id=hdr_id, className="hdr", title="click for the description"),
                 html.Div(id=f"{P}rb-{b['id']}", className="rb")]
         knobs = [control(p["key"], SHORT.get(p["key"], "")) for p in b["params"]]
@@ -212,7 +221,7 @@ def build_app(ctl, A):
                 html.Button("Save settings", id="btn-save", className="btn"),
                 html.Button("Load settings", id="btn-load", className="btn"),
             ], className="bar", style={"marginBottom": "4px"}),
-            html.Div([canvas(LS.LOCK, "external (display only)", 76), lock_scope()], id="view-cavity"),
+            html.Div([canvas(LS.LOCK2, "external (display only)", 76), lock_scope()], id="view-cavity"),
             html.Div([canvas(LS.INT, "intensity servo: IN2 (or IN1) → pid2 → OUT2", 250), int_scope()],
                      id="view-intensity", style={"display": "none"}),
             html.Pre(id="log", style={"fontSize": "12px", "height": "22vh", "overflowY": "auto", "whiteSpace": "pre-wrap",
@@ -222,13 +231,14 @@ def build_app(ctl, A):
             dcc.Store(id="synced", data=-1), dcc.Store(id="push-version"), dcc.Store(id="frame"),
             dcc.Store(id="frame-seq", data=-1), dcc.Store(id="iframe"), dcc.Store(id="iframe-seq", data=-1),
             dcc.Store(id="diag"), dcc.Store(id="diag-key", data=""), dcc.Store(id="diag-ack"),
-            dcc.Store(id="geom", data=LS.geometry(LS.LOCK)),
+            dcc.Store(id="geom", data=LS.geometry(LS.LOCK2)),
             dcc.Store(id="idiag"), dcc.Store(id="idiag-key", data=""), dcc.Store(id="idiag-ack"),
             dcc.Store(id="igeom", data=LS.geometry(LS.INT)),
-            dcc.Store(id="typed"), dcc.Store(id="ack"),
+            dcc.Store(id="typed"), dcc.Store(id="ack"), PS.interval(),
         ], style={"fontFamily": "sans-serif", "padding": "6px 12px"})
 
     app.layout = serve_layout
+    PS.install(app, ctl)
 
     @app.callback(Output("ack", "data", allow_duplicate=True), [Input(f"s-{k}", "value") for k in KEYS],
                   State("synced", "data"), prevent_initial_call=True)
@@ -398,6 +408,6 @@ def build_app(ctl, A):
                   Input("push-version", "data"), prevent_initial_call=True)
     def on_push(v):
         s = dict(ctl.s)
-        return [s[k] for k in KEYS] + [v]
+        return [PS.fmt(s[k]) if k in PS.SPIN else s[k] for k in KEYS] + [v]
 
     return app

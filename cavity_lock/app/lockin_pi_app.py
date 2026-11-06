@@ -542,6 +542,11 @@ class LockinPIController:
                 if self.mode != "off":
                     self._write_asg()
                 self.log(f"offset {v:+g} mV")
+        elif cmd == "spin":                     # P / I arrows (PyRPL PID widget): value as stepped, unchanged
+            k, v = arg
+            if k in ("p", "i", "int_p", "int_i") and s.get(k) != v:
+                s[k] = v
+                self._write_pid() if k in ("p", "i") else self._write_int()
         elif cmd == "reset_i":
             self.r.pid0.ival = 0
             self.log("lock integrator reset")

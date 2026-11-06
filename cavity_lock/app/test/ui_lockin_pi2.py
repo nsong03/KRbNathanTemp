@@ -81,10 +81,38 @@ async def main():
         await typ("ramp_periods", 2)
         await typ("phase_deg", 35)
         await typ("offset_mv", round(stats()["vc"] * 1e3, 1))
+        print("--- P / I: PyRPL PID widget arrows")
+        up = lambda k: pg.locator(f".pyspin-btn[data-key='{k}'][data-dir='1']")
+        dn = lambda k: pg.locator(f".pyspin-btn[data-key='{k}'][data-dir='-1']")
+        check("P and I have the arrows and %.4e boxes", await up("p").count() == 1 and await dn("i").count() == 1
+              and await pg.locator("#s-p").input_value() == "0.0000e+00")
+        await up("p").click(); await pg.wait_for_timeout(700)
+        check("P: one click = one register step (2^-12)", abs(stats()["p"] - 2 ** -12) < 1e-12
+              and await pg.locator("#s-p").input_value() == "2.4414e-04", str(stats()["p"]))
+        await up("i").click(); await pg.wait_for_timeout(700)
+        check("I: one click = one register step (1/(2^32 2pi 8ns) = 0.004632)",
+              abs(stats()["i"] - 1 / (2 ** 32 * 2 * 3.141592653589793 * 8e-9)) < 1e-12
+              and await pg.locator("#s-i").input_value() == "4.6320e-03", str(stats()["i"]))
+        await typ("p", "1e-3")
+        box = await up("p").bounding_box()
+        await pg.mouse.move(box["x"] + 5, box["y"] + 5); await pg.mouse.down()
+        await pg.wait_for_timeout(1100); await pg.mouse.up(); await pg.wait_for_timeout(700)
+        v = stats()["p"]
+        check("P held 1.1 s: doubles every 0.5 s (x ~4.6)", 3.2e-3 < v < 6.5e-3, f"{v:.4e}")
+        v_txt = float(await pg.locator("#s-p").input_value())
+        check("box shows what was written", abs(v_txt - v) < 2.5e-4, f"{v_txt:.4e} vs {v:.4e}")
+        await typ("p", "2.4414e-04")
+        await dn("p").click(); await pg.wait_for_timeout(700)
+        await dn("p").click(); await pg.wait_for_timeout(700)
+        check("P down through zero: stops at 0, then negative steps", abs(stats()["p"] + 2 ** -12) < 1e-12,
+              str(stats()["p"]))
+        await pg.locator("#s-p").focus()
+        await pg.keyboard.down("ArrowUp"); await pg.keyboard.up("ArrowUp"); await pg.wait_for_timeout(700)
+        check("Up key in the box steps like the button", abs(stats()["p"]) < 1e-12, str(stats()["p"]))
         await typ("p", 0.02)
         await typ("i", 2)
-        check("boxes keep the typed P / I", await pg.locator("#s-p").input_value() == "0.02"
-              and await pg.locator("#s-i").input_value() == "2" and abs(stats()["i"] - 2) < 0.005)
+        check("typed values go straight to pid0.p / pid0.i", abs(stats()["p"] - 0.02) < 2.5e-4
+              and abs(stats()["i"] - 2) < 0.005)
         await flip("pi")
         check("PI switch -> PI ON", await wait_text("#status", "LOCK: PI ON") and stats()["out"] == "out1")
         await pg.wait_for_timeout(2500)
@@ -95,6 +123,14 @@ async def main():
         vis = [k for k in INT_KEYS if not await pg.locator(f"#s-{k}").is_visible()]
         check("Intensity view: every parameter and its scope setting visible", not vis
               and await pg.locator("#iscope").is_visible() and not await pg.locator("#scope").is_visible(), str(vis))
+        await pg.locator(".pyspin-btn[data-key='int_i'][data-dir='1']").click(); await pg.wait_for_timeout(700)
+        check("intensity I arrow: one register step", abs(stats()["ii"] - 0.0046320) < 1e-6, str(stats()["ii"]))
+        await typ("int_i", "3.8e4")
+        i0 = stats()["ii"]
+        await pg.locator(".pyspin-btn[data-key='int_i'][data-dir='1']").click(); await pg.wait_for_timeout(700)
+        check("single step at a large I is not lost: the register moves by one step, display %.4e",
+              abs(stats()["ii"] - i0 - 0.0046320) < 1e-6
+              and await pg.locator("#s-int_i").input_value() == "3.8000e+04", f"{i0:.6f} -> {stats()['ii']:.6f}")
         await typ("int_p", 0.01)
         await typ("int_i", 2000)
         await typ("int_setpoint_mv", 400)
@@ -108,6 +144,15 @@ async def main():
         check("intensity view: intensity traces fast", f > 8, f"{f:.1f}/s")
         await pg.screenshot(path="lockin_pi2_2_intensity.png", full_page=True)
         await pg.click("#vbtn-cav"); await pg.wait_for_timeout(800)
+        check("PI → OUT2 switch on the lock diagram, off", await pg.locator(pid(type="sw", s="pi_out2")).count() == 1
+              and not await on("pi_out2"))
+        await flip("pi_out2")
+        st = stats()
+        check("PI → OUT2 on: pid0 -> out2, intensity servo off", await on("pi_out2") and st["out"] == "out2"
+              and st["iout"] == "off" and await wait_text("#status", "SERVO OFF"), str(st))
+        await pg.screenshot(path="lockin_pi2_3_pi_out2.png", full_page=True)
+        await flip("pi_out2")
+        check("PI → OUT2 off: pid0 back to out1", stats()["out"] == "out1" and not await on("pi_out2"))
         await flip("ramp")
         check("Ramp switch -> RAMP", await wait_text("#status", "LOCK: RAMP") and stats()["out"] == "off")
         await flip("output")
