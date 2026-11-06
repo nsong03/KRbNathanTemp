@@ -56,6 +56,71 @@ A separate, smaller web app for an EXTERNAL servo box. No PID feedback runs on t
 - Fake: `eng.pzt_out = "out2"` (env `FAKE_PZT_OUT`) makes OUT2 drive the PZT; `eng.ext_on/ext_i/ext_v/ext_lim` model the
   servo box (integrates OUT1 into IN2). An ASG with amplitude 0 outputs its offset (like the hardware).
 
+## Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, 2026-11-04)
+A copy of the errsig app (files `errsig2ph_app.py` / `errsig2ph_schematic.py` / `errsig2ph_ui.py`, independent of
+`errsig_*`) with a dual-quadrature lock-in. Same wiring (IN1 PD, OUT1 error, IN2 correction, OUT2 summer/ramp).
+- Lock-in on **iq2**: in 0.9.9.1 only DSP module 7 (`iq_2_outputs` in red_pitaya_dsp.v, QUADRATUREFILTERSTAGES 4)
+  wires `signal2_o`, so X = `iq2` (output_signal quadrature) and Y = `iq2_2` (DSP index 14). Both share the low-pass
+  register 0x124 (1–4 stages here, `lpf_order` 1–4), the high-pass and `quadrature_factor` (g3 scales both). The
+  PyRPL network analyzer / spectrum analyzer also use iq2: they cannot run while this app owns it. iq0 output off.
+- Modules: iq2 (dither → out2, demodulation), pid1 (X or Y → out1, setting `eo_source` "X"/"Y"), pid0 (in2 → out2,
+  servo mode), asg0 (ramp / DC). iq0, iq1, asg1 outputs off; pid2 off.
+- Sweeps: two triggered captures per frame, (in1, iq2) and (iq2, iq2_2) (X and Y from the same instant). Live: the
+  same two, untriggered. `xy_theta(x, y)`: principal axis of the centred X–Y scatter (θ in −90..90°) and quality q
+  (variance ratio along/across; shown only for q ≥ 3). Sweep θ uses the target-peak window (`_half_window`).
+- Auto phase: θ from one sweep → `iq2.phase = phase ± θ`; the rotation direction is found on the first run (if the
+  residual is not < θ/2 the other sign is used) and kept in `ctl._phase_sign` (runtime). Then +180° if the X slope
+  is positive. No clear axis (q < 3) → the 4-phase fit of errsig (logged).
+- Servo mode: live θ from the residual fluctuations (meaningful only when cavity-frequency noise dominates the
+  isotropic detection noise; on the fake q ≈ 1–2, "no clear axis").
+- Run: `python app\errsig2ph_app.py --host rp-f0fa92.local` → http://127.0.0.1:8065 (settings `errsig2ph_settings.json`).
+- Fake: env `FAKE_LOCKIN=iq2` → the engine demodulates with iq2: X = A cos(phase − lag), Y = A sin(phase − lag), own
+  filter state for Y, hist tuples 8 long (`ey` last), iq2 takes 4 filter stages (`IQ._stages`). Default `iq0`
+  leaves the other apps' fake unchanged.
+- Tests: `test/test_errsig2ph.py` (37 checks: θ from one sweep within 3° of the fake at two phases, Auto → |θ| < 3°
+  with a negative slope, 4 filter stages, X/Y output source, the errsig checks), `serve_errsig2ph.py` (port 8066) +
+  `ui_errsig2ph.py` (23 checks). Screenshots `docs/screenshots/errsig2ph_*.png`.
+
+## Third app: plain PI servo (`app/pi_app.py`, 2026-11-06)
+User request: accept an error signal, output the correction through a PI, **nothing fancy**: raw P and I set by hand,
+filters optional and off by default, a ramp toggle for acquisition, **IN1 and OUT1 only**.
+- `PIController` (+ `pi_ui.py`, its own small CSS/clientside scope; no schematic). pid0: input in1, p, i (Hz),
+  setpoint, min/max clamp, inputfilter (keys `filt1_hz`..`filt4_hz`, 0 = off) → out1. asg0 → out1: ramp (Ramp on)
+  or DC offset `offset_mv` (Ramp off). OUT1 = offset + PI. p/i/filter snapped to the FPGA values and pushed back.
+- Modes `ramp` (PI off, ival 0), `dc` (offset only), `pi`, `off` (OUT1 = 0 V). Toggles Output / Ramp / PI with
+  interlocks (Ramp on turns PI off and vice versa; nothing but Output works while Output is off). Reset integrator.
+  The gains are written whenever changed; PI on resets ival to 0 and routes pid0 to out1.
+- Start-up: pid0 running in1 → out1 with non-zero p or i → adopted untouched (settings read back). Else ramp.
+  Other modules routed to out1/both are switched off (logged); OUT2 is never touched.
+- Scope: ramp = one period triggered on asg0, (in1, out1), x axis time or OUT1 (`xaxis`); else untriggered
+  `live_ms`. Stats: IN1 mean/rms, OUT1 mean, integrator, warning when ival is within 1 % of a clamp.
+- Run: `python app\pi_app.py --host rp-f0fa92.local` → http://127.0.0.1:8075 (settings `pi_settings.json`).
+- Fake: env `FAKE_PLANT=errin` → `Engine.step_errin` / `traces_errin`: IN1 = dispersive cavity error
+  (`ext_err`, E_PK 0.4 V, slope −140 V/V), pid0 a real P + I with its input filter, OUT1 = asg0 + pid0.
+- Tests: `test/test_pi.py` (28: ramp acquisition shows the resonance, snapping, lock, drift, setpoint, filters,
+  clamps, wrong sign → clamp, interlocks, write log, restart adoption), `serve_pi.py` (port 8076) + `ui_pi.py` (15).
+
+## Fourth app: dual-phase lock-in PI + intensity PI (`app/lockin_pi_app.py`, 2026-11-06)
+User request: IN1/OUT1 = dual-phase lock-in + PI + ramp; intensity servo on OUT2; **raw P and I only, no
+auto-calculation or auto-setting**; optional toggleable filters (off by default). The user wrote "input 1 and output
+2" for the intensity servo; the documented hardware has the AOM pickoff on IN2, so `int_input` defaults to in2 and
+in1 is selectable.
+- `LockinPIController` (+ `lockin_pi_ui.py`, reuses `pi_ui.CSS` and `pi_app` capture/envelope). Modules: iq2 (dither
+  → out1, demodulates in1: X = iq2, Y = iq2_2, LP 1–4 stages, HP, integer gain, phase by hand), pid0 (input iq2 or
+  iq2_2 = `pi_input` X/Y → out1), asg0 (ramp / offset → out1), pid2 (int_input → out2). iq0, iq1, pid1, asg1 off.
+- No phase extraction: the sweep only DISPLAYS the X–Y signal angle (`xy_theta`). R cannot be a PI input (no R
+  signal in the FPGA, and R has no sign).
+- Filters: `filt_on` / `int_filt_on` are bool toggles (switch commands `filt` / `int_filt`), stored in settings; the
+  stage values are written only while the toggle is on (else [0, 0, 0, 0]). Bool keys are not in `KEYS`.
+- Lock modes like pi_app (ramp / dc / pi / off) + Dither toggle. Intensity `int_on` (pid2 → out2, ival 0 at on) or off
+  (OUT2 = 0 V). Start-up: each PI adopted untouched if running with gains, else lock → ramp, intensity → off.
+- Scope per frame: (in1, out1) + (iq2, iq2_2) (triggered on asg0 in ramp) and (int_input, out2) untriggered.
+- Run: `python app\lockin_pi_app.py --host rp-f0fa92.local` → http://127.0.0.1:8085 (`lockin_pi_settings.json`).
+- Fake: with `FAKE_LOCKIN=iq2` and the PZT on out1, pid0 is a full P + I on X or Y (`eng.p_out`); the AOM on OUT2 as before.
+- Tests: `test/test_lockin_pi.py` (29: phase by hand, lock from the ramp data with raw gains, drift, filter
+  toggles, X/Y input, intensity lock + setpoint + filter + input, restart adoption of both, write log),
+  `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (25).
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |

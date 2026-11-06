@@ -23,6 +23,25 @@ OUT2 is no longer a scope monitor. The intensity hardware is described in `docs/
 alignment ramp + dither (Ramp toggle). No feedback on the Red Pitaya. Ramp, Auto phase, pick a peak, "Park at peak",
 close the loop on the servo box. Run: `python app\errsig_app.py --host rp-f0fa92.local`.
 
+### PI servo for an external error signal (`app/pi_app.py`, port 8075)
+IN1 and OUT1 only. IN1 ← your error signal; OUT1 = offset + PI (pid0, raw P and I as you type them, setpoint,
+output clamps) or, with the Ramp toggle, a ramp around the offset for acquiring the error signal (PI off). Optional
+input filter in front of the PI (4 first-order stages, > 0 low-pass, < 0 high-pass), off by default. The scope shows
+IN1 and OUT1 (ramp: vs time or IN1 vs OUT1). Run: `python app\pi_app.py --host rp-f0fa92.local`.
+
+### Dual-phase lock-in PI + intensity PI (`app/lockin_pi_app.py`, port 8085)
+Lock on IN1/OUT1: dual-phase lock-in on `iq2` (X and Y, phase set by hand), raw PI (`pid0`, input X or Y), ramp /
+offset (`asg0`), dither on OUT1. Intensity on OUT2: raw PI (`pid2`, input IN2 by default, IN1 selectable). Each PI
+has raw P, I, setpoint, output clamps and a 4-stage input filter switched by its Filter toggle (off by default).
+Nothing is calculated for you. Run: `python app\lockin_pi_app.py --host rp-f0fa92.local`.
+
+### Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, port 8065)
+Same wiring and workflow, but the demodulation is a dual-quadrature lock-in on `iq2` (the only PyRPL IQ module with
+both quadratures wired out): X = `iq2`, Y = `iq2_2`, shared low-pass (up to 4 stages) and gain. The scope shows X, Y
+and R; θ (the error signal's angle in the X–Y plane) is read from one sweep, and Auto phase rotates it into X in one
+step. In servo mode θ is estimated live from the residual error fluctuations. OUT1 can carry X or Y.
+Run: `python app\errsig2ph_app.py --host rp-f0fa92.local`.
+
 ## Status
 - **v5 — AOM intensity stabilization** (2026-11-02): a second feature on IN2/OUT2 (`pid2` servo, `asg1` Bode test sine).
   Two icons at the top left switch between the *Cavity lock* and *Intensity* views; each icon has a status dot, both
