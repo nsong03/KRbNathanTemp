@@ -144,6 +144,15 @@ async def main():
         check("intensity view: intensity traces fast", f > 8, f"{f:.1f}/s")
         await pg.screenshot(path="lockin_pi2_2_intensity.png", full_page=True)
         await pg.click("#vbtn-cav"); await pg.wait_for_timeout(800)
+        check("PI → OUT2 switch on the lock diagram, off", await pg.locator(pid(type="sw", s="pi_out2")).count() == 1
+              and not await on("pi_out2"))
+        await flip("pi_out2")
+        st = stats()
+        check("PI → OUT2 on: pid0 -> out2, intensity servo off", await on("pi_out2") and st["out"] == "out2"
+              and st["iout"] == "off" and await wait_text("#status", "SERVO OFF"), str(st))
+        await pg.screenshot(path="lockin_pi2_3_pi_out2.png", full_page=True)
+        await flip("pi_out2")
+        check("PI → OUT2 off: pid0 back to out1", stats()["out"] == "out1" and not await on("pi_out2"))
         await flip("ramp")
         check("Ramp switch -> RAMP", await wait_text("#status", "LOCK: RAMP") and stats()["out"] == "off")
         await flip("output")

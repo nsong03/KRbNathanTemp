@@ -186,6 +186,25 @@ check("intensity Filter toggle off", list(r.pid2.inputfilter) == [0] * 4)
 apply(int_input="in1")
 check("intensity input selectable (in1)", r.pid2.input == "in1")
 apply(int_input="in2")
+print("--- PI output to OUT2 (toggle)")
+check("PI → OUT2 off by default", ctl.switches()["pi_out2"] is False and r.pid0.output_direct == "out1")
+sw("pi_out2", True)
+check("PI → OUT2 on: pid0 -> out2, intensity servo switched off, OUT1 keeps offset + dither",
+      r.pid0.output_direct == "out2" and not ctl.int_on and r.pid2.output_direct == "off"
+      and r.asg0.output_direct == "out1" and r.iq2.output_direct == "out1", f"pid0 {r.pid0.output_direct}")
+sw("int_on", True)
+check("intensity servo refused while PI → OUT2", not ctl.int_on and r.pid2.output_direct == "off")
+dl, di = LS.diagram_state(ctl.snapshot(), ctl.switches(), ("probe_a", "probe_b"), ("A", "B"))
+check("diagram: PI → OUT2 switch on, PI wire to OUT2, not into the OUT1 sum", dl["sw"]["pi_out2"]["on"]
+      and dl["wires"]["pid_out2"] and not dl["wires"]["pid_sum"] and "PI" not in dl["boxes"]["out1"][1][0])
+sw("ramp", True)
+check("Ramp on: PI off (output off)", r.pid0.output_direct == "off")
+sw("pi", True)
+check("PI on again with PI → OUT2: straight to out2", r.pid0.output_direct == "out2")
+sw("pi_out2", False)
+check("PI → OUT2 off: pid0 back to out1 (PI state kept)", r.pid0.output_direct == "out1" and ctl.mode == "pi")
+sw("int_on", True)
+check("intensity servo allowed again", ctl.int_on and r.pid2.output_direct == "out2")
 print("--- restart with both servos running")
 stop.set(); th.join(5)
 before = [(m.p, m.i, m.input, m.output_direct, m.setpoint) for m in (r.pid0, r.pid2)] + [r.iq2.phase]
@@ -216,7 +235,8 @@ check("intensity servo off: OUT2 = 0 V", r.pid2.output_direct == "off" and np.al
                                                                                          atol=1e-9))
 dl, di = LS.diagram_state(ctl.snapshot(), ctl.switches(), ("probe_a", "probe_b"), ("A", "B"))
 check("diagram state: every block has readback text, all switches present", set(dl["boxes"]) | set(di["boxes"])
-      == {b["id"] for b in LS.BLOCKS} and set(dl["sw"]) | set(di["sw"]) == {x["id"] for x in LS.SWITCHES})
+      == {b["id"] for b in LS.LOCK2.BLOCKS + LS.INT.BLOCKS}
+      and set(dl["sw"]) | set(di["sw"]) == {x["id"] for x in LS.LOCK2.SWITCHES + LS.INT.SWITCHES})
 ctl.submit("probe", "pid0"); time.sleep(0.5)
 dl, di = LS.diagram_state(ctl.snapshot(), ctl.switches(), ("probe_a", "probe_b"), ("A", "B"))
 check("probe dots show A / B", "A" in dl["probes"].values() or "B" in dl["probes"].values(), str(dl["probes"]))
@@ -224,7 +244,8 @@ stop2.set()
 mine = [w for w in F.WRITES if w[4] == "lockin_pi2_app.py"]
 check("writes only iq2, pid0, pid2, asg0, scope", {w[1] for w in mine} <= {"iq2", "pid0", "pid2", "asg0", "scope"},
       str(sorted({w[1] for w in mine})))
-bad = [w for w in mine if w[2] == "output_direct" and ((w[1] in ("iq2", "pid0", "asg0") and w[3] not in ("out1", "off"))
+bad = [w for w in mine if w[2] == "output_direct" and ((w[1] in ("iq2", "asg0") and w[3] not in ("out1", "off"))
+                                                       or (w[1] == "pid0" and w[3] not in ("out1", "out2", "off"))
                                                        or (w[1] == "pid2" and w[3] not in ("out2", "off")))]
 check("lock modules only on OUT1, pid2 only on OUT2", not bad, str(bad[:3]))
 print(f"\n{len(FAILS)} FAILED: {FAILS}" if FAILS else "\nALL PASS")

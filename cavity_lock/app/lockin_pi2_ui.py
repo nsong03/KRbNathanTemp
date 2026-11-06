@@ -134,7 +134,8 @@ def build_app(ctl, A):
         hdr_id = {"type": "hdr", "b": b["id"]}
         if b["kind"] == "node":
             return html.Div([html.Span(b["label"]), html.Div(id=f"{P}rb-{b['id']}", className="rb")], id=hdr_id,
-                            className="blk node" + (" term" if b["id"] in ("out1", "out2") else ""), style=pos)
+                            className="blk node" + (" term" if b["id"] in ("out1", "out2", "pi_out2_term") else ""),
+                            style=pos)
         kids = [html.Div(b["label"] + "  ⓘ", id=hdr_id, className="hdr", title="click for the description"),
                 html.Div(id=f"{P}rb-{b['id']}", className="rb")]
         knobs = [control(p["key"], SHORT.get(p["key"], "")) for p in b["params"]]
@@ -220,7 +221,7 @@ def build_app(ctl, A):
                 html.Button("Save settings", id="btn-save", className="btn"),
                 html.Button("Load settings", id="btn-load", className="btn"),
             ], className="bar", style={"marginBottom": "4px"}),
-            html.Div([canvas(LS.LOCK, "external (display only)", 76), lock_scope()], id="view-cavity"),
+            html.Div([canvas(LS.LOCK2, "external (display only)", 76), lock_scope()], id="view-cavity"),
             html.Div([canvas(LS.INT, "intensity servo: IN2 (or IN1) → pid2 → OUT2", 250), int_scope()],
                      id="view-intensity", style={"display": "none"}),
             html.Pre(id="log", style={"fontSize": "12px", "height": "22vh", "overflowY": "auto", "whiteSpace": "pre-wrap",
@@ -230,7 +231,7 @@ def build_app(ctl, A):
             dcc.Store(id="synced", data=-1), dcc.Store(id="push-version"), dcc.Store(id="frame"),
             dcc.Store(id="frame-seq", data=-1), dcc.Store(id="iframe"), dcc.Store(id="iframe-seq", data=-1),
             dcc.Store(id="diag"), dcc.Store(id="diag-key", data=""), dcc.Store(id="diag-ack"),
-            dcc.Store(id="geom", data=LS.geometry(LS.LOCK)),
+            dcc.Store(id="geom", data=LS.geometry(LS.LOCK2)),
             dcc.Store(id="idiag"), dcc.Store(id="idiag-key", data=""), dcc.Store(id="idiag-ack"),
             dcc.Store(id="igeom", data=LS.geometry(LS.INT)),
             dcc.Store(id="typed"), dcc.Store(id="ack"), PS.interval(),

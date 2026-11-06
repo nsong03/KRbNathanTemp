@@ -31,7 +31,9 @@ CSS = """
 .pyspin > span:first-child { margin-right: 3px; }
 .pyspin button.pyspin-btn { width: 17px; height: 20px; padding: 0; font-size: 12px; line-height: 18px;
                             cursor: pointer; user-select: none; }
-.pyspin input.pyspin-line { width: 78px; font-family: monospace; font-size: 11px; padding: 1px 2px; }
+.pyspin .dash-input-container { width: 92px !important; min-width: 92px !important; }
+.pyspin input.pyspin-line, .pyspin .pyspin-line input { width: 92px; font-family: monospace; font-size: 11px;
+                                                       padding: 1px 2px; box-sizing: border-box; }
 """
 
 
@@ -166,7 +168,9 @@ def component(key, value, short, label):
                       html.Button("↓", title=f"{label}: click = one register step down, hold = halve every 0.5 s",
                                   **{"data-key": key, "data-dir": "-1"}, **btn),
                       dcc.Input(id=f"s-{key}", type="text", value=fmt(value), debounce=True,
-                                className="pyspin-line"),
+                                className="pyspin-line",
+                                style={"width": "92px", "minWidth": "92px", "fontFamily": "monospace",
+                                       "fontSize": "11px"}),
                       html.Button("↑", title=f"{label}: click = one register step up, hold = double every 0.5 s",
                                   **{"data-key": key, "data-dir": "1"}, **btn)],
                      className="ic pyspin",

@@ -49,7 +49,7 @@ L_BLOCKS = [
          params=[P(k, "pid0.inputfilter") for k in ("filt1_hz", "filt2_hz", "filt3_hz", "filt4_hz")], opts=[],
          note="pid0's input filter: 4 first-order stages, > 0 low-pass corner, < 0 high-pass, 0 = stage off. "
               "Written only while the Filter switch is on (off: all stages 0). The FPGA rounds the corners."),
-    dict(id="pid", label="PI (pid0)", kind="dsp", x=850, y=100, w=240, h=205,
+    dict(id="pid", label="PI (pid0)", kind="dsp", x=850, y=100, w=240, h=220,
          params=[P("pi_input", "pid0.input", widget="radio"), P("p", "pid0.p"), P("i", "pid0.i"),
                  P("setpoint_mv", "pid0.setpoint"), P("clamp_lo_mv", "pid0.min_voltage"),
                  P("clamp_hi_mv", "pid0.max_voltage")], opts=[],
@@ -162,6 +162,18 @@ LOCK = SimpleNamespace(BLOCKS=L_BLOCKS, WIRES=L_WIRES, SWITCHES=L_SWITCHES, PROB
 INT = SimpleNamespace(BLOCKS=I_BLOCKS, WIRES=I_WIRES, SWITCHES=I_SWITCHES, PROBES=I_PROBES, TERMINALS=I_TERMINALS,
                       CANVAS_W=1340, CANVAS_H=260, PREFIX="i-")
 MODELS = (LOCK, INT)
+
+# v2 (lockin_pi2_app) only: the "PI → OUT2" switch (pid0.output_direct out2 instead of out1)
+PI_OUT2_BLOCK = dict(id="pi_out2_term", label="OUT2", kind="node", x=1200, y=242, w=100, h=56, params=[], opts=[],
+                     note="PI → OUT2 on: pid0.output_direct = out2, so OUT2 carries the lock PI (the intensity servo "
+                          "is off then). The ramp / offset and the dither stay on OUT1.")
+PI_OUT2_WIRE = dict(id="pid_out2", kind="drv", pts=[(1090, 268), (1200, 268)])
+PI_OUT2_SWITCH = dict(id="pi_out2", label="PI → OUT2", x=1176, y=268)
+SWITCH_TITLES["pi_out2"] = ("PI → OUT2: the lock PI goes to OUT2 instead of OUT1 (disables the intensity servo); "
+                            "ramp / offset and dither stay on OUT1")
+LOCK2 = SimpleNamespace(BLOCKS=L_BLOCKS + [PI_OUT2_BLOCK], WIRES=L_WIRES + [PI_OUT2_WIRE],
+                        SWITCHES=L_SWITCHES + [PI_OUT2_SWITCH], PROBES=L_PROBES, TERMINALS=L_TERMINALS,
+                        CANVAS_W=1340, CANVAS_H=500, PREFIX="")
 BLOCKS = L_BLOCKS + I_BLOCKS
 SWITCHES = L_SWITCHES + I_SWITCHES
 PROBES = L_PROBES + I_PROBES
@@ -251,24 +263,31 @@ def diagram_state(snap, sw, probe_keys=("sc_ch1", "sc_ch2"), badges=("1", "2")):
                       f"{(a_off-a_amp)*1e3:+.0f}..{(a_off+a_amp)*1e3:+.0f} mV", "")]
     else:
         B["ramp"] = [(f"DC {a_off*1e3:+.2f} mV", "")]
+    out2 = bool(sw.get("pi_out2"))
     parts = [n for n, on in (("ramp" if sw["ramp"] else "offset", hw.get("asg0.output_direct") == "out1"),
-                             ("PI", sw["pi"]), ("dither", sw["dither"])) if on]
+                             ("PI", sw["pi"] and not out2), ("dither", sw["dither"])) if on]
     B["out1"] = [("±1 V DAC" if mode != "off" else "0 V (off)", "" if mode != "off" else "warn"),
                  ("+".join(parts) if parts else "nothing", "dim")]
     xsel = hw.get("pid0.input") != "iq2_2"
     out_on = mode != "off"
     wires = dict(pd_in1=True, drv_cav=True, cav_pd=True, bp_mix=True, bp_mixq=True, mix_lpf=True, mixq_lpf=True,
-                 lpf_amp=True, lpfq_amp=True, amp_f=xsel, ampq_f=not xsel, f_pid=True, pid_sum=sw["pi"],
+                 lpf_amp=True, lpfq_amp=True, amp_f=xsel, ampq_f=not xsel, f_pid=True, pid_sum=sw["pi"] and not out2,
                  nco_phase=True, lo_mix=True, lo_90=True, dith_sum=sw["dither"],
                  ramp_sum=hw.get("asg0.output_direct") == "out1", sum_out=out_on, out1_drv=out_on)
+    lsw = L_SWITCHES + ([PI_OUT2_SWITCH] if "pi_out2" in sw else [])
+    if "pi_out2" in sw:
+        wires["pid_out2"] = sw["pi"] and out2
+        B["pi_out2_term"] = [("lock PI" if sw["pi"] and out2 else "PI → OUT2 on, PI off" if out2 else
+                              "intensity servo (PI → OUT2 off)", "" if out2 else "dim")]
     lock = dict(boxes=B, wires=wires, mode=mode, probes=_probes(LOCK, s, probe_keys, badges),
-                sw={x["id"]: dict(on=bool(sw[x["id"]]), busy=busy, label=x["label"]) for x in L_SWITCHES})
+                sw={x["id"]: dict(on=bool(sw[x["id"]]), busy=busy, label=x["label"]) for x in lsw})
     IB = {"aom": [("← OUT2 · pickoff → IN2", "dim")], "int_in": [(f"pid2.input {hw.get('pid2.input')}", "dim")],
           "int_filter": _filt_lines(hw, "pid2", sw["int_filt"]),
           "int_pid": [(f"setpoint {(hw.get('pid2.setpoint') or 0)*1e3:+.2f} mV · clamp "
                        f"{(hw.get('pid2.min_voltage') or 0)*1e3:+.0f}..{(hw.get('pid2.max_voltage') or 0)*1e3:+.0f} mV",
                        "dim")] + _pid_lines(hw, "pid2", snap.get("int_ival"), sw["int_on"]),
-          "out2": [("PI" if sw["int_on"] else "0 V (servo off)", "" if sw["int_on"] else "dim")]}
+          "out2": [("PI" if sw["int_on"] else "lock PI (PI → OUT2)" if sw.get("pi_out2") else "0 V (servo off)",
+                    "" if sw["int_on"] else "dim")]}
     iw = dict(aom_in=True, in_f=True, if_pid=True, ipid_out2=sw["int_on"], out2_aom=sw["int_on"])
     intensity = dict(boxes=IB, wires=iw, mode=mode, probes=_probes(INT, s, probe_keys, badges),
                      sw={x["id"]: dict(on=bool(sw[x["id"]]), busy=busy, label=x["label"]) for x in I_SWITCHES})

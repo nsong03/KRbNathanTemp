@@ -165,7 +165,21 @@ stays as it is.
   ~33/s. `lockin_pi_schematic.diagram_state(snap, sw, ("probe_a", "probe_b"), ("A", "B"))` for the A / B badges;
   `ownership_problems(keys, scope_keys)`.
 - Same controller rules as v1: raw p / i never rewritten, filters behind switches, adoption at start-up, intensity off.
-- Tests: `test/test_lockin_pi2.py` (40), `serve_lockin_pi2.py` (port 8096) + `ui_lockin_pi2.py` (21).
+- **PI → OUT2 switch (v2 only, 2026-11-06):** setting `pi_out2` (bool, saved; switch command `pi_out2`). On:
+  pid0.output_direct = out2 instead of out1 (when the PI is on; toggling while locked only moves the output, ival kept),
+  the intensity servo is switched off and refused while it is on; ramp / offset and dither stay on OUT1. Start-up
+  adopts a pid0 running on out2 (then pid2 is not adopted). Diagram: `LS.LOCK2` = LOCK + block `pi_out2_term`, wire
+  `pid_out2`, switch `pi_out2`.
+- **P / I boxes = PyRPL's PID widget (both lock-in apps, 2026-11-06, user: "exactly like the PI module in the pyrpl
+  ... I just want you to implement the pyrpl modules in a good interface. please stop changing things around"):**
+  `pyrpl_spinbox.py` copies widgets/spinbox.py NumberSpinBox with set_log_increment (pid_widget.py): ↓ [%.4e] ↑, click /
+  Up-Down key = one register step (p 2^-12, i 1/(2^32·2π·8 ns) = 0.004632), stop at 0 when crossing zero, held > 0.1 s
+  → ×2 per 0.5 s (halflife; Page Up/Down change it), 20 ms refresh, full precision cached (text shows %.4e), saturated
+  to ±2048 / ±38.9 kHz. Browser → Store("pyspin") every 50 ms → controller `spin` command (s[key] = value, write the
+  PI; no version bump, no log). Typed text + Enter goes through the normal apply; `PS.parse` keeps the full value
+  when the text still reads as the present value.
+- Tests: `test/test_lockin_pi2.py` (48, incl. PI → OUT2), `serve_lockin_pi2.py` (port 8096) + `ui_lockin_pi2.py`
+  (34, incl. the P / I arrows: one step, hold ×2 per 0.5 s, zero crossing, keys, large-I single step; PI → OUT2).
 
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |

@@ -57,6 +57,7 @@ FIELDS = [   # key, label, default, group, kind, options
     ("clamp_lo_mv", "Output min [mV]", -1000.0, "Lock PI", "num", {"min": -1000, "max": 1000}),
     ("clamp_hi_mv", "Output max [mV]", 1000.0, "Lock PI", "num", {"min": -1000, "max": 1000}),
     ("filt_on", "Filter on", False, "Lock PI", "bool", {}),
+    ("pi_out2", "PI output to OUT2 (instead of OUT1; disables the intensity servo)", False, "Lock PI", "bool", {}),
     ("filt1_hz", "Filter stage 1 [Hz]", 0.0, "Lock filter", "num", {}),
     ("filt2_hz", "Filter stage 2 [Hz]", 0.0, "Lock filter", "num", {}),
     ("filt3_hz", "Filter stage 3 [Hz]", 0.0, "Lock filter", "num", {}),
@@ -160,11 +161,12 @@ class LockinPIController:
         self.log("connected: lock IN1 -> iq2 (X, Y) -> pid0 -> OUT1 (+ asg0 offset/ramp, iq2 dither); "
                  "intensity pid2 -> OUT2")
         p0, p2 = self.r.pid0, self.r.pid2
-        if p0.input in ("iq2", "iq2_2") and p0.output_direct == "out1" and (p0.p != 0 or p0.i != 0):
+        if p0.input in ("iq2", "iq2_2") and p0.output_direct in ("out1", "out2") and (p0.p != 0 or p0.i != 0):
             self._adopt_lock()
         else:
+            self.s["pi_out2"] = bool(self.s.get("pi_out2"))
             self._start_ramp()
-        if p2.output_direct == "out2" and (p2.p != 0 or p2.i != 0):
+        if p2.output_direct == "out2" and (p2.p != 0 or p2.i != 0) and not self.s["pi_out2"]:
             self._adopt_int()
         else:
             p2.output_direct = "off"
@@ -191,7 +193,10 @@ class LockinPIController:
     def switches(self):
         return dict(output=self.mode != "off", ramp=self.mode == "ramp", pi=self.mode == "pi",
                     dither=self.dither_on, filt=bool(self.s["filt_on"]), int_on=self.int_on,
-                    int_filt=bool(self.s["int_filt_on"]))
+                    int_filt=bool(self.s["int_filt_on"]), pi_out2=bool(self.s["pi_out2"]))
+
+    def _pi_out(self):
+        return "out2" if self.s["pi_out2"] else "out1"
 
     def _readback(self):
         r, hw = self.r, {}
@@ -302,9 +307,14 @@ class LockinPIController:
         self._write_dither()
         self._write_pid()
         p0.ival = 0
-        p0.output_direct = "out1"
-        self.log(f"LOCK PI ON: OUT1 = {s['offset_mv']:+.1f} mV + PI({s['pi_input']} - {s['setpoint_mv']:+.1f} mV) "
-                 f"+ dither; p = {s['p']:g}, i = {s['i']:g}, filter {'on' if s['filt_on'] else 'off'}")
+        p0.output_direct = self._pi_out()
+        if s["pi_out2"]:
+            self.log(f"LOCK PI ON: OUT2 = PI({s['pi_input']} - {s['setpoint_mv']:+.1f} mV); OUT1 = "
+                     f"{s['offset_mv']:+.1f} mV + dither; p = {s['p']:g}, i = {s['i']:g}, filter "
+                     f"{'on' if s['filt_on'] else 'off'}")
+        else:
+            self.log(f"LOCK PI ON: OUT1 = {s['offset_mv']:+.1f} mV + PI({s['pi_input']} - {s['setpoint_mv']:+.1f} mV) "
+                     f"+ dither; p = {s['p']:g}, i = {s['i']:g}, filter {'on' if s['filt_on'] else 'off'}")
         if s["p"] == 0 and s["i"] == 0:
             self.log("  note: p = i = 0, the PI outputs 0")
 
@@ -323,10 +333,11 @@ class LockinPIController:
         if bw:
             s.update(lpf_hz=round(bw[0], 3), lpf_order=len(bw))
         self.dither_on = iq.output_direct == "out1"
+        s["pi_out2"] = p0.output_direct == "out2"
         s["offset_mv"] = float(a.offset) * 1e3 if (a.output_direct == "out1" and a.amplitude == 0) else 0.0
         self.mode = "pi"
         self.version += 1
-        self.log(f"pid0 was locking ({s['pi_input']} -> OUT1, p = {s['p']:g}, i = {s['i']:g}): adopted untouched")
+        self.log(f"pid0 was locking ({s['pi_input']} -> {p0.output_direct.upper()}, p = {s['p']:g}, i = {s['i']:g}): adopted untouched")
 
     def _adopt_int(self):
         p2, s = self.r.pid2, self.s
@@ -581,7 +592,22 @@ class LockinPIController:
             self.version += 1
             self.log(f"intensity PI filter {'ON: ' + str([s[k] for k in IFILT]) if on else 'off'}")
         elif name == "int_on":
+            if on and s["pi_out2"]:
+                self.log("intensity servo: OUT2 carries the lock PI (PI → OUT2 is on); switch that off first")
+                return
             self._int_switch(on)
+        elif name == "pi_out2":
+            if on == bool(s["pi_out2"]):
+                return
+            if on and self.int_on:
+                self._int_switch(False)
+                self.log("intensity servo switched off: OUT2 now carries the lock PI")
+            s["pi_out2"] = on
+            self.version += 1
+            if self.mode == "pi":
+                self.r.pid0.output_direct = self._pi_out()       # same PI state, only the output moves
+            self.log(f"lock PI output -> {'OUT2' if on else 'OUT1'}"
+                     + ("" if self.mode == "pi" else " (applies when the PI is on)"))
         elif name == "output":
             if on and self.mode == "off":
                 self._start_dc()
