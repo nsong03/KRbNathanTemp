@@ -37,6 +37,11 @@ Lock and Intensity views (schematics with switches, like the cavity app); P and 
 typed (never rewritten); one scope panel with every setting visible (channels, timebase, trigger, level,
 hysteresis, delay, averaging, rolling mode, ranges, XY, R); one capture per frame. Nothing is calculated for you. Run: `python app\lockin_pi_app.py --host rp-f0fa92.local`.
 
+### v2 of it (`app/lockin_pi2_app.py`, port 8095)
+Same lock and intensity servo and views, with the automatic scope: IN1, X/Y/R and OUT1, triggered on the ramp and
+showing 2 ramp periods while ramping (live otherwise), probes A/B, and the intensity scope in its view. Only the
+visible view's scope is captured every frame. Run: `python app\lockin_pi2_app.py --host rp-f0fa92.local`.
+
 ### Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, port 8065)
 Same wiring and workflow, but the demodulation is a dual-quadrature lock-in on `iq2` (the only PyRPL IQ module with
 both quadratures wired out): X = `iq2`, Y = `iq2_2`, shared low-pass (up to 4 stages) and gain. The scope shows X, Y

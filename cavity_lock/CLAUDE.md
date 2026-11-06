@@ -149,6 +149,24 @@ in1 is selectable.
   intensity, restart adoption, write log), `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (29: views/dots,
   every parameter and scope setting visible, scope dropdowns, ranges, XY, R, rolling, waiting, RUN/STOP, probes).
 
+## Fourth app, v2: `app/lockin_pi2_app.py` (2026-11-06)
+User: "make a v2 of this app with the scope settings set back to what they were before, it's actually a bit
+convenient. keep it to two periods on the display." v1 (`lockin_pi_app.py`, the user-configured 2-channel scope)
+stays as it is.
+- Files: `lockin_pi2_app.py` (from lockin_pi_app at commit 7763884: automatic captures (in1, out1) + (iq2, iq2_2),
+  triggered on asg0 while ramping with `ramp_periods` (default **2**), live `live_ms` otherwise; intensity
+  (int_input, out2) `int_live_ms`; probes A / B with `probe_every`; xaxis time / OUT1) + `lockin_pi2_ui.py` (v1's
+  layout: view icons, both schematics from `lockin_pi_schematic.py`, every parameter inline; the scope settings in
+  visible bars under each view, no popover; ROWS_JS row scope). Settings `lockin_pi2_settings.json`, port 8095,
+  PyRPL config `lockin_pi2_app`.
+- View scheduling like the cavity app: `ctl.view` (set by the UI tick) → only the visible view's captures every frame,
+  the hidden one once per second (`_lock_tick` / `_int_tick`, `seq` / `iseq`). Rate on the fake: lock 3.0 traces/s
+  while ramping (2 periods at 20 Hz: two triggered 134 ms captures, each waiting for the next ramp start), intensity
+  ~33/s. `lockin_pi_schematic.diagram_state(snap, sw, ("probe_a", "probe_b"), ("A", "B"))` for the A / B badges;
+  `ownership_problems(keys, scope_keys)`.
+- Same controller rules as v1: raw p / i never rewritten, filters behind switches, adoption at start-up, intensity off.
+- Tests: `test/test_lockin_pi2.py` (40), `serve_lockin_pi2.py` (port 8096) + `ui_lockin_pi2.py` (21).
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |
