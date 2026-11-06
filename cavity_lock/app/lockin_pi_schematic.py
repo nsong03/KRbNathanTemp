@@ -178,12 +178,12 @@ def geometry(M):
                 wires=[dict(id=w["id"], kind=w["kind"], pts=w["pts"]) for w in M.WIRES])
 
 
-def ownership_problems(keys):
+def ownership_problems(keys, scope_keys=None):
     seen = {}
     for b in BLOCKS:
         for k in [p["key"] for p in b["params"]]:
             seen.setdefault(k, []).append(b["id"])
-    for k in SCOPE_KEYS:
+    for k in (SCOPE_KEYS if scope_keys is None else scope_keys):
         seen.setdefault(k, []).append("scope")
     out = [f"{k}: no home" for k in keys if k not in seen]
     out += [f"{k}: in {v}" for k, v in seen.items() if len(v) > 1]
@@ -215,14 +215,15 @@ def _pid_lines(hw, m, ival, routed):
     return lines
 
 
-def _probes(M, s):
-    c1, c2 = s.get("sc_ch1"), s.get("sc_ch2")
-    return {q["id"]: ("1" if q["signal"] and q["signal"] == c1 else "2" if q["signal"] and q["signal"] == c2
-                      else "") for q in M.PROBES}
+def _probes(M, s, keys=("sc_ch1", "sc_ch2"), badges=("1", "2")):
+    c1, c2 = s.get(keys[0]), s.get(keys[1])
+    return {q["id"]: (badges[0] if q["signal"] and q["signal"] == c1 else badges[1] if q["signal"] and
+                      q["signal"] == c2 else "") for q in M.PROBES}
 
 
-def diagram_state(snap, sw):
-    """(lock view state, intensity view state) for DIAG_JS."""
+def diagram_state(snap, sw, probe_keys=("sc_ch1", "sc_ch2"), badges=("1", "2")):
+    """(lock view state, intensity view state) for DIAG_JS. probe_keys / badges: which settings the probe dots show
+    (v1: scope CH1 / CH2 -> "1" / "2"; v2: probes A / B -> "A" / "B")."""
     s, hw, mode = snap["settings"], snap["hw"], snap["mode"]
     busy = mode == "connecting"
     B = {"photodiode": [], "cavity": [], "driver": [("← OUT1", "dim")], "mixer": [], "mixerq": [], "sum": []}
@@ -260,7 +261,7 @@ def diagram_state(snap, sw):
                  lpf_amp=True, lpfq_amp=True, amp_f=xsel, ampq_f=not xsel, f_pid=True, pid_sum=sw["pi"],
                  nco_phase=True, lo_mix=True, lo_90=True, dith_sum=sw["dither"],
                  ramp_sum=hw.get("asg0.output_direct") == "out1", sum_out=out_on, out1_drv=out_on)
-    lock = dict(boxes=B, wires=wires, mode=mode, probes=_probes(LOCK, s),
+    lock = dict(boxes=B, wires=wires, mode=mode, probes=_probes(LOCK, s, probe_keys, badges),
                 sw={x["id"]: dict(on=bool(sw[x["id"]]), busy=busy, label=x["label"]) for x in L_SWITCHES})
     IB = {"aom": [("← OUT2 · pickoff → IN2", "dim")], "int_in": [(f"pid2.input {hw.get('pid2.input')}", "dim")],
           "int_filter": _filt_lines(hw, "pid2", sw["int_filt"]),
@@ -269,6 +270,6 @@ def diagram_state(snap, sw):
                        "dim")] + _pid_lines(hw, "pid2", snap.get("int_ival"), sw["int_on"]),
           "out2": [("PI" if sw["int_on"] else "0 V (servo off)", "" if sw["int_on"] else "dim")]}
     iw = dict(aom_in=True, in_f=True, if_pid=True, ipid_out2=sw["int_on"], out2_aom=sw["int_on"])
-    intensity = dict(boxes=IB, wires=iw, mode=mode, probes=_probes(INT, s),
+    intensity = dict(boxes=IB, wires=iw, mode=mode, probes=_probes(INT, s, probe_keys, badges),
                      sw={x["id"]: dict(on=bool(sw[x["id"]]), busy=busy, label=x["label"]) for x in I_SWITCHES})
     return lock, intensity
