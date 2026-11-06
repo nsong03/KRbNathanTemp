@@ -23,6 +23,12 @@ OUT2 is no longer a scope monitor. The intensity hardware is described in `docs/
 alignment ramp + dither (Ramp toggle). No feedback on the Red Pitaya. Ramp, Auto phase, pick a peak, "Park at peak",
 close the loop on the servo box. Run: `python app\errsig_app.py --host rp-f0fa92.local`.
 
+### PI servo for an external error signal (`app/pi_app.py`, port 8075)
+IN1 and OUT1 only. IN1 ← your error signal; OUT1 = offset + PI (pid0, raw P and I as you type them, setpoint,
+output clamps) or, with the Ramp toggle, a ramp around the offset for acquiring the error signal (PI off). Optional
+input filter in front of the PI (4 first-order stages, > 0 low-pass, < 0 high-pass), off by default. The scope shows
+IN1 and OUT1 (ramp: vs time or IN1 vs OUT1). Run: `python app\pi_app.py --host rp-f0fa92.local`.
+
 ### Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, port 8065)
 Same wiring and workflow, but the demodulation is a dual-quadrature lock-in on `iq2` (the only PyRPL IQ module with
 both quadratures wired out): X = `iq2`, Y = `iq2_2`, shared low-pass (up to 4 stages) and gain. The scope shows X, Y

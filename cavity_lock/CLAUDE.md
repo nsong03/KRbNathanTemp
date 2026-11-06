@@ -81,6 +81,25 @@ A copy of the errsig app (files `errsig2ph_app.py` / `errsig2ph_schematic.py` / 
   with a negative slope, 4 filter stages, X/Y output source, the errsig checks), `serve_errsig2ph.py` (port 8066) +
   `ui_errsig2ph.py` (23 checks). Screenshots `docs/screenshots/errsig2ph_*.png`.
 
+## Third app: plain PI servo (`app/pi_app.py`, 2026-11-06)
+User request: accept an error signal, output the correction through a PI, **nothing fancy**: raw P and I set by hand,
+filters optional and off by default, a ramp toggle for acquisition, **IN1 and OUT1 only**.
+- `PIController` (+ `pi_ui.py`, its own small CSS/clientside scope; no schematic). pid0: input in1, p, i (Hz),
+  setpoint, min/max clamp, inputfilter (keys `filt1_hz`..`filt4_hz`, 0 = off) → out1. asg0 → out1: ramp (Ramp on)
+  or DC offset `offset_mv` (Ramp off). OUT1 = offset + PI. p/i/filter snapped to the FPGA values and pushed back.
+- Modes `ramp` (PI off, ival 0), `dc` (offset only), `pi`, `off` (OUT1 = 0 V). Toggles Output / Ramp / PI with
+  interlocks (Ramp on turns PI off and vice versa; nothing but Output works while Output is off). Reset integrator.
+  The gains are written whenever changed; PI on resets ival to 0 and routes pid0 to out1.
+- Start-up: pid0 running in1 → out1 with non-zero p or i → adopted untouched (settings read back). Else ramp.
+  Other modules routed to out1/both are switched off (logged); OUT2 is never touched.
+- Scope: ramp = one period triggered on asg0, (in1, out1), x axis time or OUT1 (`xaxis`); else untriggered
+  `live_ms`. Stats: IN1 mean/rms, OUT1 mean, integrator, warning when ival is within 1 % of a clamp.
+- Run: `python app\pi_app.py --host rp-f0fa92.local` → http://127.0.0.1:8075 (settings `pi_settings.json`).
+- Fake: env `FAKE_PLANT=errin` → `Engine.step_errin` / `traces_errin`: IN1 = dispersive cavity error
+  (`ext_err`, E_PK 0.4 V, slope −140 V/V), pid0 a real P + I with its input filter, OUT1 = asg0 + pid0.
+- Tests: `test/test_pi.py` (28: ramp acquisition shows the resonance, snapping, lock, drift, setpoint, filters,
+  clamps, wrong sign → clamp, interlocks, write log, restart adoption), `serve_pi.py` (port 8076) + `ui_pi.py` (15).
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |

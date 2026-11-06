@@ -17,6 +17,7 @@ MODES = [(0.0, 1.0), (0.120, 0.30), (-0.085, 0.12)]
 V_PK = 0.8                         # photodiode volts on the TEM00 peak
 PZT_LAG_DEG = 35.0
 DEMOD_SCALE = 0.5
+E_PK = 0.4                         # pi_app plant: external error signal amplitude [V] (slope -140 V/V at resonance)
 NOISE_PD, NOISE_ERR = 0.002, 0.0005
 DT = float(os.environ.get("FAKE_DT", "0.0005"))
 DITHER_SCALE = 1.04
@@ -351,6 +352,10 @@ class Engine:
         # Y = 'iq2_2' = A sin(phase - lag) (same low-pass and gain)
         self.li_name = os.environ.get("FAKE_LOCKIN", "iq0")
         self.filt_y = np.zeros(4)
+        # pi_app (FAKE_PLANT=errin): IN1 is an external error signal of the cavity, e(v) dispersive with slope
+        # -2 E_PK / (KAPPA/2) at resonance; pid0 (input in1) is a full PI with its input filter; OUT1 = asg0 + pid0
+        self.plant = os.environ.get("FAKE_PLANT", "cavity")
+        self.pid_out, self.ifilt = 0.0, np.zeros(4)
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
@@ -398,8 +403,40 @@ class Engine:
                 time.sleep(0)
             time.sleep(0.002)
 
+    def ext_err(self, v):
+        """pi_app plant: the external error signal on IN1 for an OUT1 drive v (dispersive, 3 modes)."""
+        tot = 0
+        for off, h in MODES:
+            x = 2 * (np.atleast_1d(v) - (self.vc + off)) / KAPPA
+            tot = tot - h * x / (1 + x ** 2)
+        return E_PK * tot
+
+    def step_errin(self, t):
+        p0 = self.rp.pid0
+        v = float(self.rp.asg0.value(t, "out1")) + self.pid_out
+        e = float(self.ext_err(v)[0]) + NOISE_ERR * self.rng.standard_normal()
+        y = e
+        for k, b in enumerate(p0.inputfilter):              # PyRPL: > 0 low-pass, < 0 high-pass, 0 off
+            if not b:
+                continue
+            a = 1 - math.exp(-2 * math.pi * abs(b) * DT)
+            self.ifilt[k] += a * (y - self.ifilt[k])
+            y = self.ifilt[k] if b > 0 else y - self.ifilt[k]
+        if p0.input == "in1" and p0.output_direct in ("out1", "both"):
+            ev = y - p0.setpoint
+            p0.ival = float(np.clip(p0.ival + 2 * math.pi * p0.i * ev * DT, p0.min_voltage, p0.max_voltage))
+            self.pid_out = float(np.clip(p0.p * ev + p0.ival, p0.min_voltage, p0.max_voltage))
+        else:
+            self.pid_out = 0.0
+        self.hist.append((t, v, e, y, self.pid_out, 0.0, 0.0, 0.0))
+        if len(self.hist) > 40000:
+            del self.hist[:20000]
+
     def step(self, t):
         self.vc += 0.0002 * DT + 0.0002 * math.sqrt(DT) * self.rng.standard_normal()
+        if self.plant == "errin":
+            self.step_errin(t)
+            return
         p0 = self.rp.pid0
         self._n += 1
         if self._n % 4 == 0:
@@ -471,6 +508,8 @@ class Engine:
         Intensity signals (in2, pid2, out2, asg1) come from the AOM model for the same window."""
         n = 2 ** 14
         trel = np.arange(n) * duration / n
+        if self.plant == "errin":
+            return self.traces_errin(names, duration, trigger, t_start, n, trel)
         li = self.li_name
         cav_names = {"in1", li, li + "_2", "asg0", "pid0", "out1", "iq1", "pid1"}
         with self.lock:
@@ -543,6 +582,34 @@ class Engine:
             else:
                 sig.update(self.aom.synth(t0, trel))
         return [sig.get(nm, np.zeros(n)) for nm in names], ready_at
+
+
+def _traces_errin(self, names, duration, trigger, t_start, n, trel):
+    """pi_app plant: in1 = external error, out1 = asg0 + pid0, pid0, asg0."""
+    with self.lock:
+        asg, now = self.rp.asg0, time.time()
+        sig = {}
+        if trigger == "asg0" and asg.output_direct != "off":
+            per = 1 / asg.frequency
+            t0 = asg.t0 + math.ceil((now - asg.t0) / per) * per
+            ts = t0 + trel
+            v = asg.value(ts, "out1") + self.pid_out
+            sig.update({"in1": self.ext_err(v) + NOISE_ERR * self.rng.standard_normal(n), "out1": v,
+                        "asg0": asg.raw(ts), "pid0": np.full(n, self.pid_out)})
+            ready_at = t0 + duration
+        else:
+            h = np.array(self.hist[-int((self.t - (t_start or self.t) + duration) / DT) - 4:])
+            tt = h[:, 0]
+            t_end = min(tt[-1], (t_start or tt[-1] - duration) + duration)
+            ts = np.linspace(t_end - duration, t_end, n)
+            sig.update({"in1": np.interp(ts, tt, h[:, 2]) + NOISE_ERR * self.rng.standard_normal(n),
+                        "out1": np.interp(ts, tt, h[:, 1]), "pid0": np.interp(ts, tt, h[:, 4]),
+                        "asg0": asg.raw_rel(t_end - duration, trel)})
+            ready_at = now + duration
+    return [sig.get(nm, np.zeros(n)) for nm in names], ready_at
+
+
+Engine.traces_errin = _traces_errin
 
 
 class Scope:
