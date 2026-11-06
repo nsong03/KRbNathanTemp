@@ -7,7 +7,8 @@ LOCK (IN1 -> OUT1)
   iq2  =  dual-phase lock-in: dither (NCO, to OUT1) and demodulation of IN1 into X ('iq2') and Y ('iq2_2'),
           one high-pass, one low-pass (1-4 stages) and one integer gain for both. The phase is set by hand.
   pid0 =  PI on X or Y (your choice):  e = (X or Y, optionally filtered) - setpoint,
-          out = p * e + ival,  d(ival)/dt = 2 pi i e  (i in Hz), clamped. Raw p and i only: nothing is derived.
+          out = p * e + ival, clamped. p and i are PyRPL's own pid.p / pid.i, passed through unchanged (nothing is
+          derived or converted; the FPGA rounds them to its register steps, shown in the readback only).
   asg0 =  OUT1 offset under the PI, or (Ramp toggle) a ramp around the offset for acquiring the signals, PI off.
   OUT1 =  offset (or ramp) + PI + dither
 INTENSITY (-> OUT2)
@@ -15,8 +16,10 @@ INTENSITY (-> OUT2)
           Servo off: pid2 output off, OUT2 = 0 V. It starts off unless it is already running (then it is adopted).
 
 The filters in front of each PI (4 first-order stages: > 0 low-pass, < 0 high-pass, 0 off) are switched on and off
-with their Filter toggles; they are off by default. The FPGA rounds p, i and the filter corners: the boxes show the
-values it really uses.
+with their Filter toggles; they are off by default. Typed values are never rewritten: what the FPGA really uses
+(rounded p, i, filter corners) is shown in the diagram's readback text.
+Ramp mode shows 4 ramp periods per trace (triggered on the ramp), so hysteresis between successive up/down sweeps is
+visible instead of making the trigger jump between them.
 
 Run (close the other apps first: one owner per Red Pitaya)
   pip install "dash>=2.9" scipy
@@ -53,8 +56,8 @@ FIELDS = [   # key, label, default, group, kind, options
     ("lia_gain", "Gain (integer)", 1, "Lock-in", "num", {"min": 1}),
     # lock PI (pid0)
     ("pi_input", "PI input", "X", "Lock PI", "select", {"options": ["X", "Y"]}),
-    ("p", "P (raw)", 0.0, "Lock PI", "num", {}),
-    ("i_hz", "I (raw) [Hz]", 0.0, "Lock PI", "num", {}),
+    ("p", "P (PyRPL pid.p)", 0.0, "Lock PI", "num", {}),
+    ("i", "I (PyRPL pid.i)", 0.0, "Lock PI", "num", {}),
     ("setpoint_mv", "Setpoint [mV]", 0.0, "Lock PI", "num", {}),
     ("clamp_lo_mv", "Output min [mV]", -1000.0, "Lock PI", "num", {"min": -1000, "max": 1000}),
     ("clamp_hi_mv", "Output max [mV]", 1000.0, "Lock PI", "num", {"min": -1000, "max": 1000}),
@@ -70,8 +73,8 @@ FIELDS = [   # key, label, default, group, kind, options
     ("ramp_shape", "Ramp shape", "triangle", "Ramp", "select", {"options": ["triangle", "sawtooth"]}),
     # intensity PI (pid2)
     ("int_input", "Input", "in2", "Intensity PI", "select", {"options": ["in2", "in1"]}),
-    ("int_p", "P (raw)", 0.0, "Intensity PI", "num", {}),
-    ("int_i_hz", "I (raw) [Hz]", 0.0, "Intensity PI", "num", {}),
+    ("int_p", "P (PyRPL pid.p)", 0.0, "Intensity PI", "num", {}),
+    ("int_i", "I (PyRPL pid.i)", 0.0, "Intensity PI", "num", {}),
     ("int_setpoint_mv", "Setpoint [mV]", 0.0, "Intensity PI", "num", {}),
     ("int_clamp_lo_mv", "Output min [mV]", -1000.0, "Intensity PI", "num", {"min": -1000, "max": 1000}),
     ("int_clamp_hi_mv", "Output max [mV]", 1000.0, "Intensity PI", "num", {"min": -1000, "max": 1000}),
@@ -84,16 +87,29 @@ FIELDS = [   # key, label, default, group, kind, options
     ("live_ms", "Lock live trace [ms]", 20.0, "Scope", "num", {"min": 0.1}),
     ("int_live_ms", "Intensity live trace [ms]", 5.0, "Scope", "num", {"min": 0.01}),
     ("xaxis", "Ramp plot x axis", "time", "Scope", "select", {"options": ["time", "OUT1"]}),
+    ("ramp_periods", "Ramp periods per trace", 4, "Scope", "num", {"min": 1, "max": 16}),
     ("ui_hz", "Browser refresh [Hz]", 10.0, "Scope", "num", {"min": 1, "max": 30}),
+    ("probe_every", "Probe capture every N frames", 3, "Scope", "num", {"min": 1, "max": 100}),
+    ("probe_a", "Probe A", "off", "Scope", "select", {"options": ["in1", "iq2", "iq2_2", "pid0", "asg0", "out1",
+                                                                  "in2", "pid2", "out2", "off"]}),
+    ("probe_b", "Probe B", "off", "Scope", "select", {"options": ["in1", "iq2", "iq2_2", "pid0", "asg0", "out1",
+                                                                  "in2", "pid2", "out2", "off"]}),
 ]
+LEGACY = {"i_hz": "i", "int_i_hz": "int_i"}            # keys of the first version's settings files
+
+
+def load_settings(d):
+    """Settings from a file dict: legacy keys renamed (values unchanged), unknown keys ignored."""
+    d = {LEGACY.get(k, k): v for k, v in d.items()}
+    return {k: v for k, v in d.items() if k in DEFAULTS}
 KEYS = [f[0] for f in FIELDS if f[4] != "bool"]          # the bool keys are toggles (switch commands)
 DEFAULTS = {f[0]: f[2] for f in FIELDS}
 FILT = ["filt1_hz", "filt2_hz", "filt3_hz", "filt4_hz"]
 IFILT = ["int_" + k for k in FILT]
 LOCKIN_KEYS = {"dither_hz", "dither_mvpp", "phase_deg", "lpf_hz", "lpf_order", "ac_hz", "lia_gain"}
-PID_KEYS = {"pi_input", "p", "i_hz", "setpoint_mv", "clamp_lo_mv", "clamp_hi_mv"} | set(FILT)
+PID_KEYS = {"pi_input", "p", "i", "setpoint_mv", "clamp_lo_mv", "clamp_hi_mv"} | set(FILT)
 RAMP_KEYS = {"offset_mv", "ramp_hz", "ramp_mvpp", "ramp_shape"}
-INT_KEYS = {"int_input", "int_p", "int_i_hz", "int_setpoint_mv", "int_clamp_lo_mv", "int_clamp_hi_mv"} | set(IFILT)
+INT_KEYS = {"int_input", "int_p", "int_i", "int_setpoint_mv", "int_clamp_lo_mv", "int_clamp_hi_mv"} | set(IFILT)
 QUAD = {"X": "iq2", "Y": "iq2_2"}
 
 
@@ -121,6 +137,10 @@ class LockinPIController:
         self.fps = 0.0
         self._t_last = None
         self._scope_cfg = {}
+        self.probe = None
+        self._probe_last = "b"
+        self._frames = 0
+        self._long_msg = None
         self.log(f"connecting to {host} ...")
         from pyrpl import Pyrpl
         self.p = Pyrpl(config=config, hostname=host, gui=False)
@@ -168,7 +188,7 @@ class LockinPIController:
             return dict(mode=self.mode, trace=self.trace, itrace=self.itrace, logs=list(self.logs),
                         settings=dict(self.s), version=self.version, seq=self.seq, hw=dict(self.hw), ival=self.ival,
                         int_ival=self.int_ival, fps=self.fps, int_on=self.int_on, dither_on=self.dither_on,
-                        theta=self.theta)
+                        theta=self.theta, probe=self.probe)
 
     def switches(self):
         return dict(output=self.mode != "off", ramp=self.mode == "ramp", pi=self.mode == "pi",
@@ -195,12 +215,6 @@ class LockinPIController:
         with self._lock:
             self.hw = hw
 
-    def _snapped(self, new):
-        if new:
-            self.log("hardware values: " + ", ".join(f"{k} {self.s[k]:g} -> {v:g}" for k, v in new.items()))
-            self.s.update(new)
-            self.version += 1
-
     # ---- writers ----
     def _write_lockin(self):
         s, iq = self.s, self.r.iq2
@@ -214,15 +228,6 @@ class LockinPIController:
         iq.acbandwidth = s["ac_hz"]
         iq.quadrature_factor = s["lia_gain"]
         self._write_dither()
-        new = {}
-        bw = [float(b) for b in np.atleast_1d(iq.bandwidth) if b > 0]
-        if bw and abs(bw[0] - s["lpf_hz"]) > 1e-6 * s["lpf_hz"]:
-            new["lpf_hz"] = round(bw[0], 3)
-        if abs(float(iq.acbandwidth) - s["ac_hz"]) > 1e-6 * max(s["ac_hz"], 1):
-            new["ac_hz"] = round(float(iq.acbandwidth), 3)
-        if abs(float(iq.quadrature_factor) - s["lia_gain"]) > 1e-9:
-            new["lia_gain"] = int(round(float(iq.quadrature_factor)))
-        self._snapped(new)
 
     def _write_dither(self):
         self.r.iq2.output_direct = "out1" if (self.dither_on and self.mode != "off" and self.s["dither_mvpp"] > 0) \
@@ -237,26 +242,15 @@ class LockinPIController:
         p.min_voltage, p.max_voltage = max(lo, -LIM), min(hi, LIM)
         p.setpoint = s[ksp] * 1e-3
         p.inputfilter = [s[k] for k in kf] if s[kon] else [0, 0, 0, 0]
-        p.p = s[kp]
+        p.p = s[kp]                       # PyRPL's own units, unchanged; the readback shows the FPGA's rounding
         p.i = s[ki]
-        new = {}
-        if abs(float(p.p) - s[kp]) > 1e-12:
-            new[kp] = float(p.p)
-        if abs(float(p.i) - s[ki]) > 1e-9:
-            new[ki] = float(p.i)
-        if s[kon]:
-            hwf = [float(x) for x in p.inputfilter] + [0.0] * 4
-            for k, v in zip(kf, hwf):
-                if abs(v - s[k]) > 1e-6 * max(abs(s[k]), 1.0):
-                    new[k] = round(v, 3)
-        self._snapped(new)
 
     def _write_pid(self):
-        self._write_pi(self.r.pid0, ("p", "i_hz", "setpoint_mv", "clamp_lo_mv", "clamp_hi_mv", "filt_on", FILT),
+        self._write_pi(self.r.pid0, ("p", "i", "setpoint_mv", "clamp_lo_mv", "clamp_hi_mv", "filt_on", FILT),
                        QUAD[self.s["pi_input"]])
 
     def _write_int(self):
-        self._write_pi(self.r.pid2, ("int_p", "int_i_hz", "int_setpoint_mv", "int_clamp_lo_mv", "int_clamp_hi_mv",
+        self._write_pi(self.r.pid2, ("int_p", "int_i", "int_setpoint_mv", "int_clamp_lo_mv", "int_clamp_hi_mv",
                                      "int_filt_on", IFILT), self.s["int_input"])
 
     def _ramp_limits(self):
@@ -312,13 +306,13 @@ class LockinPIController:
         p0.ival = 0
         p0.output_direct = "out1"
         self.log(f"LOCK PI ON: OUT1 = {s['offset_mv']:+.1f} mV + PI({s['pi_input']} - {s['setpoint_mv']:+.1f} mV) "
-                 f"+ dither; p = {s['p']:g}, i = {s['i_hz']:g} Hz, filter {'on' if s['filt_on'] else 'off'}")
-        if s["p"] == 0 and s["i_hz"] == 0:
+                 f"+ dither; p = {s['p']:g}, i = {s['i']:g}, filter {'on' if s['filt_on'] else 'off'}")
+        if s["p"] == 0 and s["i"] == 0:
             self.log("  note: p = i = 0, the PI outputs 0")
 
     def _adopt_lock(self):
         p0, iq, a, s = self.r.pid0, self.r.iq2, self.r.asg0, self.s
-        s.update(pi_input="Y" if p0.input == "iq2_2" else "X", p=float(p0.p), i_hz=float(p0.i),
+        s.update(pi_input="Y" if p0.input == "iq2_2" else "X", p=float(p0.p), i=float(p0.i),
                  setpoint_mv=float(p0.setpoint) * 1e3, clamp_lo_mv=float(p0.min_voltage) * 1e3,
                  clamp_hi_mv=float(p0.max_voltage) * 1e3)
         f = [float(x) for x in p0.inputfilter]
@@ -334,12 +328,12 @@ class LockinPIController:
         s["offset_mv"] = float(a.offset) * 1e3 if (a.output_direct == "out1" and a.amplitude == 0) else 0.0
         self.mode = "pi"
         self.version += 1
-        self.log(f"pid0 was locking ({s['pi_input']} -> OUT1, p = {s['p']:g}, i = {s['i_hz']:g} Hz): adopted untouched")
+        self.log(f"pid0 was locking ({s['pi_input']} -> OUT1, p = {s['p']:g}, i = {s['i']:g}): adopted untouched")
 
     def _adopt_int(self):
         p2, s = self.r.pid2, self.s
         s.update(int_input=p2.input if p2.input in ("in1", "in2") else s["int_input"], int_p=float(p2.p),
-                 int_i_hz=float(p2.i), int_setpoint_mv=float(p2.setpoint) * 1e3,
+                 int_i=float(p2.i), int_setpoint_mv=float(p2.setpoint) * 1e3,
                  int_clamp_lo_mv=float(p2.min_voltage) * 1e3, int_clamp_hi_mv=float(p2.max_voltage) * 1e3)
         f = [float(x) for x in p2.inputfilter]
         s["int_filt_on"] = any(f)
@@ -347,7 +341,7 @@ class LockinPIController:
             s.update({k: round(v, 3) for k, v in zip(IFILT, f + [0.0] * 4)})
         self.int_on = True
         self.version += 1
-        self.log(f"pid2 was running ({p2.input} -> OUT2, p = {s['int_p']:g}, i = {s['int_i_hz']:g} Hz): adopted "
+        self.log(f"pid2 was running ({p2.input} -> OUT2, p = {s['int_p']:g}, i = {s['int_i']:g}): adopted "
                  f"untouched")
 
     # ---- intensity ----
@@ -360,7 +354,7 @@ class LockinPIController:
             p2.output_direct = "out2"
             self.int_on = True
             self.log(f"INTENSITY PI ON: OUT2 = PI({s['int_input']} - {s['int_setpoint_mv']:+.1f} mV), "
-                     f"p = {s['int_p']:g}, i = {s['int_i_hz']:g} Hz, filter {'on' if s['int_filt_on'] else 'off'}")
+                     f"p = {s['int_p']:g}, i = {s['int_i']:g}, filter {'on' if s['int_filt_on'] else 'off'}")
         elif not on and self.int_on:
             p2.output_direct = "off"
             p2.ival = 0
@@ -368,25 +362,77 @@ class LockinPIController:
             self.log("intensity PI OFF: OUT2 = 0 V")
 
     # ---- scope ----
+    def _ramp_window(self):
+        s = self.s
+        want = max(int(s["ramp_periods"]), 1) / s["ramp_hz"]
+        opts = sorted(getattr(self.r.scope, "durations", []) or [])
+        if opts and want > opts[-1] * 1.0001:
+            if self._long_msg != want:
+                self.log(f"{int(s['ramp_periods'])} ramp periods ({want:.2f} s) are longer than the scope's longest "
+                         f"trace ({opts[-1]:.2f} s): showing {opts[-1]*s['ramp_hz']:.2f} periods")
+                self._long_msg = want
+            return opts[-1]
+        return want
+
+    def _probe_frame(self, have, dur, trigger):
+        """Probes A/B: reuse a main capture when both signals are in it, else one extra capture every
+        probe_every frames."""
+        s = self.s
+        a, b = s["probe_a"], s["probe_b"]
+        real = [x for x in (a, b) if x != "off"]
+        if not real:
+            return None
+        if all(x in have for x in real):
+            return dict(t=have["t"], a=have.get(a), b=have.get(b), a_name=a, b_name=b)
+        if self._frames % max(int(s["probe_every"]), 1) and self.probe is not None and \
+                (self.probe.get("a_name"), self.probe.get("b_name")) == (a, b):
+            return self.probe
+        t, ya, yb = self.capture(a if a != "off" else real[0], b if b != "off" else real[0], dur, trigger)
+        return dict(t=t, a=None if a == "off" else ya, b=None if b == "off" else yb, a_name=a, b_name=b)
+
+    def _toggle_probe(self, sig):
+        s = self.s
+        a, b = s["probe_a"], s["probe_b"]
+        if sig == a:
+            a = "off"
+        elif sig == b:
+            b = "off"
+        elif a == "off":
+            a, self._probe_last = sig, "a"
+        elif b == "off":
+            b, self._probe_last = sig, "b"
+        elif self._probe_last == "b":
+            a, self._probe_last = sig, "a"
+        else:
+            b, self._probe_last = sig, "b"
+        s["probe_a"], s["probe_b"] = a, b
+        self.version += 1
+        self.log(f"probes: A = {a}, B = {b}")
+
     def _tick(self):
         s = self.s
+        self._frames += 1
         if self.mode == "ramp":
-            dur = 1.0 / s["ramp_hz"]
-            t, pd, o = self.capture("in1", "out1", dur, trigger="asg0")
-            _, x, y = self.capture("iq2", "iq2_2", dur, trigger="asg0")
-            n = min(int(np.searchsorted(t, dur)), len(x))
+            dur = self._ramp_window()
+            trig = "asg0"
+            t, pd, o = self.capture("in1", "out1", dur, trigger=trig)
+            _, x, y = self.capture("iq2", "iq2_2", dur, trigger=trig)
+            n = min(int(np.searchsorted(t, dur * 0.9999)), len(x))
             t, pd, o, x, y = t[:n], pd[:n], o[:n], x[:n], y[:n]
             kind = "ramp"
             th, q = xy_theta(x, y)
             theta = dict(theta=th, q=q) if th is not None else None
         else:
             dur = s["live_ms"] * 1e-3
+            trig = "immediately"
             t, pd, o = self.capture("in1", "out1", dur)
             _, x, y = self.capture("iq2", "iq2_2", dur)
             kind = "live"
             theta = None
         ti, vi, oi = self.capture(s["int_input"], "out2", s["int_live_ms"] * 1e-3)
         it = dict(t=ti, inp=vi, out2=oi)
+        have = {"t": t, "in1": pd, "out1": o, "iq2": x, "iq2_2": y}
+        probe = self._probe_frame(have, dur, trig)
         iv = jv = None
         try:
             if self.mode == "pi":
@@ -399,6 +445,7 @@ class LockinPIController:
         with self._lock:
             self.trace = dict(kind=kind, t=t, pd=pd, out1=o, x=x, y=y)
             self.itrace = it
+            self.probe = probe
             self.ival, self.int_ival, self.theta = iv, jv, theta
             self.seq += 1
             if self._t_last:
@@ -451,10 +498,22 @@ class LockinPIController:
                 self._write_asg()
             if changed & INT_KEYS:
                 self._write_int()
-            if changed - {"ui_hz", "xaxis", "live_ms", "int_live_ms"}:
+            if changed - {"ui_hz", "xaxis", "live_ms", "int_live_ms", "ramp_periods", "probe_every", "probe_a",
+                          "probe_b"}:
                 self.log("applied: " + ", ".join(f"{k}={s[k]}" for k in sorted(changed)))
         elif cmd == "switch":
             self._switch(*arg)
+        elif cmd == "probe":
+            self._toggle_probe(arg)
+        elif cmd in ("offset", "offset_nudge"):
+            v = float(arg) if cmd == "offset" else s["offset_mv"] + float(arg)
+            v = round(max(min(v, 1000.0), -1000.0), 3)
+            if v != s["offset_mv"]:
+                s["offset_mv"] = v
+                self.version += 1
+                if self.mode != "off":
+                    self._write_asg()
+                self.log(f"offset {v:+g} mV")
         elif cmd == "reset_i":
             self.r.pid0.ival = 0
             self.log("lock integrator reset")
@@ -467,7 +526,7 @@ class LockinPIController:
             self.log(f"settings saved to {SETTINGS_FILE}")
         elif cmd == "load":
             with open(SETTINGS_FILE) as f:
-                s.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+                s.update(load_settings(json.load(f)))
             self._write_lockin()
             self._write_pid()
             self._write_int()
@@ -530,7 +589,7 @@ def main():
     settings = dict(DEFAULTS)
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE) as f:
-            settings.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+            settings.update(load_settings(json.load(f)))
     ctl = LockinPIController(args.host, args.config, settings)
     import lockin_pi_ui
     app = lockin_pi_ui.build_app(ctl, sys.modules[__name__])

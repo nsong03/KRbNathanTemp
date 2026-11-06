@@ -105,21 +105,32 @@ User request: IN1/OUT1 = dual-phase lock-in + PI + ramp; intensity servo on OUT2
 auto-calculation or auto-setting**; optional toggleable filters (off by default). The user wrote "input 1 and output
 2" for the intensity servo; the documented hardware has the AOM pickoff on IN2, so `int_input` defaults to in2 and
 in1 is selectable.
-- `LockinPIController` (+ `lockin_pi_ui.py`, reuses `pi_ui.CSS` and `pi_app` capture/envelope). Modules: iq2 (dither
-  → out1, demodulates in1: X = iq2, Y = iq2_2, LP 1–4 stages, HP, integer gain, phase by hand), pid0 (input iq2 or
-  iq2_2 = `pi_input` X/Y → out1), asg0 (ramp / offset → out1), pid2 (int_input → out2). iq0, iq1, pid1, asg1 off.
-- No phase extraction: the sweep only DISPLAYS the X–Y signal angle (`xy_theta`). R cannot be a PI input (no R
-  signal in the FPGA, and R has no sign).
-- Filters: `filt_on` / `int_filt_on` are bool toggles (switch commands `filt` / `int_filt`), stored in settings; the
-  stage values are written only while the toggle is on (else [0, 0, 0, 0]). Bool keys are not in `KEYS`.
-- Lock modes like pi_app (ramp / dc / pi / off) + Dither toggle. Intensity `int_on` (pid2 → out2, ival 0 at on) or off
-  (OUT2 = 0 V). Start-up: each PI adopted untouched if running with gains, else lock → ramp, intensity → off.
-- Scope per frame: (in1, out1) + (iq2, iq2_2) (triggered on asg0 in ramp) and (int_input, out2) untriggered.
+- **User rules for this app (2026-11-06): the schematic diagram with switches (like errsig / the cavity app), NOT a
+  settings sidebar. P and I keys are `p`/`i` and `int_p`/`int_i`: PyRPL's own `pid.p` / `pid.i`, passed through
+  unchanged. "Do NOT change the I to Hz ... don't autoconvert": no labels in Hz, and typed values are NEVER rewritten
+  with the FPGA-rounded readback (no snapping push-back in this app, for any key); the rounded hardware values
+  appear only in the diagram's readback text.** Old settings files with `i_hz` / `int_i_hz` load via `LEGACY`.
+- Files: `lockin_pi_app.py` (`LockinPIController`, reuses `pi_app` capture/envelope), `lockin_pi_schematic.py`
+  (BLOCKS/WIRES/SWITCHES/PROBES on one 1340×670 canvas: lock chain on top, intensity chain in a frame below;
+  `diagram_state(snap, switches)`), `lockin_pi_ui.py` (errsig-style UI: ui.CSS, ui.DIAG_JS, ui.POP_JS, its own
+  generic row SCOPE_JS for the lock scope (IN1, X/Y/R, OUT1, probes A/B) and the intensity scope).
+- Modules: iq2 (dither → out1, demodulates in1: X = iq2, Y = iq2_2, LP 1–4 stages, HP, integer gain, phase by hand),
+  pid0 (input iq2 or iq2_2 = `pi_input` X/Y → out1), asg0 (ramp / offset → out1), pid2 (int_input → out2). iq0, iq1,
+  pid1, asg1 off.
+- Switches: Filter, PI, Dither, Ramp, Output (lock); Filter, Servo (intensity). Filters: `filt_on` / `int_filt_on`
+  bools in settings (not in `KEYS`); stage values are written only while the switch is on (else [0, 0, 0, 0]).
+- **Ramp mode shows `ramp_periods` (default 4) periods per trace**, triggered on asg0 (user: successive up/down
+  sweeps differ by hysteresis, a one-period trace jumped between them). Longer than the scope's longest duration →
+  clipped and logged. X–Y signal angle displayed only (no phase extraction). Offset ±1/±10 mV buttons + typed path.
+- Probes A/B (in1, iq2, iq2_2, pid0, asg0, out1, in2, pid2, out2): reuse the main captures, else one extra capture
+  every `probe_every` frames.
+- Lock modes ramp / dc / pi / off; intensity `int_on`. Start-up: each PI adopted untouched if running with gains,
+  else lock → ramp, intensity → off (OUT2 = 0 V).
 - Run: `python app\lockin_pi_app.py --host rp-f0fa92.local` → http://127.0.0.1:8085 (`lockin_pi_settings.json`).
-- Fake: with `FAKE_LOCKIN=iq2` and the PZT on out1, pid0 is a full P + I on X or Y (`eng.p_out`); the AOM on OUT2 as before.
-- Tests: `test/test_lockin_pi.py` (29: phase by hand, lock from the ramp data with raw gains, drift, filter
-  toggles, X/Y input, intensity lock + setpoint + filter + input, restart adoption of both, write log),
-  `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (25).
+- Fake: with `FAKE_LOCKIN=iq2` and the PZT on out1, pid0 is a full P + I on X or Y (`eng.p_out`); the AOM on OUT2.
+- Tests: `test/test_lockin_pi.py` (35: schematic homes, 4 ramp periods, legacy keys, phase by hand, lock with raw gains,
+  typed values never rewritten, drift, filter switches, X/Y input, intensity lock/setpoint/filter/input, restart
+  adoption, diagram state, write log), `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (32).
 
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |

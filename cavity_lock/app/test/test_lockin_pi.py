@@ -58,10 +58,35 @@ check("start-up intensity: servo off, OUT2 = 0 V", not ctl.int_on and r.pid2.out
 check("filters off by default", list(r.pid0.inputfilter) == [0] * 4 and list(r.pid2.inputfilter) == [0] * 4
       and not ctl.s["filt_on"] and not ctl.s["int_filt_on"])
 check("lock-in = iq2 demodulating IN1, PI input X = 'iq2'", r.iq2.input == "in1" and r.pid0.input == "iq2")
-apply(ramp_hz=5.0)                                     # slow ramp: little low-pass lag in the acquired signals
-time.sleep(0.5)
+import lockin_pi_schematic as LS
+check("schematic: every settings key has exactly one home", not LS.ownership_problems(E.KEYS),
+      str(LS.ownership_problems(E.KEYS)))
+
+
+def fresh(n=2):
+    q = ctl.seq
+    t0 = time.time()
+    while ctl.seq < q + n and time.time() - t0 < 20:
+        time.sleep(0.05)
+
+
+fresh()
+tr = ctl.trace
+per = tr["t"][-1] * ctl.s["ramp_hz"]
+o = tr["out1"] - np.mean(tr["out1"])
+nb = len(o) // 200 * 200
+ob = o[:nb].reshape(200, -1).mean(axis=1)               # 200 bins: averages out the dither
+turns = int(np.sum(np.diff(np.sign(np.diff(ob))[2:-2]) != 0))
+check("ramp trace shows 4 ramp periods (default), triggered", ctl.s["ramp_periods"] == 4 and 3.95 < per < 4.05
+      and 6 <= turns <= 9, f"{per:.2f} periods, {turns} turning points")
+d = {"i_hz": 3.3, "int_i_hz": 44.0, "p": 0.5, "bogus": 1}
+ld = E.load_settings(d)
+check("old settings files: i_hz / int_i_hz load as i / int_i, values unchanged", ld == {"i": 3.3, "int_i": 44.0,
+                                                                                      "p": 0.5}, str(ld))
+apply(ramp_hz=5.0, ramp_periods=1)                     # slow ramp, one period: the lock-point analysis below
+fresh()
 apply(phase_deg=F.PZT_LAG_DEG + 60)
-time.sleep(1.0)
+fresh()
 tr = ctl.trace
 th0 = ctl.snapshot()["theta"]
 check("ramp frame: IN1, OUT1, X and Y; signal angle shown (display only)", tr["kind"] == "ramp" and len(tr["y"]) ==
@@ -69,7 +94,7 @@ check("ramp frame: IN1, OUT1, X and Y; signal angle shown (display only)", tr["k
       f"X pp {np.ptp(tr['x']):.3f}, Y pp {np.ptp(tr['y']):.3f}, theta {th0}")
 check("the phase is not touched by the app", abs(r.iq2.phase - (F.PZT_LAG_DEG + 60)) < 1e-9)
 apply(phase_deg=F.PZT_LAG_DEG)                         # by hand: the whole signal in X
-time.sleep(1.5)
+fresh()
 tr = ctl.trace
 check("phase set by hand: Y ~ 0, the signal in X", np.ptp(tr["y"]) < 0.1 * np.ptp(tr["x"]),
       f"X pp {np.ptp(tr['x']):.3f}, Y pp {np.ptp(tr['y']):.3f}")
@@ -90,9 +115,13 @@ check("lock point found in the ramp data (within the low-pass lag of the ramp)",
       f"slope {S:+.1f} V/V")
 sw("ramp", False)
 check("Ramp off: offset + dither, PI off", ctl.mode == "dc" and r.asg0.amplitude == 0 and r.iq2.output_direct == "out1")
-apply(offset_mv=round(v0 * 1e3, 2), p=-0.1 / S, i_hz=-10.0 / S)          # raw gains, chosen by the user (|i S| = 10 Hz)
-check("raw p and i written as typed (snapped), nothing derived", abs(r.pid0.p + 0.1 / S) < 2.5e-4
-      and abs(r.pid0.i + 10.0 / S) < 0.005 and ctl.s["p"] == r.pid0.p, f"p {r.pid0.p}, i {r.pid0.i}")
+p_typed, i_typed = round(-0.1 / S, 5), round(-10.0 / S, 4)
+v_before = ctl.version
+apply(offset_mv=round(v0 * 1e3, 2), p=p_typed, i=i_typed)          # raw gains, chosen by the user (|i S| = 10 Hz)
+check("p and i go to pid0.p / pid0.i as typed (PyRPL units, FPGA rounding only)", abs(r.pid0.p - p_typed) < 2.5e-4
+      and abs(r.pid0.i - i_typed) < 0.005, f"p {r.pid0.p}, i {r.pid0.i}")
+check("typed values are never rewritten (no push-back of rounded values)", ctl.s["p"] == p_typed
+      and ctl.s["i"] == i_typed and ctl.version == v_before, f"{ctl.s['p']}, {ctl.s['i']}, version {ctl.version}")
 sw("pi", True)
 time.sleep(2.0)
 w = win(["iq2", "in1"], 0.2)
@@ -108,8 +137,8 @@ apply(filt1_hz=2000.0, filt2_hz=-1.0)
 check("filter values alone do nothing while the Filter toggle is off", list(r.pid0.inputfilter) == [0] * 4)
 sw("filt", True)
 f = list(r.pid0.inputfilter)
-check("Filter toggle on -> pid0.inputfilter (snapped values shown)", f[0] > 0 and f[1] < 0
-      and ctl.s["filt1_hz"] == round(f[0], 3), str(f))
+check("Filter toggle on -> pid0.inputfilter; typed values kept", f[0] > 0 and f[1] < 0
+      and ctl.s["filt1_hz"] == 2000.0 and ctl.s["filt2_hz"] == -1.0, str(f))
 sw("filt", False)
 check("Filter toggle off -> all stages 0", list(r.pid0.inputfilter) == [0] * 4)
 apply(pi_input="Y")
@@ -119,7 +148,7 @@ ctl.submit("reset_i"); idle()
 check("Reset integrator (then the lock pulls it back)", any("lock integrator reset" in l for l in ctl.logs))
 time.sleep(1.5)
 print("--- intensity (OUT2)")
-apply(int_p=0.01, int_i_hz=2000.0, int_setpoint_mv=400.0)
+apply(int_p=0.01, int_i=2000.0, int_setpoint_mv=400.0)
 check("intensity gains written while off, output stays off", r.pid2.output_direct == "off" and abs(r.pid2.i - 2000) < 1
       and r.pid2.input == "in2")
 sw("int_on", True)
@@ -156,7 +185,7 @@ ctl2 = E.LockinPIController("fake", "t", dict(E.DEFAULTS))
 after = [(m.p, m.i, m.input, m.output_direct, m.setpoint) for m in (r.pid0, r.pid2)] + [r.iq2.phase]
 neww = [w for w in F.WRITES[n0:] if w[1] in ("pid0", "pid2", "iq2", "asg0")]
 check("restart: lock and intensity adopted untouched", ctl2.mode == "pi" and ctl2.int_on and before == after
-      and not neww and abs(ctl2.s["int_p"] - r.pid2.p) < 1e-12 and abs(ctl2.s["phase_deg"] - r.iq2.phase) < 1e-9,
+      and not neww and abs(ctl2.s["int_p"] - r.pid2.p) < 1e-12 and abs(ctl2.s["i"] - r.pid0.i) < 1e-12 and abs(ctl2.s["phase_deg"] - r.iq2.phase) < 1e-9,
       str(neww[:3]))
 stop2 = threading.Event()
 threading.Thread(target=ctl2.run, args=(stop2,), daemon=True).start()
@@ -168,6 +197,9 @@ check("lock Output off: OUT1 = 0 V, intensity untouched", ctl.mode == "off" and 
 sw("int_on", False)
 check("intensity servo off: OUT2 = 0 V", r.pid2.output_direct == "off" and np.allclose(win(["out2"], 0.001)[0], 0,
                                                                                          atol=1e-9))
+dg = LS.diagram_state(ctl.snapshot(), ctl.switches())
+check("diagram state: every block has readback text, all switches present", set(dg["boxes"]) == {b["id"] for b in
+      LS.BLOCKS} and set(dg["sw"]) == {x["id"] for x in LS.SWITCHES})
 stop2.set()
 mine = [w for w in F.WRITES if w[4] == "lockin_pi_app.py"]
 check("writes only iq2, pid0, pid2, asg0, scope", {w[1] for w in mine} <= {"iq2", "pid0", "pid2", "asg0", "scope"},
