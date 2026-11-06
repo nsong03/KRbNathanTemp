@@ -41,7 +41,8 @@ hysteresis, delay, averaging, rolling mode, ranges, XY, R); one capture per fram
 Same lock and intensity servo and views, with the automatic scope: IN1, X/Y/R and OUT1, triggered on the ramp and
 showing 2 ramp periods while ramping (live otherwise), probes A/B, and the intensity scope in its view. Only the
 visible view's scope is captured every frame. P and I have PyRPL's ↓/↑ arrows (one register step per click, ×2 per
-0.5 s when held). A "PI → OUT2" switch sends the lock PI to OUT2 instead of OUT1 (the intensity servo is off then). Run: `python app\lockin_pi2_app.py --host rp-f0fa92.local`.
+0.5 s when held). OUT1 summer = dither + ramp or offset + PI (Ramp and PI exclusive); "PI → OUT2" independently sends the
+PI to OUT2 (to tune it without closing the loop through OUT1; the intensity servo is off then). Run: `python app\lockin_pi2_app.py --host rp-f0fa92.local`.
 
 ### Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, port 8065)
 Same wiring and workflow, but the demodulation is a dual-quadrature lock-in on `iq2` (the only PyRPL IQ module with

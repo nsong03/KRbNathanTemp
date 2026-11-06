@@ -132,6 +132,15 @@ check("lock point found in the ramp data (within the low-pass lag of the ramp)",
       f"slope {S:+.1f} V/V")
 sw("ramp", False)
 check("Ramp off: offset + dither, PI off", ctl.mode == "dc" and r.asg0.amplitude == 0 and r.iq2.output_direct == "out1")
+w = win(["out1"], 0.02)[0]
+tt = np.arange(len(w)) * 0.02 / len(w)
+A_ = np.column_stack([np.sin(2 * np.pi * ctl.s["dither_hz"] * tt), np.cos(2 * np.pi * ctl.s["dither_hz"] * tt),
+                      np.ones_like(tt)])
+coef, *_ = np.linalg.lstsq(A_, w, rcond=None)
+res = w - A_ @ coef
+check("offset only, PI off: OUT1 = offset + a pure dither sine (nothing else in the sum)",
+      np.std(res) < 1e-4 and abs(coef[2] - r.asg0.offset) < 1e-4 and r.pid0.output_direct == "off",
+      f"sine {2*np.hypot(coef[0], coef[1])*1e3:.2f} mVpp, offset {coef[2]*1e3:+.2f} mV, residual {np.std(res):.1e} V")
 p_typed, i_typed = round(-0.1 / S, 5), round(-10.0 / S, 4)
 v_before = ctl.version
 apply(offset_mv=round(v0 * 1e3, 2), p=p_typed, i=i_typed)          # raw gains, chosen by the user (|i S| = 10 Hz)
@@ -186,23 +195,39 @@ check("intensity Filter toggle off", list(r.pid2.inputfilter) == [0] * 4)
 apply(int_input="in1")
 check("intensity input selectable (in1)", r.pid2.input == "in1")
 apply(int_input="in2")
-print("--- PI output to OUT2 (toggle)")
-check("PI → OUT2 off by default", ctl.switches()["pi_out2"] is False and r.pid0.output_direct == "out1")
+print("--- PI routing: OUT1 summer (PI switch, exclusive with Ramp) and OUT2 (PI → OUT2), independent")
+check("PI → OUT2 off by default; PI on the summer: pid0 -> out1", ctl.switches()["pi_out2"] is False
+      and ctl.mode == "pi" and r.pid0.output_direct == "out1")
 sw("pi_out2", True)
-check("PI → OUT2 on: pid0 -> out2, intensity servo switched off, OUT1 keeps offset + dither",
-      r.pid0.output_direct == "out2" and not ctl.int_on and r.pid2.output_direct == "off"
+check("PI → OUT2 on with PI on the summer: pid0 -> both, intensity servo off, OUT1 keeps offset + dither",
+      r.pid0.output_direct == "both" and not ctl.int_on and r.pid2.output_direct == "off"
       and r.asg0.output_direct == "out1" and r.iq2.output_direct == "out1", f"pid0 {r.pid0.output_direct}")
 sw("int_on", True)
 check("intensity servo refused while PI → OUT2", not ctl.int_on and r.pid2.output_direct == "off")
-dl, di = LS.diagram_state(ctl.snapshot(), ctl.switches(), ("probe_a", "probe_b"), ("A", "B"))
-check("diagram: PI → OUT2 switch on, PI wire to OUT2, not into the OUT1 sum", dl["sw"]["pi_out2"]["on"]
-      and dl["wires"]["pid_out2"] and not dl["wires"]["pid_sum"] and "PI" not in dl["boxes"]["out1"][1][0])
+iv = r.pid0.ival
 sw("ramp", True)
-check("Ramp on: PI off (output off)", r.pid0.output_direct == "off")
+check("Ramp on: PI off the summer but still running to OUT2 (integrator not reset)", ctl.mode == "ramp"
+      and r.pid0.output_direct == "out2" and r.asg0.amplitude > 0 and r.pid0.ival != 0, f"{r.pid0.output_direct}")
+dl, di = LS.diagram_state(ctl.snapshot(), ctl.switches(), ("probe_a", "probe_b"), ("A", "B"))
+check("diagram: ramp into the summer, PI wire to OUT2 only", dl["wires"]["ramp_sum"] and dl["wires"]["pid_out2"]
+      and not dl["wires"]["pid_sum"] and dl["sw"]["ramp"]["on"] and not dl["sw"]["pi"]["on"]
+      and "PI" not in dl["boxes"]["out1"][1][0])
+sw("ramp", False)
+check("Ramp off: offset + dither on OUT1, PI still on OUT2", ctl.mode == "dc" and r.pid0.output_direct == "out2"
+      and r.asg0.amplitude == 0)
 sw("pi", True)
-check("PI on again with PI → OUT2: straight to out2", r.pid0.output_direct == "out2")
+check("PI switch on: PI into the summer as well (both)", ctl.mode == "pi" and r.pid0.output_direct == "both")
+sw("output", False)
+check("Output off: OUT1 = 0 V, PI → OUT2 stays", ctl.mode == "off" and r.pid0.output_direct == "out2"
+      and r.asg0.output_direct == "off" and r.iq2.output_direct == "off")
 sw("pi_out2", False)
-check("PI → OUT2 off: pid0 back to out1 (PI state kept)", r.pid0.output_direct == "out1" and ctl.mode == "pi")
+check("PI → OUT2 off with nothing else: pid0 off, integrator cleared", r.pid0.output_direct == "off"
+      and r.pid0.ival == 0)
+sw("output", True)
+sw("pi", True)
+check("PI on again: pid0 -> out1 only", r.pid0.output_direct == "out1" and ctl.mode == "pi")
+time.sleep(2.0)
+check("locks again through OUT1", np.mean(win(["in1"], 0.2)[0]) > 0.5 * pk)
 sw("int_on", True)
 check("intensity servo allowed again", ctl.int_on and r.pid2.output_direct == "out2")
 print("--- restart with both servos running")
@@ -245,7 +270,7 @@ mine = [w for w in F.WRITES if w[4] == "lockin_pi2_app.py"]
 check("writes only iq2, pid0, pid2, asg0, scope", {w[1] for w in mine} <= {"iq2", "pid0", "pid2", "asg0", "scope"},
       str(sorted({w[1] for w in mine})))
 bad = [w for w in mine if w[2] == "output_direct" and ((w[1] in ("iq2", "asg0") and w[3] not in ("out1", "off"))
-                                                       or (w[1] == "pid0" and w[3] not in ("out1", "out2", "off"))
+                                                       or (w[1] == "pid0" and w[3] not in ("out1", "out2", "both", "off"))
                                                        or (w[1] == "pid2" and w[3] not in ("out2", "off")))]
 check("lock modules only on OUT1, pid2 only on OUT2", not bad, str(bad[:3]))
 print(f"\n{len(FAILS)} FAILED: {FAILS}" if FAILS else "\nALL PASS")

@@ -165,11 +165,18 @@ stays as it is.
   ~33/s. `lockin_pi_schematic.diagram_state(snap, sw, ("probe_a", "probe_b"), ("A", "B"))` for the A / B badges;
   `ownership_problems(keys, scope_keys)`.
 - Same controller rules as v1: raw p / i never rewritten, filters behind switches, adoption at start-up, intensity off.
-- **PI → OUT2 switch (v2 only, 2026-11-06):** setting `pi_out2` (bool, saved; switch command `pi_out2`). On:
-  pid0.output_direct = out2 instead of out1 (when the PI is on; toggling while locked only moves the output, ival kept),
-  the intensity servo is switched off and refused while it is on; ramp / offset and dither stay on OUT1. Start-up
-  adopts a pid0 running on out2 (then pid2 is not adopted). Diagram: `LS.LOCK2` = LOCK + block `pi_out2_term`, wire
-  `pid_out2`, switch `pi_out2`.
+- **OUT1 summer + PI routing (v2, 2026-11-06, user):** "the dither is sent straight to the summer before output 1, and
+  then we can toggle on either a ramp or the PI output to the summer. I like ... the PI active without sending it to the
+  summer and send it only to output 2, as this lets me tune the PI." Summer = dither (Dither switch) + asg0 (ramp when
+  Ramp is on, else the DC offset) + PI (PI switch = mode `pi`). Ramp and PI → summer are mutually exclusive (modes
+  ramp / dc / pi). PI → OUT2 (`pi_out2`, bool, saved) is independent: `_pi_route()` → pid0.output_direct = both /
+  out1 / out2 / off; `_route_pid()` writes it (integrator from 0 when the PI goes from no output to an output, cleared
+  when it has none, kept when it only changes destination). PI → OUT2 switches the intensity servo off and the Servo
+  switch is refused while it is on; it works with Output off too. Start-up adopts pid0 on out1 / out2 / both (mode from
+  asg0 when pid0 is not on out1). Diagram `LS.LOCK2` (+ block `pi_out2_term`, wire `pid_out2`, switch `pi_out2`).
+  Status "OUT2: LOCK PI (PI → OUT2)". Note told to the user: a 1 mVpp dither is ~8 DAC steps (2 V / 2^14 = 0.12 mV),
+  so on a scope it is lost in the output noise; and the lock-in low-pass must be well below the dither (607 Hz LP with a
+  500 Hz dither leaves a large 2f ripple on X / Y).
 - **P / I boxes = PyRPL's PID widget (both lock-in apps, 2026-11-06, user: "exactly like the PI module in the pyrpl
   ... I just want you to implement the pyrpl modules in a good interface. please stop changing things around"):**
   `pyrpl_spinbox.py` copies widgets/spinbox.py NumberSpinBox with set_log_increment (pid_widget.py): ↓ [%.4e] ↑, click /
@@ -178,8 +185,8 @@ stays as it is.
   to ±2048 / ±38.9 kHz. Browser → Store("pyspin") every 50 ms → controller `spin` command (s[key] = value, write the
   PI; no version bump, no log). Typed text + Enter goes through the normal apply; `PS.parse` keeps the full value
   when the text still reads as the present value.
-- Tests: `test/test_lockin_pi2.py` (48, incl. PI → OUT2), `serve_lockin_pi2.py` (port 8096) + `ui_lockin_pi2.py`
-  (34, incl. the P / I arrows: one step, hold ×2 per 0.5 s, zero crossing, keys, large-I single step; PI → OUT2).
+- Tests: `test/test_lockin_pi2.py` (55, incl. PI routing and the pure-sine OUT1 check), `serve_lockin_pi2.py` (port 8096) + `ui_lockin_pi2.py`
+  (36, incl. the P / I arrows: one step, hold ×2 per 0.5 s, zero crossing, keys, large-I single step; PI routing).
 
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |

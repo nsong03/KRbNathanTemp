@@ -71,6 +71,10 @@ function(fr) {
 }
 """
 
+V2_TITLES = {"pi": "PI → OUT1 summer: on = OUT1 = offset + PI + dither (turns the ramp off); the PI can run "
+                  "with this off and PI → OUT2 on",
+             "ramp": "Ramp → OUT1 summer: on = ramp + dither (takes the PI off the summer; PI → OUT2 unaffected)",
+             "dither": "Dither: iq2's oscillator straight into the OUT1 summer"}
 LOCK_DOT = {"pi": "ok", "ramp": "busy", "dc": "held", "off": "off", "connecting": "busy"}
 
 
@@ -166,7 +170,7 @@ def build_app(ctl, A):
         return html.Div([html.Div(sw["label"], id=f"{P}swl-{sw['id']}", className="lab"),
                          html.Div(id=f"{P}swp-{sw['id']}", className="pill")],
                         id={"type": "sw", "s": sw["id"]}, className="sw", style={"left": sw["x"], "top": sw["y"]},
-                        title=LS.SWITCH_TITLES[sw["id"]])
+                        title=V2_TITLES.get(sw["id"], LS.SWITCH_TITLES[sw["id"]]))
 
     def probe(p, M):
         P = M.PREFIX
@@ -380,12 +384,13 @@ def build_app(ctl, A):
         s, mode, tr, it = snap["settings"], snap["mode"], snap["trace"], snap["itrace"]
         version_new = snap["version"] != synced
         color = {"ramp": "#2471a3", "dc": "#7f8c8d", "pi": "#1e8e3e", "off": "#c0392b"}.get(mode, "#555")
-        label = {"ramp": "LOCK: RAMP", "dc": "LOCK: OFFSET ONLY (PI off)", "pi": "LOCK: PI ON",
+        label = {"ramp": "LOCK: RAMP", "dc": "LOCK: OFFSET ONLY", "pi": "LOCK: PI → OUT1",
                  "off": "LOCK: OUTPUT OFF"}.get(mode, mode.upper())
-        ion = snap["int_on"]
+        ion, po2 = snap["int_on"], bool(s.get("pi_out2"))
+        out2_txt = ("OUT2: LOCK PI (PI → OUT2)" if po2 else "INTENSITY: SERVO ON" if ion
+                    else "INTENSITY: SERVO OFF (OUT2 = 0 V)")
         status = html.Span([html.Span(label, style={"color": color}), html.Span("   ·   "),
-                            html.Span("INTENSITY: SERVO ON" if ion else "INTENSITY: SERVO OFF (OUT2 = 0 V)",
-                                      style={"color": "#1e8e3e" if ion else "#7f8c8d"}),
+                            html.Span(out2_txt, style={"color": "#1e8e3e" if (ion or po2) else "#7f8c8d"}),
                             html.Span(f"   {snap['fps']:.1f} traces/s", style={"fontSize": "13px"})])
         stats = (tstats(tr["x"], "X") + "  ·  " + tstats(tr["y"], "Y") + f"  ·  OUT1 mean "
                  f"{np.mean(tr['out1'])*1e3:+.2f} mV") if tr is not None else ""

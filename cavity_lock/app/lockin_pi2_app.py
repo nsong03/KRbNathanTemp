@@ -57,7 +57,8 @@ FIELDS = [   # key, label, default, group, kind, options
     ("clamp_lo_mv", "Output min [mV]", -1000.0, "Lock PI", "num", {"min": -1000, "max": 1000}),
     ("clamp_hi_mv", "Output max [mV]", 1000.0, "Lock PI", "num", {"min": -1000, "max": 1000}),
     ("filt_on", "Filter on", False, "Lock PI", "bool", {}),
-    ("pi_out2", "PI output to OUT2 (instead of OUT1; disables the intensity servo)", False, "Lock PI", "bool", {}),
+    ("pi_out2", "PI output to OUT2 (independent of PI -> OUT1 summer; disables the intensity servo)", False,
+     "Lock PI", "bool", {}),
     ("filt1_hz", "Filter stage 1 [Hz]", 0.0, "Lock filter", "num", {}),
     ("filt2_hz", "Filter stage 2 [Hz]", 0.0, "Lock filter", "num", {}),
     ("filt3_hz", "Filter stage 3 [Hz]", 0.0, "Lock filter", "num", {}),
@@ -161,7 +162,7 @@ class LockinPIController:
         self.log("connected: lock IN1 -> iq2 (X, Y) -> pid0 -> OUT1 (+ asg0 offset/ramp, iq2 dither); "
                  "intensity pid2 -> OUT2")
         p0, p2 = self.r.pid0, self.r.pid2
-        if p0.input in ("iq2", "iq2_2") and p0.output_direct in ("out1", "out2") and (p0.p != 0 or p0.i != 0):
+        if p0.input in ("iq2", "iq2_2") and p0.output_direct in ("out1", "out2", "both") and (p0.p != 0 or p0.i != 0):
             self._adopt_lock()
         else:
             self.s["pi_out2"] = bool(self.s.get("pi_out2"))
@@ -195,8 +196,23 @@ class LockinPIController:
                     dither=self.dither_on, filt=bool(self.s["filt_on"]), int_on=self.int_on,
                     int_filt=bool(self.s["int_filt_on"]), pi_out2=bool(self.s["pi_out2"]))
 
-    def _pi_out(self):
-        return "out2" if self.s["pi_out2"] else "out1"
+    def _pi_route(self):
+        """pid0.output_direct from the two PI destinations: the OUT1 summer (PI switch = mode 'pi') and OUT2
+        (PI → OUT2 switch). PyRPL's 'both' sends it to both outputs."""
+        o1, o2 = self.mode == "pi", bool(self.s["pi_out2"])
+        return "both" if (o1 and o2) else "out1" if o1 else "out2" if o2 else "off"
+
+    def _route_pid(self):
+        """Apply the PI routing. The integrator starts from 0 when the PI goes from no output to an output and is
+        cleared when it has no output; moving between destinations keeps it."""
+        p0 = self.r.pid0
+        new, old = self._pi_route(), p0.output_direct
+        if new != "off" and old == "off":
+            self._write_pid()
+            p0.ival = 0
+        p0.output_direct = new
+        if new == "off":
+            p0.ival = 0
 
     def _readback(self):
         r, hw = self.r, {}
@@ -283,38 +299,33 @@ class LockinPIController:
 
     # ---- lock modes ----
     def _start_ramp(self):
-        self._pid_off()
         self.mode = "ramp"
+        self._route_pid()                         # PI off the summer (still on OUT2 if PI → OUT2 is on)
         self._write_lockin()
         self._write_pid()
         self._write_asg()
         lo, hi = self._ramp_limits()
         self.log(f"RAMP: OUT1 {self.s['ramp_shape']} {lo*1e3:+.0f}..{hi*1e3:+.0f} mV at {self.s['ramp_hz']:g} Hz "
-                 f"+ dither (PI off)")
+                 f"+ dither (PI not on OUT1" + (", PI → OUT2" if self.s["pi_out2"] else "") + ")")
 
     def _start_dc(self):
-        self._pid_off()
         self.mode = "dc"
+        self._route_pid()
         self._write_asg()
         self._write_dither()
-        self.log(f"OUT1 = offset {self.s['offset_mv']:+.1f} mV + dither (PI off)")
+        self.log(f"OUT1 = offset {self.s['offset_mv']:+.1f} mV + dither (PI not on OUT1"
+                 + (", PI → OUT2" if self.s["pi_out2"] else "") + ")")
 
     def _start_pi(self):
-        p0, s = self.r.pid0, self.s
-        self._pid_off()
+        s = self.s
         self.mode = "pi"
-        self._write_asg()
+        self._write_asg()                         # ramp off: the offset as DC under the PI
         self._write_dither()
         self._write_pid()
-        p0.ival = 0
-        p0.output_direct = self._pi_out()
-        if s["pi_out2"]:
-            self.log(f"LOCK PI ON: OUT2 = PI({s['pi_input']} - {s['setpoint_mv']:+.1f} mV); OUT1 = "
-                     f"{s['offset_mv']:+.1f} mV + dither; p = {s['p']:g}, i = {s['i']:g}, filter "
-                     f"{'on' if s['filt_on'] else 'off'}")
-        else:
-            self.log(f"LOCK PI ON: OUT1 = {s['offset_mv']:+.1f} mV + PI({s['pi_input']} - {s['setpoint_mv']:+.1f} mV) "
-                     f"+ dither; p = {s['p']:g}, i = {s['i']:g}, filter {'on' if s['filt_on'] else 'off'}")
+        self._route_pid()
+        self.log(f"LOCK PI → OUT1 summer: OUT1 = {s['offset_mv']:+.1f} mV + PI({s['pi_input']} - "
+                 f"{s['setpoint_mv']:+.1f} mV) + dither" + (" (and PI → OUT2)" if s["pi_out2"] else "")
+                 + f"; p = {s['p']:g}, i = {s['i']:g}, filter {'on' if s['filt_on'] else 'off'}")
         if s["p"] == 0 and s["i"] == 0:
             self.log("  note: p = i = 0, the PI outputs 0")
 
@@ -333,9 +344,16 @@ class LockinPIController:
         if bw:
             s.update(lpf_hz=round(bw[0], 3), lpf_order=len(bw))
         self.dither_on = iq.output_direct == "out1"
-        s["pi_out2"] = p0.output_direct == "out2"
+        s["pi_out2"] = p0.output_direct in ("out2", "both")
         s["offset_mv"] = float(a.offset) * 1e3 if (a.output_direct == "out1" and a.amplitude == 0) else 0.0
-        self.mode = "pi"
+        if p0.output_direct in ("out1", "both"):
+            self.mode = "pi"
+        elif a.output_direct == "out1":
+            self.mode = "ramp" if a.amplitude > 0 else "dc"
+            if a.amplitude > 0:
+                s["offset_mv"] = float(a.offset) * 1e3
+        else:
+            self.mode = "off"
         self.version += 1
         self.log(f"pid0 was locking ({s['pi_input']} -> {p0.output_direct.upper()}, p = {s['p']:g}, i = {s['i']:g}): adopted untouched")
 
@@ -604,19 +622,18 @@ class LockinPIController:
                 self.log("intensity servo switched off: OUT2 now carries the lock PI")
             s["pi_out2"] = on
             self.version += 1
-            if self.mode == "pi":
-                self.r.pid0.output_direct = self._pi_out()       # same PI state, only the output moves
-            self.log(f"lock PI output -> {'OUT2' if on else 'OUT1'}"
-                     + ("" if self.mode == "pi" else " (applies when the PI is on)"))
+            self._route_pid()
+            self.log(f"PI → OUT2 {'on' if on else 'off'}: pid0 output {self.r.pid0.output_direct}")
         elif name == "output":
             if on and self.mode == "off":
                 self._start_dc()
             elif not on and self.mode != "off":
-                self._pid_off()
                 self.mode = "off"
+                self._route_pid()
                 self._write_asg()
                 self._write_dither()
-                self.log("lock Output OFF: OUT1 = 0 V (ramp/offset, dither and PI off)")
+                self.log("lock Output OFF: OUT1 = 0 V (ramp/offset, dither and PI off OUT1"
+                         + ("; PI → OUT2 stays" if s["pi_out2"] else "") + ")")
         elif self.mode == "off":
             self.log(f"{name}: lock Output is off; switch Output on first")
         elif name == "ramp":
