@@ -13,7 +13,8 @@ def _stats():
     return json.dumps(dict(mode=ctl.mode, int_on=ctl.int_on, p=r.pid0.p, i=r.pid0.i, pin=r.pid0.input,
                            out=r.pid0.output_direct, filt=list(r.pid0.inputfilter), ifilt=list(r.pid2.inputfilter),
                            ip=r.pid2.p, ii=r.pid2.i, iout=r.pid2.output_direct, phase=r.iq2.phase,
-                           dither=r.iq2.output_direct, amp=r.asg0.amplitude, vc=r.eng.vc))
+                           dither=r.iq2.output_direct, amp=r.asg0.amplitude, vc=r.eng.vc,
+                           ch1=r.scope.input1, ch2=r.scope.input2, dur=r.scope.duration, trig=r.scope.trigger_source))
 
 
 port = int(os.environ.get("PORT", "8086"))

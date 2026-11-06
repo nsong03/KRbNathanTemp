@@ -110,27 +110,44 @@ in1 is selectable.
   unchanged. "Do NOT change the I to Hz ... don't autoconvert": no labels in Hz, and typed values are NEVER rewritten
   with the FPGA-rounded readback (no snapping push-back in this app, for any key); the rounded hardware values
   appear only in the diagram's readback text.** Old settings files with `i_hz` / `int_i_hz` load via `LEGACY`.
-- Files: `lockin_pi_app.py` (`LockinPIController`, reuses `pi_app` capture/envelope), `lockin_pi_schematic.py`
-  (BLOCKS/WIRES/SWITCHES/PROBES on one 1340×670 canvas: lock chain on top, intensity chain in a frame below;
-  `diagram_state(snap, switches)`), `lockin_pi_ui.py` (errsig-style UI: ui.CSS, ui.DIAG_JS, ui.POP_JS, its own
-  generic row SCOPE_JS for the lock scope (IN1, X/Y/R, OUT1, probes A/B) and the intensity scope).
+- **User rules (2026-11-06, second round): UI laid out like the cavity app (view icons "Lock" / "Intensity" with
+  status dots, one schematic per view); EVERY parameter inline in its box and EVERY scope setting in the scope panel
+  ("don't hide things behind layers": popovers only carry notes); the user sets all scope settings (channels,
+  timebase, trigger, level, hysteresis, delay, averaging, rolling, ranges); the traces must be live.**
+- Why the previous version was choppy (diagnosed 2026-11-06): 3 scope captures per frame ((in1, out1), (iq2, iq2_2),
+  (in2, out2)), each a full trace + ~2×16384-sample readout, trigger source switching (PyRPL `call_setup`) between
+  them; in ramp mode 2 triggered 268 ms captures → ~0.7 s per update on the hardware. Now: ONE capture per frame.
+- Files: `lockin_pi_app.py` (`LockinPIController`, reuses `pi_app` `_scope_set`), `lockin_pi_schematic.py` (two models
+  `LOCK` (1340×500, prefix "") and `INT` (1340×260, prefix "i-"), `SCOPE_KEYS`, `diagram_state(snap, sw)` → (lock,
+  intensity)), `lockin_pi_ui.py` (ui.CSS + ui.VIEW_CLICK_JS / VIEW_SHOW_JS / DIAG_JS / POP_JS, ids `view-cavity` /
+  `view-intensity`, `vbtn-cav` / `vbtn-int`, `dot-cav` / `dot-int`; its own 2-channel SCOPE_JS).
+- Scope (`_tick`): settings `sc_ch1`, `sc_ch2` (any of in1, in2, iq2, iq2_2, pid0, pid2, asg0, asg1, out1, out2),
+  `sc_duration` (PyRPL `durations`, 131 µs × 2^k), `sc_trigger` (immediately, asg0, asg1, ch1/ch2/ext edges),
+  `sc_threshold_mv`, `sc_hysteresis_mv`, `sc_delay_ms` (PyRPL trigger_delay = trace centre after the trigger;
+  default duration/2 = trace starts at the trigger), `sc_average`, `sc_rolling`; display only: `sc_view` (time / XY),
+  `sc_math` (R), `sc_ch{1,2}_{min,max}_mv` (None = auto), `ui_hz`. Registers written only on change (`_scope_set`);
+  the capture is armed and polled without blocking (≤ 50 ms per loop pass, commands served in between); no trigger
+  for dur + 0.25 s → `ctl.waiting` ("WAITING FOR TRIGGER"). Rolling (trigger immediately, duration > 0.1 s):
+  `_start_acquisition_rolling_mode()` once, then `_get_rolling_curve()` each frame at `ui_hz`. RUN/STOPPED button
+  (`scope_run` command). Probe dots put a signal on CH1 / CH2 alternately (badges "1" / "2"). With iq2 and iq2_2 on
+  the two channels the Phase box shows the X–Y signal angle (display only).
 - Modules: iq2 (dither → out1, demodulates in1: X = iq2, Y = iq2_2, LP 1–4 stages, HP, integer gain, phase by hand),
   pid0 (input iq2 or iq2_2 = `pi_input` X/Y → out1), asg0 (ramp / offset → out1), pid2 (int_input → out2). iq0, iq1,
   pid1, asg1 off.
 - Switches: Filter, PI, Dither, Ramp, Output (lock); Filter, Servo (intensity). Filters: `filt_on` / `int_filt_on`
   bools in settings (not in `KEYS`); stage values are written only while the switch is on (else [0, 0, 0, 0]).
-- **Ramp mode shows `ramp_periods` (default 4) periods per trace**, triggered on asg0 (user: successive up/down
-  sweeps differ by hysteresis, a one-period trace jumped between them). Longer than the scope's longest duration →
-  clipped and logged. X–Y signal angle displayed only (no phase extraction). Offset ±1/±10 mV buttons + typed path.
-- Probes A/B (in1, iq2, iq2_2, pid0, asg0, out1, in2, pid2, out2): reuse the main captures, else one extra capture
-  every `probe_every` frames.
 - Lock modes ramp / dc / pi / off; intensity `int_on`. Start-up: each PI adopted untouched if running with gains,
   else lock → ramp, intensity → off (OUT2 = 0 V).
 - Run: `python app\lockin_pi_app.py --host rp-f0fa92.local` → http://127.0.0.1:8085 (`lockin_pi_settings.json`).
 - Fake: with `FAKE_LOCKIN=iq2` and the PZT on out1, pid0 is a full P + I on X or Y (`eng.p_out`); the AOM on OUT2.
-- Tests: `test/test_lockin_pi.py` (35: schematic homes, 4 ramp periods, legacy keys, phase by hand, lock with raw gains,
-  typed values never rewritten, drift, filter switches, X/Y input, intensity lock/setpoint/filter/input, restart
-  adoption, diagram state, write log), `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (32).
+  Scope: `traces(..., delay=)` honours trigger_delay for asg triggers; ch1/ch2 edge triggers (level + hysteresis)
+  cut the window around the first crossing; ext triggers never fire; `_start_acquisition_rolling_mode` /
+  `_get_rolling_curve` (the last `duration`, NaN before the start).
+- Tests: `test/test_lockin_pi.py` (44: scope defaults, asg0 trigger at t = 0, writes only on change, > 8 traces/s
+  free running, rolling at the browser rate, edge trigger at the level, waiting + commands served, Stop, probe →
+  channel, phase by hand, lock point from triggered traces, raw gains, typed values never rewritten, filters, X/Y,
+  intensity, restart adoption, write log), `serve_lockin_pi.py` (port 8086) + `ui_lockin_pi.py` (29: views/dots,
+  every parameter and scope setting visible, scope dropdowns, ranges, XY, R, rolling, waiting, RUN/STOP, probes).
 
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
