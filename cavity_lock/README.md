@@ -33,8 +33,9 @@ IN1 and OUT1 (ramp: vs time or IN1 vs OUT1). Run: `python app\pi_app.py --host r
 Lock on IN1/OUT1: dual-phase lock-in on `iq2` (X and Y, phase set by hand), raw PI (`pid0`, input X or Y), ramp /
 offset (`asg0`), dither on OUT1. Intensity on OUT2: raw PI (`pid2`, input IN2 by default, IN1 selectable). Each PI
 has raw P, I, setpoint, output clamps and a 4-stage input filter switched by its Filter toggle (off by default).
-Schematic diagram with switches; P and I are PyRPL's pid.p / pid.i as typed (never rewritten); the ramp
-view shows 4 periods. Nothing is calculated for you. Run: `python app\lockin_pi_app.py --host rp-f0fa92.local`.
+Lock and Intensity views (schematics with switches, like the cavity app); P and I are PyRPL's pid.p / pid.i as
+typed (never rewritten); one scope panel with every setting visible (channels, timebase, trigger, level,
+hysteresis, delay, averaging, rolling mode, ranges, XY, R); one capture per frame. Nothing is calculated for you. Run: `python app\lockin_pi_app.py --host rp-f0fa92.local`.
 
 ### Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, port 8065)
 Same wiring and workflow, but the demodulation is a dual-quadrature lock-in on `iq2` (the only PyRPL IQ module with

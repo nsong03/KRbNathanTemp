@@ -70,49 +70,96 @@ def fresh(n=2):
         time.sleep(0.05)
 
 
-fresh()
-tr = ctl.trace
-per = tr["t"][-1] * ctl.s["ramp_hz"]
-o = tr["out1"] - np.mean(tr["out1"])
-nb = len(o) // 200 * 200
-ob = o[:nb].reshape(200, -1).mean(axis=1)               # 200 bins: averages out the dither
-turns = int(np.sum(np.diff(np.sign(np.diff(ob))[2:-2]) != 0))
-check("ramp trace shows 4 ramp periods (default), triggered", ctl.s["ramp_periods"] == 4 and 3.95 < per < 4.05
-      and 6 <= turns <= 9, f"{per:.2f} periods, {turns} turning points")
+def scope(**kw):
+    apply(**kw)
+    fresh(2)
+    return ctl.trace
+
+
+print("--- scope: one capture per frame, the user's settings")
+tr = scope()
+s_ = ctl.s
+check("default scope: CH1 in1, CH2 iq2, triggered on asg0, 268 ms, trace from the trigger",
+      (tr["n1"], tr["n2"], tr["kind"]) == ("in1", "iq2", "triggered") and abs(s_["sc_duration"] - 0.268435456) < 1e-9
+      and abs(tr["t"][0]) < 1e-9 and abs(tr["t"][-1] - 0.268) < 0.001, f"t {tr['t'][0]:.4f}..{tr['t'][-1]:.4f}")
+o = win(["asg0"], 0.001)[0]
+tr = scope(sc_ch1="out1", sc_ch2="asg0")
+per = (tr["t"][-1] - tr["t"][0]) * ctl.s["ramp_hz"]
+check("asg0 trigger: the ramp starts at t = 0 of every trace", abs(tr["c2"][0] - (r.asg0.offset - r.asg0.amplitude))
+      < 0.01 and 5.3 < per < 5.4, f"asg0 at t=0: {tr['c2'][0]*1e3:+.1f} mV, {per:.2f} periods")
 d = {"i_hz": 3.3, "int_i_hz": 44.0, "p": 0.5, "bogus": 1}
 ld = E.load_settings(d)
 check("old settings files: i_hz / int_i_hz load as i / int_i, values unchanged", ld == {"i": 3.3, "int_i": 44.0,
                                                                                       "p": 0.5}, str(ld))
-apply(ramp_hz=5.0, ramp_periods=1)                     # slow ramp, one period: the lock-point analysis below
-fresh()
-apply(phase_deg=F.PZT_LAG_DEG + 60)
-fresh()
-tr = ctl.trace
+n0 = len([w for w in F.WRITES if w[1] == "scope"])
+time.sleep(2.0)
+n1 = len([w for w in F.WRITES if w[1] == "scope"])
+check("scope settings are written only when they change (not per frame)", n1 == n0, f"{n1 - n0} writes in 2 s")
+tr = scope(sc_trigger="immediately", sc_duration=E.DURATIONS[8], sc_ch1="in1", sc_ch2="iq2")
+q0, t0 = ctl.seq, time.time()
+time.sleep(2.0)
+rate = (ctl.seq - q0) / (time.time() - t0)
+check("free running 33.6 ms traces: > 8 traces/s (one capture per frame)", rate > 8 and tr["kind"] == "free",
+      f"{rate:.1f}/s")
+tr = scope(sc_duration=E.DURATIONS[13], sc_rolling="on")
+q0, t0 = ctl.seq, time.time()
+time.sleep(2.0)
+rate = (ctl.seq - q0) / (time.time() - t0)
+check("rolling mode, 1.07 s window: refreshed at the browser rate (live), times up to now", ctl.trace["kind"] == "rolling"
+      and rate > 7 and abs(ctl.trace["t"][-1]) < 0.001 and abs(ctl.trace["t"][0] + 1.07) < 0.01, f"{rate:.1f}/s")
+apply(sc_rolling="off")
+tr = scope(sc_ch1="out1", sc_ch2="iq2", sc_trigger="ch1_positive_edge", sc_threshold_mv=round(r.asg0.offset * 1e3, 1),
+           sc_hysteresis_mv=20.0, sc_duration=E.DURATIONS[11], sc_delay_ms=0.0)
+k0 = int(np.argmin(np.abs(tr["t"])))
+sm = np.convolve(tr["c1"], np.ones(301) / 301, mode="same")
+check("edge trigger on CH1 at the level, delay 0: the crossing is in the middle (t = 0)", tr["kind"] == "triggered"
+      and abs(sm[k0] - ctl.s["sc_threshold_mv"] * 1e-3) < 0.02 and sm[k0 + 400] > sm[k0 - 400],
+      f"CH1 at t=0 {sm[k0]*1e3:+.1f} mV vs level {ctl.s['sc_threshold_mv']:+.1f}")
+apply(sc_trigger="ext_positive_edge")
+time.sleep(1.5)
+t_cmd = time.time()
+apply(dither_mvpp=31.0)
+check("no trigger: WAITING FOR TRIGGER shown, and commands are still served", ctl.snapshot()["waiting"]
+      and abs(r.iq2.amplitude - 0.0155) < 1e-9 and time.time() - t_cmd < 2.0)
+apply(dither_mvpp=30.0)
+ctl.submit("scope_run", False); idle()
+q0 = ctl.seq
+time.sleep(0.8)
+check("Stop: no new traces", ctl.seq == q0 and not ctl.scope_run)
+ctl.submit("scope_run", True); idle()
+ctl.submit("probe", "iq2_2"); idle()
+check("probe click puts the signal on a scope channel", "iq2_2" in (ctl.s["sc_ch1"], ctl.s["sc_ch2"]))
+print("--- lock-in (phase by hand) and the lock point from triggered ramp traces")
+apply(ramp_hz=5.0)
+tr = scope(sc_ch1="iq2", sc_ch2="iq2_2", sc_trigger="asg0", sc_duration=E.DURATIONS[12], sc_delay_ms=0.0,
+           phase_deg=F.PZT_LAG_DEG + 60)
 th0 = ctl.snapshot()["theta"]
-check("ramp frame: IN1, OUT1, X and Y; signal angle shown (display only)", tr["kind"] == "ramp" and len(tr["y"]) ==
-      len(tr["x"]) and np.ptp(tr["y"]) > 0.3 * np.ptp(tr["x"]) and th0 is not None and th0["q"] > 10,
-      f"X pp {np.ptp(tr['x']):.3f}, Y pp {np.ptp(tr['y']):.3f}, theta {th0}")
+check("X and Y on the scope: signal angle shown (display only)", th0 is not None and th0["q"] > 10
+      and abs(th0["theta"] - 60) < 3, str(th0))
 check("the phase is not touched by the app", abs(r.iq2.phase - (F.PZT_LAG_DEG + 60)) < 1e-9)
-apply(phase_deg=F.PZT_LAG_DEG)                         # by hand: the whole signal in X
-fresh()
-tr = ctl.trace
-check("phase set by hand: Y ~ 0, the signal in X", np.ptp(tr["y"]) < 0.1 * np.ptp(tr["x"]),
-      f"X pp {np.ptp(tr['x']):.3f}, Y pp {np.ptp(tr['y']):.3f}")
-# lock point from the ramp data, found by the cavity app's sweep analysis (test side only; the app derives nothing)
+tr = scope(phase_deg=F.PZT_LAG_DEG)                    # by hand: the whole signal in X
+check("phase set by hand: Y ~ 0, the signal in X", np.ptp(tr["c2"]) < 0.1 * np.ptp(tr["c1"]),
+      f"X pp {np.ptp(tr['c1']):.3f}, Y pp {np.ptp(tr['c2']):.3f}")
+# lock point (test side only; the app derives nothing): triggered on asg0, so captures line up
+dur = 1.0 / ctl.s["ramp_hz"]
+tA = scope(sc_ch1="out1", sc_ch2="iq2", sc_delay_ms=round(E.DURATIONS[12] / 2 * 1e3, 6))
+tB = scope(sc_ch1="in1", sc_ch2="out1")
+n = int(np.searchsorted(tA["t"], dur * 0.999))
 import cavity_lock_app as CL
-o = tr["out1"]
+o = tA["c1"][:n]
 k = max(3, len(o) // 200)
 sm = np.convolve(np.pad(o, k, mode="edge"), np.ones(k) / k, mode="same")[k:-k]
 s_ = ctl.s
-an = CL.analyze_sweep(dict(t=tr["t"], v=sm, pd=tr["pd"], err=tr["x"], up=np.gradient(sm) > 0),
+an = CL.analyze_sweep(dict(t=tA["t"][:n], v=sm, pd=tB["c1"][:n], err=tA["c2"][:n], up=np.gradient(sm) > 0),
                       dict(prominence=0.1, target_mv=None, rate=2 * s_["ramp_mvpp"] * 1e-3 * s_["ramp_hz"],
                            lpf_hz=s_["lpf_hz"], lpf_order=s_["lpf_order"], dither_hz=s_["dither_hz"],
                            dither_mvpp=s_["dither_mvpp"], kappa=None, ramp_hz=s_["ramp_hz"],
                            ramp_mvpp=s_["ramp_mvpp"]))
 v0, S = an["v0"], an["slope"]
 pk = an["peaks"][an["target"]]["height"]
-check("lock point found in the ramp data (within the low-pass lag of the ramp)", abs(v0 - eng.vc) < 0.004, f"{v0*1e3:+.2f} vs {eng.vc*1e3:+.2f} mV, "
-      f"slope {S:+.1f} V/V")
+check("lock point found in the ramp data (within the low-pass lag of the ramp)", abs(v0 - eng.vc) < 0.004,
+      f"{v0*1e3:+.2f} vs {eng.vc*1e3:+.2f} mV, slope {S:+.1f} V/V")
+apply(sc_trigger="immediately", sc_duration=E.DURATIONS[8])
 sw("ramp", False)
 check("Ramp off: offset + dither, PI off", ctl.mode == "dc" and r.asg0.amplitude == 0 and r.iq2.output_direct == "out1")
 p_typed, i_typed = round(-0.1 / S, 5), round(-10.0 / S, 4)
@@ -197,9 +244,9 @@ check("lock Output off: OUT1 = 0 V, intensity untouched", ctl.mode == "off" and 
 sw("int_on", False)
 check("intensity servo off: OUT2 = 0 V", r.pid2.output_direct == "off" and np.allclose(win(["out2"], 0.001)[0], 0,
                                                                                          atol=1e-9))
-dg = LS.diagram_state(ctl.snapshot(), ctl.switches())
-check("diagram state: every block has readback text, all switches present", set(dg["boxes"]) == {b["id"] for b in
-      LS.BLOCKS} and set(dg["sw"]) == {x["id"] for x in LS.SWITCHES})
+dl, di = LS.diagram_state(ctl.snapshot(), ctl.switches())
+check("diagram state: every block has readback text, all switches present", set(dl["boxes"]) | set(di["boxes"])
+      == {b["id"] for b in LS.BLOCKS} and set(dl["sw"]) | set(di["sw"]) == {x["id"] for x in LS.SWITCHES})
 stop2.set()
 mine = [w for w in F.WRITES if w[4] == "lockin_pi_app.py"]
 check("writes only iq2, pid0, pid2, asg0, scope", {w[1] for w in mine} <= {"iq2", "pid0", "pid2", "asg0", "scope"},

@@ -508,7 +508,7 @@ class Engine:
         return y[npre:], out[npre:]
 
     # scope traces
-    def traces(self, names, duration, trigger, t_start=None):
+    def traces(self, names, duration, trigger, t_start=None, delay=None):
         """Scope data. Triggered on asg0/asg1: computed analytically. Untriggered: the recorded window
         [t_start, t_start + duration] of the simulation (the real scope records after it is armed).
         Intensity signals (in2, pid2, out2, asg1) come from the AOM model for the same window."""
@@ -516,6 +516,8 @@ class Engine:
         trel = np.arange(n) * duration / n
         if self.plant == "errin":
             return self.traces_errin(names, duration, trigger, t_start, n, trel)
+        if delay is not None and trigger in ("asg0", "asg1"):
+            trel = trel + (delay - duration / 2)          # PyRPL: trigger_delay = trace centre after the trigger
         li = self.li_name
         cav_names = {"in1", li, li + "_2", "asg0", "pid0", "out1", "iq1", "pid1"}
         with self.lock:
@@ -526,7 +528,7 @@ class Engine:
                 g = asg if trigger == "asg0" else self.rp.asg1
                 per = 1 / g.frequency
                 t0 = g.t0 + math.ceil((now - g.t0) / per) * per
-                ready_at = t0 + duration
+                ready_at = t0 + float(trel[-1])
             else:
                 t0 = None
                 ready_at = now + duration          # an untriggered trace still takes its duration to record
@@ -625,7 +627,8 @@ class Scope:
         object.__setattr__(self, "eng", eng)
         for k, v in dict(input1="in1", input2="in2", duration=self.durations[10], trigger_source="immediately",
                          trigger_delay=0.0, average=True, rolling_mode=False, _data=None, _ready_at=0.0,
-                         _arm=None).items():
+                         _arm=None, threshold=0.0, hysteresis=0.01, ch1_active=True, ch2_active=True,
+                         _edge=None, _rolling_t0=None).items():
             object.__setattr__(self, k, v)
 
     _name = "scope"
@@ -648,12 +651,25 @@ class Scope:
     def _start_acquisition(self):
         lan()
         object.__setattr__(self, "_data", None)
+        object.__setattr__(self, "_edge", None)
         if self.trigger_source == "immediately":       # record from now on; read out when complete
             object.__setattr__(self, "_arm", (self.eng.t, [self.input1, self.input2], self.duration))
             object.__setattr__(self, "_ready_at", time.time() + self.duration)
             return
+        if self.trigger_source.startswith(("ch1_", "ch2_")):
+            # edge trigger: record 2 trace lengths from now, then find the first crossing of the level (with
+            # hysteresis) on that channel and cut the window around it (trigger_delay = trace centre after it)
+            object.__setattr__(self, "_arm", (self.eng.t, [self.input1, self.input2], self.duration))
+            object.__setattr__(self, "_edge", self.trigger_source)
+            object.__setattr__(self, "_ready_at", time.time() + 2.5 * self.duration + abs(self.trigger_delay))
+            return
+        if self.trigger_source.startswith("ext_"):    # nothing on the external trigger input of the fake
+            object.__setattr__(self, "_arm", None)
+            object.__setattr__(self, "_ready_at", float("inf"))
+            return
         object.__setattr__(self, "_arm", None)
-        d, r = self.eng.traces([self.input1, self.input2], self.duration, self.trigger_source)
+        d, r = self.eng.traces([self.input1, self.input2], self.duration, self.trigger_source,
+                               delay=self.trigger_delay)
         object.__setattr__(self, "_data", d)
         object.__setattr__(self, "_ready_at", r)
 
@@ -662,6 +678,35 @@ class Scope:
         return time.time() >= self._ready_at
 
     def _get_curve(self):
+        if self._data is None and self._arm is not None and self._edge:
+            t0, names, dur = self._arm
+            span = 2.5 * dur + abs(self.trigger_delay)
+            while self.eng.t < t0 + span:
+                time.sleep(0.001)
+            d, _ = self.eng.traces(names, span, "immediately", t_start=t0)
+            n = len(d[0])
+            y = np.asarray(d[0 if self._edge.startswith("ch1") else 1])
+            lv, hy = self.threshold, abs(self.hysteresis)
+            pos = self._edge.endswith("positive_edge")
+            k0 = int(n * (dur / span))                  # leave room for the pre-trigger part
+            below = (y < lv - hy) if pos else (y > lv + hy)
+            cross = (y >= lv) if pos else (y <= lv)
+            k_trig = None
+            armed = False
+            for k in range(k0, n):
+                if below[k]:
+                    armed = True
+                elif armed and cross[k]:
+                    k_trig = k
+                    break
+            m = 2 ** 14
+            if k_trig is None:                           # no trigger: the real scope would keep waiting
+                k_trig = k0
+            dt = span / n
+            start = k_trig + int(round((self.trigger_delay - dur / 2) / dt))
+            idx = np.clip(start + np.arange(m) * (dur / m) / dt, 0, n - 1)
+            data = [np.interp(idx, np.arange(n), np.asarray(ch)) for ch in d]
+            object.__setattr__(self, "_data", data)
         if self._data is None and self._arm is not None:
             t0, names, dur = self._arm
             while self.eng.t < t0 + dur:                 # the simulation may run a few ms behind the clock
@@ -669,6 +714,23 @@ class Scope:
             d, _ = self.eng.traces(names, dur, "immediately", t_start=t0)
             object.__setattr__(self, "_data", d)
         return np.array(self._data)
+
+    def _start_acquisition_rolling_mode(self):
+        lan()
+        object.__setattr__(self, "_rolling_t0", self.eng.t)
+
+    def _get_rolling_curve(self):
+        """The last `duration` of both inputs, times from -duration to 0 (PyRPL's rolling-mode read)."""
+        lan(); lan()
+        dur = self.duration
+        t_end = self.eng.t
+        d, _ = self.eng.traces([self.input1, self.input2], dur, "immediately", t_start=t_end - dur)
+        n = len(d[0])
+        times = np.linspace(-dur, 0, n, endpoint=False)
+        data = np.array(d, dtype=float)
+        if self._rolling_t0 is not None and t_end - self._rolling_t0 < dur:     # not filled yet since the start
+            data[:, times < -(t_end - self._rolling_t0)] = np.nan
+        return times, data
 
     _start_trace_acquisition = _start_acquisition         # PyRPL 0.9.9 names
     _get_trace = _get_curve

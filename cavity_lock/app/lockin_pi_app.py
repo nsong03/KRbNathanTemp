@@ -18,8 +18,11 @@ INTENSITY (-> OUT2)
 The filters in front of each PI (4 first-order stages: > 0 low-pass, < 0 high-pass, 0 off) are switched on and off
 with their Filter toggles; they are off by default. Typed values are never rewritten: what the FPGA really uses
 (rounded p, i, filter corners) is shown in the diagram's readback text.
-Ramp mode shows 4 ramp periods per trace (triggered on the ramp), so hysteresis between successive up/down sweeps is
-visible instead of making the trigger jump between them.
+SCOPE: one hardware scope, every setting in the scope panel (channels, timebase, trigger source / threshold /
+hysteresis / delay, averaging, rolling mode, y ranges, XY / R). The controller takes ONE capture per frame with those
+settings, armed without blocking (commands are served while it waits for a trigger), so the frame rate is set by the
+timebase: trace length + readout (~2 x 16384 samples over the LAN), not by extra captures. Rolling mode (trigger
+immediately, timebase > 0.1 s) reads the running buffer every frame: a live chart recorder.
 
 Run (close the other apps first: one owner per Red Pitaya)
   pip install "dash>=2.9" scipy
@@ -44,6 +47,10 @@ from errsig2ph_app import xy_theta          # display only: the signal angle in 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(HERE, "lockin_pi_settings.json")
 LIM = 1.0
+SCOPE_SIGNALS = ["in1", "in2", "iq2", "iq2_2", "pid0", "pid2", "asg0", "asg1", "out1", "out2"]
+DURATIONS = [8e-9 * 2 ** k * 2 ** 14 for k in range(17)]      # PyRPL 0.9.9.1 scope.durations (decimation 2^k)
+TRIGGERS = ["immediately", "asg0", "asg1", "ch1_positive_edge", "ch1_negative_edge", "ch2_positive_edge",
+            "ch2_negative_edge", "ext_positive_edge", "ext_negative_edge"]
 
 FIELDS = [   # key, label, default, group, kind, options
     # lock-in (iq2)
@@ -83,19 +90,28 @@ FIELDS = [   # key, label, default, group, kind, options
     ("int_filt2_hz", "Filter stage 2 [Hz]", 0.0, "Intensity filter", "num", {}),
     ("int_filt3_hz", "Filter stage 3 [Hz]", 0.0, "Intensity filter", "num", {}),
     ("int_filt4_hz", "Filter stage 4 [Hz]", 0.0, "Intensity filter", "num", {}),
-    # scope
-    ("live_ms", "Lock live trace [ms]", 20.0, "Scope", "num", {"min": 0.1}),
-    ("int_live_ms", "Intensity live trace [ms]", 5.0, "Scope", "num", {"min": 0.01}),
-    ("xaxis", "Ramp plot x axis", "time", "Scope", "select", {"options": ["time", "OUT1"]}),
-    ("ramp_periods", "Ramp periods per trace", 4, "Scope", "num", {"min": 1, "max": 16}),
+    # scope (all settings in the scope panel)
+    ("sc_ch1", "CH1", "in1", "Scope", "select", {"options": SCOPE_SIGNALS}),
+    ("sc_ch2", "CH2", "iq2", "Scope", "select", {"options": SCOPE_SIGNALS}),
+    ("sc_duration", "Timebase (trace length)", DURATIONS[11], "Scope", "select", {"options": DURATIONS}),
+    ("sc_trigger", "Trigger source", "asg0", "Scope", "select", {"options": TRIGGERS}),
+    ("sc_threshold_mv", "Trigger level [mV]", 0.0, "Scope", "num", {}),
+    ("sc_hysteresis_mv", "Trigger hysteresis [mV]", 10.0, "Scope", "num", {"min": 0}),
+    ("sc_delay_ms", "Trigger delay [ms] (PyRPL: trace centre after the trigger)", DURATIONS[11] / 2 * 1e3, "Scope",
+     "num", {}),
+    ("sc_average", "Averaging in the decimation", "on", "Scope", "select", {"options": ["on", "off"]}),
+    ("sc_rolling", "Rolling mode", "off", "Scope", "select", {"options": ["off", "on"]}),
+    ("sc_view", "Display", "time", "Scope", "select", {"options": ["time", "XY"]}),
+    ("sc_math", "Math", "none", "Scope", "select", {"options": ["none", "R"]}),
+    ("sc_ch1_min_mv", "CH1 y min [mV] (empty = auto)", None, "Scope", "num", {}),
+    ("sc_ch1_max_mv", "CH1 y max [mV] (empty = auto)", None, "Scope", "num", {}),
+    ("sc_ch2_min_mv", "CH2 y min [mV] (empty = auto)", None, "Scope", "num", {}),
+    ("sc_ch2_max_mv", "CH2 y max [mV] (empty = auto)", None, "Scope", "num", {}),
     ("ui_hz", "Browser refresh [Hz]", 10.0, "Scope", "num", {"min": 1, "max": 30}),
-    ("probe_every", "Probe capture every N frames", 3, "Scope", "num", {"min": 1, "max": 100}),
-    ("probe_a", "Probe A", "off", "Scope", "select", {"options": ["in1", "iq2", "iq2_2", "pid0", "asg0", "out1",
-                                                                  "in2", "pid2", "out2", "off"]}),
-    ("probe_b", "Probe B", "off", "Scope", "select", {"options": ["in1", "iq2", "iq2_2", "pid0", "asg0", "out1",
-                                                                  "in2", "pid2", "out2", "off"]}),
 ]
 LEGACY = {"i_hz": "i", "int_i_hz": "int_i"}            # keys of the first version's settings files
+SCOPE_HW_KEYS = {"sc_ch1", "sc_ch2", "sc_duration", "sc_trigger", "sc_threshold_mv", "sc_hysteresis_mv",
+                 "sc_delay_ms", "sc_average", "sc_rolling"}
 
 
 def load_settings(d):
@@ -137,10 +153,11 @@ class LockinPIController:
         self.fps = 0.0
         self._t_last = None
         self._scope_cfg = {}
-        self.probe = None
-        self._probe_last = "b"
-        self._frames = 0
-        self._long_msg = None
+        self._probe_last = 2
+        self._armed = None               # (settings tuple, arm time) while a capture is armed
+        self._rolling = None             # settings tuple while rolling mode runs
+        self.waiting = False             # armed, trace time over, no trigger yet
+        self.scope_run = True
         self.log(f"connecting to {host} ...")
         from pyrpl import Pyrpl
         self.p = Pyrpl(config=config, hostname=host, gui=False)
@@ -188,7 +205,7 @@ class LockinPIController:
             return dict(mode=self.mode, trace=self.trace, itrace=self.itrace, logs=list(self.logs),
                         settings=dict(self.s), version=self.version, seq=self.seq, hw=dict(self.hw), ival=self.ival,
                         int_ival=self.int_ival, fps=self.fps, int_on=self.int_on, dither_on=self.dither_on,
-                        theta=self.theta, probe=self.probe)
+                        theta=self.theta, waiting=self.waiting, scope_run=self.scope_run)
 
     def switches(self):
         return dict(output=self.mode != "off", ramp=self.mode == "ramp", pi=self.mode == "pi",
@@ -361,78 +378,78 @@ class LockinPIController:
             self.int_on = False
             self.log("intensity PI OFF: OUT2 = 0 V")
 
-    # ---- scope ----
-    def _ramp_window(self):
+    # ---- scope: one capture per frame, the user's settings, armed without blocking ----
+    def _scope_cfg_now(self):
         s = self.s
-        want = max(int(s["ramp_periods"]), 1) / s["ramp_hz"]
-        opts = sorted(getattr(self.r.scope, "durations", []) or [])
-        if opts and want > opts[-1] * 1.0001:
-            if self._long_msg != want:
-                self.log(f"{int(s['ramp_periods'])} ramp periods ({want:.2f} s) are longer than the scope's longest "
-                         f"trace ({opts[-1]:.2f} s): showing {opts[-1]*s['ramp_hz']:.2f} periods")
-                self._long_msg = want
-            return opts[-1]
-        return want
+        return (s["sc_ch1"], s["sc_ch2"], float(s["sc_duration"]), s["sc_trigger"], float(s["sc_threshold_mv"]),
+                float(s["sc_hysteresis_mv"]), float(s["sc_delay_ms"]), s["sc_average"], s["sc_rolling"])
 
-    def _probe_frame(self, have, dur, trigger):
-        """Probes A/B: reuse a main capture when both signals are in it, else one extra capture every
-        probe_every frames."""
-        s = self.s
-        a, b = s["probe_a"], s["probe_b"]
-        real = [x for x in (a, b) if x != "off"]
-        if not real:
-            return None
-        if all(x in have for x in real):
-            return dict(t=have["t"], a=have.get(a), b=have.get(b), a_name=a, b_name=b)
-        if self._frames % max(int(s["probe_every"]), 1) and self.probe is not None and \
-                (self.probe.get("a_name"), self.probe.get("b_name")) == (a, b):
-            return self.probe
-        t, ya, yb = self.capture(a if a != "off" else real[0], b if b != "off" else real[0], dur, trigger)
-        return dict(t=t, a=None if a == "off" else ya, b=None if b == "off" else yb, a_name=a, b_name=b)
+    def _write_scope(self, cfg):
+        c1, c2, dur, trig, thr, hys, dly, avg, _ = cfg
+        sc = self.r.scope
+        self._scope_set(sc, input1=c1, input2=c2, duration=dur, average=avg == "on", rolling_mode=False)
+        for k, v in (("threshold", thr * 1e-3), ("hysteresis", hys * 1e-3)):
+            try:
+                self._scope_set(sc, **{k: v})
+            except Exception:
+                pass
+        self._scope_set(sc, trigger_source=trig)
+        if trig != "immediately":
+            self._scope_set(sc, trigger_delay=dly * 1e-3)
 
-    def _toggle_probe(self, sig):
-        s = self.s
-        a, b = s["probe_a"], s["probe_b"]
-        if sig == a:
-            a = "off"
-        elif sig == b:
-            b = "off"
-        elif a == "off":
-            a, self._probe_last = sig, "a"
-        elif b == "off":
-            b, self._probe_last = sig, "b"
-        elif self._probe_last == "b":
-            a, self._probe_last = sig, "a"
-        else:
-            b, self._probe_last = sig, "b"
-        s["probe_a"], s["probe_b"] = a, b
-        self.version += 1
-        self.log(f"probes: A = {a}, B = {b}")
+    def _rolling_ok(self, cfg):
+        return cfg[8] == "on" and cfg[3] == "immediately" and cfg[2] > 0.1
 
     def _tick(self):
-        s = self.s
-        self._frames += 1
-        if self.mode == "ramp":
-            dur = self._ramp_window()
-            trig = "asg0"
-            t, pd, o = self.capture("in1", "out1", dur, trigger=trig)
-            _, x, y = self.capture("iq2", "iq2_2", dur, trigger=trig)
-            n = min(int(np.searchsorted(t, dur * 0.9999)), len(x))
-            t, pd, o, x, y = t[:n], pd[:n], o[:n], x[:n], y[:n]
-            kind = "ramp"
-            th, q = xy_theta(x, y)
-            theta = dict(theta=th, q=q) if th is not None else None
+        if not self.scope_run:
+            self._armed = self._rolling = None
+            time.sleep(0.05)
+            return
+        cfg = self._scope_cfg_now()
+        sc = self.r.scope
+        if self._rolling_ok(cfg):
+            if self._rolling != cfg:
+                self._write_scope(cfg)
+                sc._start_acquisition_rolling_mode()
+                self._rolling, self._armed = cfg, None
+            t0 = time.time()
+            t, data = sc._get_rolling_curve()
+            self._frame(np.asarray(t, float), np.asarray(data[0], float), np.asarray(data[1], float), "rolling", cfg)
+            time.sleep(max(0.0, 1.0 / max(float(self.s["ui_hz"]), 1) - (time.time() - t0)))
+            return
+        self._rolling = None
+        if self._armed is None or self._armed[0] != cfg:
+            self._write_scope(cfg)
+            start = getattr(sc, "_start_trace_acquisition", None) or getattr(sc, "_start_acquisition")
+            start()
+            self._armed = (cfg, time.time())
+        dur = cfg[2]
+        left = dur - (time.time() - self._armed[1])
+        if left > 0:
+            time.sleep(min(left, 0.05))                # keep serving commands during long traces
+            return
+        if not sc.curve_ready():
+            self.waiting = time.time() - self._armed[1] > dur + 0.25
+            time.sleep(0.002 if not self.waiting else 0.02)
+            return
+        self.waiting = False
+        read = getattr(sc, "_get_trace", None) or getattr(sc, "_get_curve")
+        data = np.array(read())
+        self._armed = None
+        n = data.shape[-1]
+        if cfg[3] == "immediately":
+            t = np.arange(n) * dur / n
         else:
-            dur = s["live_ms"] * 1e-3
-            trig = "immediately"
-            t, pd, o = self.capture("in1", "out1", dur)
-            _, x, y = self.capture("iq2", "iq2_2", dur)
-            kind = "live"
-            theta = None
-        ti, vi, oi = self.capture(s["int_input"], "out2", s["int_live_ms"] * 1e-3)
-        it = dict(t=ti, inp=vi, out2=oi)
-        have = {"t": t, "in1": pd, "out1": o, "iq2": x, "iq2_2": y}
-        probe = self._probe_frame(have, dur, trig)
+            t = cfg[6] * 1e-3 - dur / 2 + np.arange(n) * dur / n      # PyRPL scope.times: relative to the trigger
+        self._frame(t, data[0], data[1], "triggered" if cfg[3] != "immediately" else "free", cfg)
+
+    def _frame(self, t, c1, c2, kind, cfg):
+        th = None
+        if {cfg[0], cfg[1]} == {"iq2", "iq2_2"}:
+            x, y = (c1, c2) if cfg[0] == "iq2" else (c2, c1)
+            ok = np.isfinite(x) & np.isfinite(y)
+            a, q = xy_theta(x[ok], y[ok])
+            th = dict(theta=a, q=q) if a is not None else None
         iv = jv = None
         try:
             if self.mode == "pi":
@@ -443,17 +460,24 @@ class LockinPIController:
             pass
         now = time.time()
         with self._lock:
-            self.trace = dict(kind=kind, t=t, pd=pd, out1=o, x=x, y=y)
-            self.itrace = it
-            self.probe = probe
-            self.ival, self.int_ival, self.theta = iv, jv, theta
+            self.trace = dict(kind=kind, t=t, c1=c1, c2=c2, n1=cfg[0], n2=cfg[1])
+            self.ival, self.int_ival, self.theta = iv, jv, th
             self.seq += 1
             if self._t_last:
                 dt = max(now - self._t_last, 1e-3)
                 self.fps = 0.8 * self.fps + 0.2 / dt if self.fps else 1 / dt
             self._t_last = now
-        if kind == "live":
-            time.sleep(0.02)
+
+    def _probe_to_channel(self, sig):
+        """A diagram probe click puts that signal on a scope channel (alternating CH1 / CH2)."""
+        s = self.s
+        if sig in (s["sc_ch1"], s["sc_ch2"]):
+            return
+        ch = 1 if self._probe_last == 2 else 2
+        s[f"sc_ch{ch}"] = sig
+        self._probe_last = ch
+        self.version += 1
+        self.log(f"scope: CH1 = {s['sc_ch1']}, CH2 = {s['sc_ch2']}")
 
     # ---- main loop ----
     def run(self, stop_event):
@@ -498,13 +522,17 @@ class LockinPIController:
                 self._write_asg()
             if changed & INT_KEYS:
                 self._write_int()
-            if changed - {"ui_hz", "xaxis", "live_ms", "int_live_ms", "ramp_periods", "probe_every", "probe_a",
-                          "probe_b"}:
+            if changed - {"ui_hz", "sc_view", "sc_math", "sc_ch1_min_mv", "sc_ch1_max_mv", "sc_ch2_min_mv",
+                          "sc_ch2_max_mv"}:
                 self.log("applied: " + ", ".join(f"{k}={s[k]}" for k in sorted(changed)))
         elif cmd == "switch":
             self._switch(*arg)
         elif cmd == "probe":
-            self._toggle_probe(arg)
+            self._probe_to_channel(arg)
+        elif cmd == "scope_run":
+            self.scope_run = bool(arg)
+            self.waiting = False
+            self.log("scope " + ("running" if self.scope_run else "stopped"))
         elif cmd in ("offset", "offset_nudge"):
             v = float(arg) if cmd == "offset" else s["offset_mv"] + float(arg)
             v = round(max(min(v, 1000.0), -1000.0), 3)
