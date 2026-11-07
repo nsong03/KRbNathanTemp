@@ -188,6 +188,36 @@ stays as it is.
 - Tests: `test/test_lockin_pi2.py` (55, incl. PI routing and the pure-sine OUT1 check), `serve_lockin_pi2.py` (port 8096) + `ui_lockin_pi2.py`
   (36, incl. the P / I arrows: one step, hold ×2 per 0.5 s, zero crossing, keys, large-I single step; PI routing).
 
+## Fifth app: external-reference lock-in PI (`app/extref_app.py`, 2026-11-07)
+User: IN1 photodiode, IN2 = an external sine (5 Vpp) = the dither reference, two-phase lock-in for the error signal,
+error toggleable on OUT2, PI on the error (raw P / I, limiters), alignment ramp on OUT1; NO dither from the Red Pitaya
+(the external dither is summed with OUT1 outside). Keep the module design and displays of lockin_pi2_app.
+- **FPGA fact (PyRPL 0.9.9.1 source): an IQ module demodulates only against its own NCO; IN1 x IN2 is impossible.**
+  So: iq2 demodulates IN1 (X = iq2, Y = iq2_2) with its NCO at `ref_hz`, amplitude 0, output off. iq0 / iq1
+  (input in2, phases corr / corr + 90, outputs off, LP `ref_lpf_hz` x2) measure the reference phase vs the same NCO
+  (all three synchronized with `iq.synchronize_iqs()`). Software tracking (`_ref_service`, every 50 ms, also inside
+  scope waits): read `r.sampler.iq0 / iq1` (fallback `current_output_signal`), θ = atan2; hold θ at its first value by
+  shifting the phase register of iq0 / iq1 / iq2 by `corr` (gain 0.8 per step); the direction (`_sign`) is found once
+  by stepping iq0 / iq1 only by +30° (never iq2: a running lock is not disturbed); FLL `_fll`: every 3 s, drift
+  rate r > 5°/s → NCO += r / 360 Hz (direction `_fsign` flipped if it got worse). REF_MIN 2 mV demod level → "NO
+  REFERENCE". "Find f": scope trace of IN2 (≥ 200 periods, ≥ 8 points / period) → `measure_freq` (FFT peak +
+  half-trace phase advance) → ref_hz, NCO, sync. Start-up measures IN2 and only LOGS a mismatch (no auto change).
+  Track switch (`ref_track`, saved). IN2 must be on the HV jumper (5 Vpp clips on LV); `in2_scale` 20 is display only.
+- Modules: iq0, iq1, iq2, pid0 (PI on X / Y; PI → OUT1 summer exclusive with the ramp; PI → OUT2), pid1 (error →
+  OUT2: gain x X / Y + offset, clamp; I = 0; switch `eo_on`), asg0 (ramp / offset → out1). PI → OUT2 and Error → OUT2
+  are exclusive. pid2 / asg1 off. Single view (no intensity: IN2 / OUT2 are taken).
+- Files: `extref_app.py` (`ExtRefController`, own `capture` with the tracking in its waits), `extref_schematic.py`
+  (`LOCK` 1340×570), `extref_ui.py` (from lockin_pi2_ui; Find f button in the Reference box; status OUT1 / OUT2 /
+  REF). Port 8105, settings `extref_settings.json`, PyRPL config `extref_app`.
+- Fake: `FAKE_EXTREF=1` (+ `FAKE_LOCKIN=iq2`): external dither f_ext 1000.0137 Hz (`FAKE_F_EXT`), 30 mVpp at the
+  PZT, 0.25 Vpp at IN2; shared NCO phase model (`nco_phase`, `sync_ncos`), θ_ext; X / Y = cos / sin(phase − lag −
+  θ_ext) × LP attenuation at the beat; `ref_demod` for iq0 / iq1 (sampler, current_output_signal); in2 / iq0 / iq1 /
+  pid1 / out2 scope traces; OUT1 carries no dither.
+- Tests: `test/test_extref.py` (30: start-up, tracking locked with the 4.9°/s drift, X-Y angle fixed with tracking /
+  rotating without, Find f (frequency, 5.02 Vpp), 0.3 Hz pulled in by the FLL, phase by hand, lock with the external
+  dither, no dither on OUT1, error → OUT2 maths, exclusivity, restart adoption with iq2 phase moved < 5° only by the
+  tracking, write log), `serve_extref.py` (port 8106) + `ui_extref.py` (22).
+
 ## FPGA module allocation (keep it; enforced by `test/test_isolation.py`)
 | Module | Owner | Use |
 | --- | --- | --- |

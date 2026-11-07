@@ -44,6 +44,12 @@ visible view's scope is captured every frame. P and I have PyRPL's ↓/↑ arrow
 0.5 s when held). OUT1 summer = dither + ramp or offset + PI (Ramp and PI exclusive); "PI → OUT2" independently sends the
 PI to OUT2 (to tune it without closing the loop through OUT1; the intensity servo is off then). Run: `python app\lockin_pi2_app.py --host rp-f0fa92.local`.
 
+### External-reference lock-in PI (`app/extref_app.py`, port 8105)
+IN1 photodiode, IN2 your external dither sine (5 Vpp, HV jumper), no dither from the Red Pitaya. Dual-phase lock-in
+(iq2) whose oscillator is phase-locked in software to the IN2 sine (iq0 / iq1 measure it; "Find f" sets the
+frequency), raw PI to OUT1 (or OUT2) with limiters, error signal toggleable on OUT2, alignment ramp on OUT1.
+Run: `python app\extref_app.py --host rp-f0fa92.local`.
+
 ### Spin-off: 2-phase lock-in (`app/errsig2ph_app.py`, port 8065)
 Same wiring and workflow, but the demodulation is a dual-quadrature lock-in on `iq2` (the only PyRPL IQ module with
 both quadratures wired out): X = `iq2`, Y = `iq2_2`, shared low-pass (up to 4 stages) and gain. The scope shows X, Y
