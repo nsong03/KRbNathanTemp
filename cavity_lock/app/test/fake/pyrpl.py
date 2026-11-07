@@ -356,6 +356,15 @@ class Engine:
         # -2 E_PK / (KAPPA/2) at resonance; pid0 (input in1) is a full PI with its input filter; OUT1 = asg0 + pid0
         self.plant = os.environ.get("FAKE_PLANT", "cavity")
         self.pid_out, self.ifilt, self.p_out = 0.0, np.zeros(4), 0.0
+        # extref_app (FAKE_EXTREF=1, with FAKE_LOCKIN=iq2): the dither is EXTERNAL: a sine at f_ext (independent of
+        # the Red Pitaya clock) moves the PZT by ext_dpp and is fed into IN2 (ref_vpp at the FPGA: 5 Vpp / 20 on HV).
+        # The three IQ NCOs share one phase model (synchronize_iqs resets it); X / Y and the reference demodulation
+        # rotate with theta_ext = phase(external) - phase(NCO).
+        self.extref = os.environ.get("FAKE_EXTREF", "") == "1"
+        self.f_ext = float(os.environ.get("FAKE_F_EXT", "1000.0137"))
+        self.ext_dpp, self.ref_vpp, self.theta_e = 0.030, 0.25, 37.0
+        self.T0 = time.time()
+        self._nco_f, self._nco_t0, self._nco_ph0 = None, 0.0, 0.0
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
@@ -364,8 +373,44 @@ class Engine:
         return getattr(self.rp, self.li_name)
 
     def dither_pp(self):
+        if self.extref:
+            return self.ext_dpp
         iq = self.li
         return 2 * iq.amplitude * DITHER_SCALE if iq.output_direct in (self.pzt_out, "both") else 0.0
+
+    # ---- external reference model (extref) ----
+    def nco_phase(self, t):
+        """Shared NCO phase [deg] at time t (continuous through frequency changes; synchronize_iqs resets it)."""
+        f = float(self.rp.iq2.frequency)
+        tr = t - self.T0
+        if self._nco_f is None:
+            self._nco_f, self._nco_t0, self._nco_ph0 = f, tr, 0.0
+        if f != self._nco_f:
+            self._nco_ph0 += 360.0 * self._nco_f * (tr - self._nco_t0)
+            self._nco_f, self._nco_t0 = f, tr
+        return self._nco_ph0 + 360.0 * self._nco_f * (tr - self._nco_t0)
+
+    def sync_ncos(self):
+        self._nco_f, self._nco_t0, self._nco_ph0 = float(self.rp.iq2.frequency), time.time() - self.T0, 0.0
+
+    def theta_ext(self, t):
+        return (360.0 * self.f_ext * (t - self.T0) + self.theta_e - self.nco_phase(t)) % 360.0
+
+    def beat_att(self, iq):
+        """Low-pass attenuation of a demodulated signal that rotates at the frequency difference."""
+        df = abs(self.f_ext - float(iq.frequency))
+        g = 1.0
+        for b in [b for b in np.atleast_1d(iq.bandwidth) if b > 0]:
+            g /= math.sqrt(1 + (df / b) ** 2)
+        return g
+
+    def ref_demod(self, iq, t=None):
+        """iq0 / iq1 demodulating IN2 (the external reference): 0.5 x amplitude x cos(phase - theta_ext)."""
+        if iq.input != "in2":
+            return 0.0
+        th = self.theta_ext(time.time() if t is None else t)
+        a = 0.5 * self.ref_vpp / 2 * float(iq.quadrature_factor) * self.beat_att(iq)
+        return a * math.cos(math.radians(float(iq.phase) - th)) + 1e-5 * self.rng.standard_normal()
 
     def pd_avg(self, v):
         d = self.dither_pp() / 2
@@ -384,6 +429,9 @@ class Engine:
         iq = self.li
         c1 = sum(h * h1(2 * (np.atleast_1d(v) - (self.vc + off)) / KAPPA, m) for off, h in MODES)
         trig = math.sin if quad else math.cos
+        if self.extref:
+            ph = iq.phase - PZT_LAG_DEG - self.theta_ext(self.t)
+            return DEMOD_SCALE * iq.quadrature_factor * V_PK * c1 * trig(math.radians(ph)) * self.beat_att(iq)
         return DEMOD_SCALE * iq.quadrature_factor * V_PK * c1 * trig(math.radians(iq.phase - PZT_LAG_DEG))
 
     def lpf_coeffs(self, dt):
@@ -483,6 +531,24 @@ class Engine:
         if len(self.hist) > 40000:
             del self.hist[:20000]
 
+    def _extref_sig(self, sig, names, t0, trel, n):
+        """extref: IN2 = the external sine, iq0 / iq1 = its demodulation, pid1 / out2 = error output (+ PI)."""
+        rp, li = self.rp, self.li_name
+        tr = (t0 - self.T0) + np.asarray(trel)
+        sig["in2"] = self.ref_vpp / 2 * np.sin(2 * np.pi * self.f_ext * tr + math.radians(self.theta_e)) \
+            + 2e-4 * self.rng.standard_normal(n)
+        sig["iq0"] = np.full(n, self.ref_demod(rp.iq0, t0))
+        sig["iq1"] = np.full(n, self.ref_demod(rp.iq1, t0))
+        p1, p0 = rp.pid1, rp.pid0
+        src = sig.get(p1.input) if p1.input in (li, li + "_2") else None
+        if src is None and p1.input in (li, li + "_2"):
+            src = np.zeros(n)
+        e1 = np.clip(p1.p * src + p1.ival, p1.min_voltage, p1.max_voltage) if src is not None else np.zeros(n)
+        sig["pid1"] = e1
+        out2 = (e1 if p1.output_direct in ("out2", "both") else 0.0) + \
+            (sig.get("pid0", np.zeros(n)) if p0.output_direct in ("out2", "both") else 0.0)
+        sig["out2"] = np.clip(np.zeros(n) + out2, -1, 1)
+
     def copies(self, ts):
         """The spare iq1 -> pid1 chain driven by an ASG (circuit-only Bode). iq1 with its oscillator at 0 Hz is
         input x cos(phase) through its low-pass stages and integer gain; pid1 is P + I of its input."""
@@ -558,7 +624,7 @@ class Engine:
                         y = lfilter([a], [1, -(1 - a)], y)
                     sig[li + "_2"] = y[npre:] + NOISE_ERR * self.rng.standard_normal(n)
                 pd = self.pd_avg(v) + NOISE_PD * self.rng.standard_normal(n)
-                d = self.dither_pp() / 2
+                d = 0.0 if self.extref else self.dither_pp() / 2           # an external dither is not on OUT1
                 sig.update({"in1": pd, li: err, "asg0": asg.raw(ts), "pid0": np.full(n, pid_out),
                             po: v + d * np.sin(2 * np.pi * self.li.frequency * ts)})
                 if po == "out2":
@@ -574,7 +640,7 @@ class Engine:
                 if t0 is None:
                     t0 = t_end - duration
                 ts = np.linspace(t_end - duration, t_end, n)
-                d = self.dither_pp() / 2
+                d = 0.0 if self.extref else self.dither_pp() / 2
                 drive = np.interp(ts, tt, h[:, 1])
                 sig.update({"in1": np.interp(ts, tt, h[:, 2]), li: np.interp(ts, tt, h[:, 3]),
                             li + "_2": np.interp(ts, tt, h[:, 7]),
@@ -583,9 +649,13 @@ class Engine:
                 if self.pzt_out == "out2":
                     sig["out1"] = np.interp(ts, tt, h[:, 5])
                     sig["in2"] = np.interp(ts, tt, h[:, 6])
-            if "iq1" in names or "pid1" in names:
+            if self.extref:
+                self._extref_sig(sig, names, t0, trel, n)
+            elif "iq1" in names or "pid1" in names:
                 sig["iq1"], sig["pid1"] = self.copies(t0 + trel)
-            if self.pzt_out == "out2":                  # errsig wiring: no AOM on OUT2; IN2 = the external servo
+            if self.extref:
+                pass
+            elif self.pzt_out == "out2":                  # errsig wiring: no AOM on OUT2; IN2 = the external servo
                 sig.setdefault("asg1", self.rp.asg1.raw_rel(t0, trel))
             else:
                 sig.update(self.aom.synth(t0, trel))
@@ -746,8 +816,21 @@ class Sampler:
         return self.eng.hist[-1][2] if self.eng.hist else 0.0
 
     @property
+    def iq0(self):
+        lan()
+        return self.eng.ref_demod(self.eng.rp.iq0) if self.eng.extref else 0.0
+
+    @property
+    def iq1(self):
+        lan()
+        return self.eng.ref_demod(self.eng.rp.iq1) if self.eng.extref else 0.0
+
+    @property
     def in2(self):
         lan()
+        if self.eng.extref:
+            return self.eng.ref_vpp / 2 * math.sin(2 * math.pi * self.eng.f_ext * (time.time() - self.eng.T0)
+                                                   + math.radians(self.eng.theta_e))
         if self.eng.pzt_out == "out2":
             return self.eng.ext_v + 0.0005 * self.eng.rng.standard_normal()
         return self.eng.aom.sample_pd()
@@ -769,6 +852,17 @@ def nearest_log(v, ladder):
 
 
 class IQ(Mod):
+    def synchronize_iqs(self):
+        """PyRPL: zero phase offset between the IQ NCOs."""
+        lan()
+        if getattr(self, "_eng", None) is not None:
+            self._eng.sync_ncos()
+
+    @property
+    def current_output_signal(self):
+        lan()
+        return self._eng.ref_demod(self) if self._eng.extref else 0.0
+
     """FPGA-like rounding: factor-2 filter ladder, 2 filter stages (iq2: 4), integer quadrature factor."""
     @property
     def bandwidth(self):
@@ -812,6 +906,8 @@ class RP:
         self.asg0 = ASG(None, "asg0")
         self.asg1 = ASG(None, "asg1")
         self.eng = Engine(self)
+        for iq in (self.iq0, self.iq1, self.iq2):
+            object.__setattr__(iq, "_eng", self.eng)
         self.scope = Scope(self.eng)
         self.sampler = Sampler(self.eng)
 
