@@ -346,6 +346,8 @@ def build_app(ctl, A):
         out2 = "OUT2: ERROR" if s.get("eo_on") else "OUT2: PI" if s.get("pi_out2") else "OUT2: 0 V"
         if ref.get("level") is None:
             rtxt, rcol = "REF: —", "#7f8c8d"
+        elif ref.get("mismatch"):
+            rtxt, rcol = "REF: WRONG FREQUENCY (press Find f)", "#c0392b"
         elif not ref.get("ok"):
             rtxt, rcol = "REF: NONE ON IN2", "#c0392b"
         elif not s.get("ref_track"):

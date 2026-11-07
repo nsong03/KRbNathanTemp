@@ -180,6 +180,8 @@ def diagram_state(snap, sw):
     rl = [(f"NCO {snap.get('f_nco', 0):.4f} Hz", "")]
     if lvl is None:
         rl.append(("reference: not read yet", "dim"))
+    elif ref.get("mismatch"):
+        rl.append((f"WRONG FREQUENCY: IN2 {ref.get('f_in2', 0):.4f} Hz → press Find f", "warn"))
     elif not ref.get("ok"):
         rl.append(("NO REFERENCE on IN2", "warn"))
     elif not sw["track"]:
@@ -189,7 +191,8 @@ def diagram_state(snap, sw):
         rl.append((("LOCKED" if ref.get("locked") else "acquiring") + f" · corr {snap.get('corr', 0):+.1f}°"
                    + (f" · {r_:+.2f}°/s" if r_ is not None else ""), "" if ref.get("locked") else "warn"))
     if fnd.get("ok"):
-        rl.append((f"IN2: {fnd['f']:.4f} Hz, {fnd['vpp']:.2f} Vpp", "dim"))
+        rl.append((f"IN2: {fnd['f']:.4f} Hz, {fnd['vpp']:.2f} Vpp" + (" CLIPPING (LV jumper?)" if fnd.get("clip")
+                                                                      else ""), "warn" if fnd.get("clip") else "dim"))
     B["reference"] = rl
     B["bandpass"] = [(f"HP {_f(hw.get('iq2.acbandwidth'), '{:.1f}')} Hz", "")]
     bw = [b for b in (hw.get("iq2.bandwidth") or []) if b and b > 0]

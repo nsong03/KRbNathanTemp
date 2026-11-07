@@ -364,7 +364,7 @@ class Engine:
         self.f_ext = float(os.environ.get("FAKE_F_EXT", "1000.0137"))
         self.ext_dpp, self.ref_vpp, self.theta_e = 0.030, 0.25, 37.0
         self.T0 = time.time()
-        self._nco_f, self._nco_t0, self._nco_ph0 = None, 0.0, 0.0
+        self._nco = {}                 # per IQ module: [frequency, anchor time, anchor phase]
         threading.Thread(target=self.loop, daemon=True).start()
 
     # physics helpers (vectorized over drive voltage)
@@ -379,22 +379,26 @@ class Engine:
         return 2 * iq.amplitude * DITHER_SCALE if iq.output_direct in (self.pzt_out, "both") else 0.0
 
     # ---- external reference model (extref) ----
-    def nco_phase(self, t):
-        """Shared NCO phase [deg] at time t (continuous through frequency changes; synchronize_iqs resets it)."""
-        f = float(self.rp.iq2.frequency)
-        tr = t - self.T0
-        if self._nco_f is None:
-            self._nco_f, self._nco_t0, self._nco_ph0 = f, tr, 0.0
-        if f != self._nco_f:
-            self._nco_ph0 += 360.0 * self._nco_f * (tr - self._nco_t0)
-            self._nco_f, self._nco_t0 = f, tr
-        return self._nco_ph0 + 360.0 * self._nco_f * (tr - self._nco_t0)
+    def nco_phase(self, t, iq=None):
+        """NCO phase [deg] of IQ module iq (default iq2) at time t: each module has its own phase accumulator,
+        continuous through frequency changes; synchronize_iqs zeroes all of them at the same instant."""
+        iq = self.rp.iq2 if iq is None else iq
+        f, tr = float(iq.frequency), t - self.T0
+        st = self._nco.get(iq._name)
+        if st is None:
+            st = self._nco[iq._name] = [f, tr, 0.0]
+        if f != st[0]:
+            st[2] += 360.0 * st[0] * (tr - st[1])
+            st[0], st[1] = f, tr
+        return st[2] + 360.0 * st[0] * (tr - st[1])
 
     def sync_ncos(self):
-        self._nco_f, self._nco_t0, self._nco_ph0 = float(self.rp.iq2.frequency), time.time() - self.T0, 0.0
+        tr = time.time() - self.T0
+        for iq in (self.rp.iq0, self.rp.iq1, self.rp.iq2):
+            self._nco[iq._name] = [float(iq.frequency), tr, 0.0]
 
-    def theta_ext(self, t):
-        return (360.0 * self.f_ext * (t - self.T0) + self.theta_e - self.nco_phase(t)) % 360.0
+    def theta_ext(self, t, iq=None):
+        return (360.0 * self.f_ext * (t - self.T0) + self.theta_e - self.nco_phase(t, iq)) % 360.0
 
     def beat_att(self, iq):
         """Low-pass attenuation of a demodulated signal that rotates at the frequency difference."""
@@ -408,7 +412,7 @@ class Engine:
         """iq0 / iq1 demodulating IN2 (the external reference): 0.5 x amplitude x cos(phase - theta_ext)."""
         if iq.input != "in2":
             return 0.0
-        th = self.theta_ext(time.time() if t is None else t)
+        th = self.theta_ext(time.time() if t is None else t, iq)
         a = 0.5 * self.ref_vpp / 2 * float(iq.quadrature_factor) * self.beat_att(iq)
         return a * math.cos(math.radians(float(iq.phase) - th)) + 1e-5 * self.rng.standard_normal()
 

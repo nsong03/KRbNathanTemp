@@ -99,6 +99,17 @@ check("Find f: NCO set to the IN2 frequency", abs(ctl.f_nco - eng.f_ext) < 0.005
       < 0.005 and abs(ctl.s["ref_hz"] - eng.f_ext) < 0.005, f"{ctl.f_nco:.4f} vs {eng.f_ext:.4f}")
 fnd = ctl.snapshot()["ref"]["find"]
 check("Find f: reference amplitude at the connector (IN2 scale 20)", abs(fnd["vpp"] - 5.0) < 0.2, f"{fnd['vpp']:.2f} Vpp")
+apply(ref_hz=1013.0)                                   # 13 Hz off: the phase looks random
+time.sleep(1.5)
+rf = ctl.snapshot()["ref"]
+dl = ES.diagram_state(ctl.snapshot(), ctl.switches())
+check("13 Hz off: WRONG FREQUENCY shown, never 'locked'", rf["mismatch"] and not rf["locked"]
+      and "WRONG FREQUENCY" in dl["boxes"]["reference"][1][0], str(dl["boxes"]["reference"]))
+check("wrong frequency: no tracking, the NCO is not walked away", abs(ctl.f_nco - 1013.0) < 1e-6, f"{ctl.f_nco}")
+ctl.submit("find_ref"); idle()
+time.sleep(2.0)
+check("Find f clears it and the tracking locks", not ctl.snapshot()["ref"]["mismatch"]
+      and ctl.snapshot()["ref"]["locked"])
 apply(ref_hz=999.7)                                    # 0.31 Hz off: 112 deg/s
 time.sleep(12.0)
 check("frequency correction: a 0.3 Hz error is pulled in by the tracking", abs(ctl.f_nco - eng.f_ext) < 0.05

@@ -203,6 +203,15 @@ error toggleable on OUT2, PI on the error (raw P / I, limiters), alignment ramp 
   REFERENCE". "Find f": scope trace of IN2 (≥ 200 periods, ≥ 8 points / period) → `measure_freq` (FFT peak +
   half-trace phase advance) → ref_hz, NCO, sync. Start-up measures IN2 and only LOGS a mismatch (no auto change).
   Track switch (`ref_track`, saved). IN2 must be on the HV jumper (5 Vpp clips on LV); `in2_scale` 20 is display only.
+- **2026-11-07, user: "the phase appears to be jumping around like crazy".** Reproduced on the fake with the NCO 13 Hz
+  off the IN2 frequency: the reference phase rotates ~4700°/s, read 10–20 times a second it shows random aliased
+  steps (up to 133°), and the old FLL then walked the NCO further away (1013 → 1018.6 Hz) on that garbage. Fixes:
+  `ref.f_in2` (start-up / Find f measurement) vs the NCO > 0.5 Hz → `mismatch`: "WRONG FREQUENCY → press Find f"
+  in the Reference box and "REF: WRONG FREQUENCY" in the status, NO tracking and no FLL while it holds; the FLL is
+  clamped to ±1 Hz of `ref_hz`; "locked" needs the last ≥ 5 tracking errors < 10°; Find f warns on IN2 clipping
+  (> 1.9 Vpp at the FPGA = LV jumper). `extref_diag.py` (standalone, outputs off): measures IN2, sets iq0 / iq1,
+  prints the raw reference phase for N s with tracking off and a verdict (smooth / far off / noisy). Fake: one NCO
+  phase accumulator per IQ module (`_nco`), all zeroed by synchronize_iqs.
 - Modules: iq0, iq1, iq2, pid0 (PI on X / Y; PI → OUT1 summer exclusive with the ramp; PI → OUT2), pid1 (error →
   OUT2: gain x X / Y + offset, clamp; I = 0; switch `eo_on`), asg0 (ramp / offset → out1). PI → OUT2 and Error → OUT2
   are exclusive. pid2 / asg1 off. Single view (no intensity: IN2 / OUT2 are taken).
@@ -213,7 +222,7 @@ error toggleable on OUT2, PI on the error (raw P / I, limiters), alignment ramp 
   PZT, 0.25 Vpp at IN2; shared NCO phase model (`nco_phase`, `sync_ncos`), θ_ext; X / Y = cos / sin(phase − lag −
   θ_ext) × LP attenuation at the beat; `ref_demod` for iq0 / iq1 (sampler, current_output_signal); in2 / iq0 / iq1 /
   pid1 / out2 scope traces; OUT1 carries no dither.
-- Tests: `test/test_extref.py` (30: start-up, tracking locked with the 4.9°/s drift, X-Y angle fixed with tracking /
+- Tests: `test/test_extref.py` (33, incl. wrong frequency → warning, no tracking, NCO not walked; start-up, tracking locked with the 4.9°/s drift, X-Y angle fixed with tracking /
   rotating without, Find f (frequency, 5.02 Vpp), 0.3 Hz pulled in by the FLL, phase by hand, lock with the external
   dither, no dither on OUT1, error → OUT2 maths, exclusivity, restart adoption with iq2 phase moved < 5° only by the
   tracking, write log), `serve_extref.py` (port 8106) + `ui_extref.py` (22).

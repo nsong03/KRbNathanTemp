@@ -173,7 +173,9 @@ class ExtRefController:
         # reference tracking
         self.corr = 0.0            # phase added to iq0 / iq1 / iq2 [deg]
         self.f_nco = float(self.s["ref_hz"])
-        self.ref = dict(level=None, ok=False, theta=None, rate=None, locked=False, find=None)
+        self.ref = dict(level=None, ok=False, theta=None, rate=None, locked=False, find=None, f_in2=None,
+                        mismatch=False)
+        self._errs = collections.deque(maxlen=10)
         self._target = None
         self._sign = None          # d(measured ref phase) / d(phase register) = +1 or -1, found once
         self._fsign = 1.0          # direction of the frequency correction (checked when it is first used)
@@ -329,9 +331,11 @@ class ExtRefController:
             ok = level > REF_MIN
             th = math.degrees(math.atan2(y, x))
             st = dict(self.ref, level=level, ok=ok, theta=th)
-            if not ok or not self.s["ref_track"]:
+            st["mismatch"] = self._mismatch()
+            if not ok or not self.s["ref_track"] or st["mismatch"]:      # no tracking on a wrong frequency
                 st["locked"] = False
                 self._target = None
+                self._errs.clear()
                 with self._lock:
                     self.ref = st
                 return
@@ -347,7 +351,8 @@ class ExtRefController:
             self._write_phases()
             unwrapped = (self._hist[-1][1] + wrap(self.corr - self._hist[-1][2])) if self._hist else self.corr
             self._hist.append((now, unwrapped, self.corr))
-            st["locked"] = abs(err) < 10
+            self._errs.append(abs(err))
+            st["locked"] = len(self._errs) >= 5 and max(self._errs) < 10
             st["err"] = err
             if len(self._hist) > 10:
                 t0, c0, _ = self._hist[0]
@@ -357,6 +362,12 @@ class ExtRefController:
             self._fll(now)
         finally:
             self._busy = False
+
+    def _mismatch(self):
+        """True when the last IN2 frequency measurement (start-up or Find f) is far from the NCO: the reference
+        phase then rotates faster than the tracking can follow and looks random."""
+        f2 = self.ref.get("f_in2")
+        return f2 is not None and abs(f2 - self.f_nco) > 0.5
 
     def _calibrate_sign(self, th0):
         """Which way does a phase-register step move the measured reference phase? Step the reference modules
@@ -394,7 +405,13 @@ class ExtRefController:
             self.log(f"reference frequency correction direction flipped (drift {prev:+.1f} -> {rate:+.1f} deg/s)")
         if abs(rate) > 5.0:
             df = self._fsign * rate / 360.0
-            self._write_freq(self.f_nco + df)
+            f_new = float(np.clip(self.f_nco + df, self.s["ref_hz"] - 1.0, self.s["ref_hz"] + 1.0))
+            if f_new == self.f_nco:
+                self.log("reference frequency correction stopped at +-1 Hz from the set frequency: check Find f")
+                self._fll_prev = None
+                return
+            df = f_new - self.f_nco
+            self._write_freq(f_new)
             self._fll_prev = rate
             self._hist.clear()
             self.log(f"reference drift {rate:+.1f} deg/s: NCO frequency {self.f_nco - df:.4f} -> {self.f_nco:.4f} Hz")
@@ -417,7 +434,10 @@ class ExtRefController:
                 self.log("Find f: no sine on IN2 (peak-peak < 5 mV at the FPGA)")
             return None
         f, pp = measure_freq(t, a)
-        self.ref["find"] = dict(ok=True, f=f, vpp=pp * self.s["in2_scale"], t=time.time())
+        self.ref["find"] = dict(ok=True, f=f, vpp=pp * self.s["in2_scale"], t=time.time(), clip=pp > 1.9)
+        self.ref["f_in2"] = f
+        if pp > 1.9:
+            self.log(f"IN2: {pp:.2f} Vpp at the FPGA = clipping. Is IN2 on the LV jumper? 5 Vpp needs HV.")
         if not quiet:
             self.s["ref_hz"] = round(f, 4)
             self.version += 1
@@ -435,9 +455,10 @@ class ExtRefController:
             return
         if f is None:
             self.log("IN2: no reference sine found at start-up (connect the external dither; then Find f)")
-        elif abs(f - self.f_nco) > max(1.0, 0.1 * self.s["lpf_hz"]):
-            self.log(f"IN2 reference measured at {f:.4f} Hz, NCO at {self.f_nco:.4f} Hz: press Find f (or type "
-                     f"the frequency)")
+        elif abs(f - self.f_nco) > 0.5:
+            self.log(f"FREQUENCY MISMATCH: IN2 reference measured at {f:.4f} Hz, NCO at {self.f_nco:.4f} Hz. The "
+                     f"reference phase rotates at {360*(f - self.f_nco):+.0f} deg/s and cannot be tracked: press "
+                     f"Find f (or type the frequency)")
         else:
             self.log(f"IN2 reference {f:.4f} Hz, NCO {self.f_nco:.4f} Hz: tracking")
 
